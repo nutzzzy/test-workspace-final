@@ -1,0 +1,41 @@
+{
+  "name": "qa-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspaces --if-present",
+    "predev:web": "npm run build -w @qa-workbench/shared",
+    "dev:web": "npm run dev -w @qa-workbench/web",
+    "predev:api": "npm run build -w @qa-workbench/shared",
+    "dev:api": "npm run dev -w @qa-workbench/api",
+    "build": "npm run build -w @qa-workbench/shared && npm run build -w @qa-workbench/api && npm run build -w @qa-workbench/web",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "db:generate": "npm run prisma:generate -w @qa-workbench/api",
+    "db:migrate": "npm run prisma:migrate -w @qa-workbench/api",
+    "db:push": "npm run prisma:push -w @qa-workbench/api",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "demo:db": "node scripts/demo-db.mjs",
+    "demo:seed": "node scripts/demo-seed.mjs",
+    "demo": "echo \"Run in 3 terminals:\\n 1) npm run demo:db\\n 2) npm run dev:api\\n 3) npm run dev:web\\nThen: npm run demo:seed\""
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "allowScripts": {
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "prisma@6.19.3": true,
+    "esbuild@0.28.2": true,
+    "unrs-resolver@1.12.2": true,
+    "@parcel/watcher@2.6.0": true,
+    "@embedded-postgres/linux-x64@18.4.0-beta.17": true,
+    "embedded-postgres@18.4.0-beta.17": true
+  }
+}

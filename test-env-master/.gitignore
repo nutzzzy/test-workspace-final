@@ -1,0 +1,50 @@
+# dependencies
+node_modules
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+coverage
+
+# next.js
+.next/
+out/
+
+# nest / build
+dist/
+build/
+*.tsbuildinfo
+
+# misc
+.DS_Store
+*.pem
+.idea/
+!.idea/modules.xml
+.demo/
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# vercel
+.vercel
+
+# prisma
+apps/api/prisma/*.db
+apps/api/prisma/*.db-journal
+
+# uploaded evidence
+apps/api/data/uploads

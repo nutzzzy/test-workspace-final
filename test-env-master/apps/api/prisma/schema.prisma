@@ -1,0 +1,452 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model SystemSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("system_settings")
+}
+
+model JiraConfig {
+  id           String   @id @default(cuid())
+  baseUrl      String
+  email        String
+  apiTokenEnc  String
+  projectKey   String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("jira_configs")
+}
+
+model JiraIssue {
+  id                   String   @id @default(cuid())
+  key                  String   @unique
+  title                String
+  description          String   @default("")
+  issueType            String?
+  priority             String?
+  labels               String[] @default([])
+  rawAcceptanceText    String?
+  linkedIssuesJson     Json?
+  importedAt           DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  acceptanceCriteria   AcceptanceCriterion[]
+  requirementAnalysis  RequirementAnalysis?
+  testStrategy         TestStrategy?
+  testCases            TestCase[]
+  edgeCases            EdgeCase[]
+  risks                Risk[]
+  automationCandidates AutomationCandidate[]
+  bugs                 Bug[]
+  requirementProfile   RequirementProfile?
+
+  @@map("jira_issues")
+}
+
+model RequirementProfile {
+  id           String    @id @default(cuid())
+  jiraIssueId  String    @unique
+  jiraIssue    JiraIssue @relation(fields: [jiraIssueId], references: [id], onDelete: Cascade)
+  intelligence Json
+  contentHash  String
+  updatedAt    DateTime  @updatedAt
+
+  @@map("requirement_profiles")
+}
+
+model AcceptanceCriterion {
+  id          String    @id @default(cuid())
+  jiraIssueId String
+  jiraIssue   JiraIssue @relation(fields: [jiraIssueId], references: [id], onDelete: Cascade)
+  key         String
+  text        String
+  orderIndex  Int       @default(0)
+  origin      String    @default("imported")
+  createdAt   DateTime  @default(now())
+
+  testCases   TestCaseAcceptanceCriterion[]
+
+  @@unique([jiraIssueId, key])
+  @@map("acceptance_criteria")
+}
+
+model RequirementAnalysis {
+  id                 String   @id @default(cuid())
+  jiraIssueId        String   @unique
+  jiraIssue          JiraIssue @relation(fields: [jiraIssueId], references: [id], onDelete: Cascade)
+  summary            String
+  acceptanceCriteria Json
+  gaps               Json
+  ambiguities        Json
+  missingScenarios   Json
+  potentialRisks     Json
+  questionsProduct   Json
+  questionsDeveloper Json
+  questionsBusiness  Json
+  /// [{ question, category, reason, source }] — why each question was asked.
+  questionDetails    Json     @default("[]")
+  /// [{ text, reason, source }] — suggested, never mixed with the Jira criteria.
+  suggestedCriteria  Json     @default("[]")
+  manuallyEdited     Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@map("requirement_analyses")
+}
+
+model TestStrategy {
+  id            String    @id @default(cuid())
+  jiraIssueId   String    @unique
+  jiraIssue     JiraIssue @relation(fields: [jiraIssueId], references: [id], onDelete: Cascade)
+  scope         String
+  objectives    Json
+  testTypes     Json
+  environments  Json
+  dependencies  Json
+  assumptions   Json
+  manuallyEdited Boolean  @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@map("test_strategies")
+}
+
+model TestCase {
+  id               String             @id @default(cuid())
+  jiraIssueId      String?
+  jiraIssue        JiraIssue?         @relation(fields: [jiraIssueId], references: [id], onDelete: SetNull)
+  title            String
+  description      String             @default("")
+  preconditions    Json
+  steps            Json
+  expectedResult   String
+  priority         String             @default("MEDIUM")
+  type             String             @default("FUNCTIONAL")
+  tags             String[]           @default([])
+  automationStatus String             @default("NOT_AUTOMATED")
+  testData         Json               @default("[]")
+  stepExpectations Json               @default("[]")
+  jiraSyncStatus   String             @default("NOT_SYNCED")
+  jiraSyncedAt     DateTime?
+  jiraSyncHash     String?
+  jiraSyncError    String?
+  jiraCommentId    String?
+  manuallyEdited          Boolean            @default(false)
+  designStatus            String             @default("AI_DRAFT")
+  technique               String             @default("")
+  conditionKey            String?
+  postconditions          Json               @default("[]")
+  assumptions             Json               @default("[]")
+  gapRefs                 String[]           @default([])
+  automationSuitability   String?
+  automationNotes         String             @default("")
+  executionNotes          String             @default("")
+  executionEvidence       String             @default("")
+  createdAt               DateTime           @default(now())
+  updatedAt               DateTime           @updatedAt
+
+  acceptanceLinks  TestCaseAcceptanceCriterion[]
+  suiteLinks       TestSuiteCase[]
+  runs             TestRun[]
+  automationCandidates AutomationCandidate[]
+  bugs             Bug[]
+
+  @@map("test_cases")
+}
+
+model TestCaseAcceptanceCriterion {
+  testCaseId             String
+  acceptanceCriterionId  String
+  testCase               TestCase             @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+  acceptanceCriterion    AcceptanceCriterion  @relation(fields: [acceptanceCriterionId], references: [id], onDelete: Cascade)
+
+  @@id([testCaseId, acceptanceCriterionId])
+  @@map("test_case_acceptance_criteria")
+}
+
+model EdgeCase {
+  id             String    @id @default(cuid())
+  jiraIssueId    String
+  jiraIssue      JiraIssue @relation(fields: [jiraIssueId], references: [id], onDelete: Cascade)
+  title          String
+  description    String
+  manuallyEdited Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@map("edge_cases")
+}
+
+model Risk {
+  id             String    @id @default(cuid())
+  jiraIssueId    String
+  jiraIssue      JiraIssue @relation(fields: [jiraIssueId], references: [id], onDelete: Cascade)
+  description      String
+  impact           String
+  likelihood       String
+  mitigation       String
+  releaseBlocking  Boolean  @default(false)
+  acceptanceKeys   String[] @default([])
+  manuallyEdited   Boolean  @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@map("risks")
+}
+
+model AutomationCandidate {
+  id                    String    @id @default(cuid())
+  jiraIssueId           String
+  jiraIssue             JiraIssue @relation(fields: [jiraIssueId], references: [id], onDelete: Cascade)
+  testCaseId            String?
+  testCase              TestCase? @relation(fields: [testCaseId], references: [id], onDelete: SetNull)
+  recommendedLevel      String
+  apiUiRecommendation   String
+  reasoning             String
+  manuallyEdited        Boolean   @default(false)
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@map("automation_candidates")
+}
+
+model TestSuite {
+  id          String   @id @default(cuid())
+  name        String
+  description String   @default("")
+  kind        String   @default("CUSTOM") // SMOKE | REGRESSION | CUSTOM
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  cases       TestSuiteCase[]
+
+  @@map("test_suites")
+}
+
+model TestSuiteCase {
+  suiteId    String
+  testCaseId String
+  orderIndex Int      @default(0)
+  suite      TestSuite @relation(fields: [suiteId], references: [id], onDelete: Cascade)
+  testCase   TestCase  @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+
+  @@id([suiteId, testCaseId])
+  @@map("test_suite_cases")
+}
+
+model TestRun {
+  id          String   @id @default(cuid())
+  testCaseId  String
+  testCase    TestCase @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+  status      String
+  notes       String?
+  evidence    String?
+  executedAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  bugs        Bug[]
+
+  @@index([testCaseId, executedAt])
+  @@map("test_runs")
+}
+
+model Bug {
+  id                 String     @id @default(cuid())
+  title              String
+  description        String     @default("")
+  reproductionSteps  Json
+  expectedResult     String     @default("")
+  actualResult       String     @default("")
+  severity           String     @default("MEDIUM")
+  priority           String     @default("MEDIUM")
+  environment        String?
+  evidence           String?
+  jiraIssueId        String?
+  jiraIssue          JiraIssue? @relation(fields: [jiraIssueId], references: [id], onDelete: SetNull)
+  testCaseId         String?
+  testCase           TestCase?  @relation(fields: [testCaseId], references: [id], onDelete: SetNull)
+  testRunId          String?
+  testRun            TestRun?   @relation(fields: [testRunId], references: [id], onDelete: SetNull)
+  scenarioRunId      String?
+  status             String     @default("OPEN")
+  assignee           String?
+  reporter           String     @default("QA")
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+
+  comments           BugComment[]
+  activities         BugActivity[]
+
+  @@map("bugs")
+}
+
+model BugComment {
+  id        String   @id @default(cuid())
+  bugId     String
+  bug       Bug      @relation(fields: [bugId], references: [id], onDelete: Cascade)
+  author    String
+  content   String
+  createdAt DateTime @default(now())
+
+  @@index([bugId, createdAt])
+  @@map("bug_comments")
+}
+
+model BugActivity {
+  id        String   @id @default(cuid())
+  bugId     String
+  bug       Bug      @relation(fields: [bugId], references: [id], onDelete: Cascade)
+  author    String
+  action    String
+  detail    String
+  createdAt DateTime @default(now())
+
+  @@index([bugId, createdAt])
+  @@map("bug_activities")
+}
+
+model Environment {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String   @default("")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  variables   EnvironmentVariable[]
+  scenarios   Scenario[]
+  runs        ScenarioRun[]
+
+  @@map("environments")
+}
+
+model EnvironmentVariable {
+  id            String      @id @default(cuid())
+  environmentId String
+  environment   Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  key           String
+  value         String
+  type          String      @default("NORMAL") // NORMAL | SECRET
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@unique([environmentId, key])
+  @@map("environment_variables")
+}
+
+model Scenario {
+  id              String       @id @default(cuid())
+  name            String
+  description     String       @default("")
+  environmentId   String?
+  environment     Environment? @relation(fields: [environmentId], references: [id], onDelete: SetNull)
+  stopOnFailure   Boolean      @default(true)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  steps           ScenarioStep[]
+  runs            ScenarioRun[]
+
+  @@map("scenarios")
+}
+
+model ScenarioStep {
+  id          String   @id @default(cuid())
+  scenarioId  String
+  scenario    Scenario @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+  name        String
+  type        String
+  orderIndex  Int
+  enabled     Boolean  @default(true)
+  config      Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  stepRuns    ScenarioStepRun[]
+
+  @@index([scenarioId, orderIndex])
+  @@map("scenario_steps")
+}
+
+model ScenarioRun {
+  id            String       @id @default(cuid())
+  scenarioId    String
+  scenario      Scenario     @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+  environmentId String?
+  environment   Environment? @relation(fields: [environmentId], references: [id], onDelete: SetNull)
+  status        String       @default("PENDING")
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  durationMs    Int?
+  error         String?
+  variablesJson Json?
+  createdAt     DateTime     @default(now())
+
+  stepRuns      ScenarioStepRun[]
+
+  @@index([scenarioId, createdAt])
+  @@map("scenario_runs")
+}
+
+model ScenarioStepRun {
+  id              String       @id @default(cuid())
+  scenarioRunId   String
+  scenarioRun     ScenarioRun  @relation(fields: [scenarioRunId], references: [id], onDelete: Cascade)
+  scenarioStepId  String?
+  scenarioStep    ScenarioStep? @relation(fields: [scenarioStepId], references: [id], onDelete: SetNull)
+  name            String
+  type            String
+  orderIndex      Int
+  status          String
+  startedAt       DateTime?
+  finishedAt      DateTime?
+  durationMs      Int?
+  resolvedInput   Json?
+  output          Json?
+  error           String?
+  extractedVars   Json?
+  createdAt       DateTime     @default(now())
+
+  @@index([scenarioRunId, orderIndex])
+  @@map("scenario_step_runs")
+}
+
+model DatabaseConnector {
+  id              String   @id @default(cuid())
+  name            String   @unique
+  type            String
+  encryptedConfig String
+  status          String   @default("ACTIVE")
+  lastTestStatus  String?
+  lastTestedAt    DateTime?
+  lastTestMessage String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("database_connectors")
+}
+
+model Attachment {
+  id          String   @id @default(cuid())
+  ownerKind   String
+  ownerId     String
+  filename    String
+  mimeType    String
+  sizeBytes   Int
+  storageName String
+  createdAt   DateTime @default(now())
+
+  @@index([ownerKind, ownerId])
+  @@map("attachments")
+}

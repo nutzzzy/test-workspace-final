@@ -1,0 +1,157 @@
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Query,
+} from "@nestjs/common";
+import { ScenariosService } from "./scenarios.service";
+
+@Controller("scenarios")
+export class ScenariosController {
+  constructor(private readonly scenariosService: ScenariosService) {}
+
+  @Get()
+  list() {
+    return this.scenariosService.list();
+  }
+
+  @Get("runs")
+  listRuns(@Query("scenarioId") scenarioId?: string) {
+    return this.scenariosService.listRuns(scenarioId);
+  }
+
+  @Get("runs/:runId")
+  getRun(@Param("runId") runId: string) {
+    return this.scenariosService.getRun(runId);
+  }
+
+  @Post()
+  create(
+    @Body()
+    body: {
+      name: string;
+      description?: string;
+      environmentId?: string;
+      stopOnFailure?: boolean;
+    },
+  ) {
+    return this.scenariosService.create(body);
+  }
+
+  @Post("runs/:runId/cancel")
+  cancel(@Param("runId") runId: string) {
+    return this.scenariosService.cancel(runId);
+  }
+
+  @Patch("steps/:stepId")
+  updateStep(
+    @Param("stepId") stepId: string,
+    @Body()
+    body: Partial<{
+      name: string;
+      config: Record<string, unknown>;
+      enabled: boolean;
+      orderIndex: number;
+    }>,
+  ) {
+    return this.scenariosService.updateStep(stepId, body);
+  }
+
+  @Delete("steps/:stepId")
+  deleteStep(@Param("stepId") stepId: string) {
+    return this.scenariosService.deleteStep(stepId);
+  }
+
+  @Post("steps/:stepId/duplicate")
+  duplicateStep(@Param("stepId") stepId: string) {
+    return this.scenariosService.duplicateStep(stepId);
+  }
+
+  @Get(":id")
+  get(@Param("id") id: string) {
+    return this.scenariosService.get(id);
+  }
+
+  @Patch(":id")
+  update(
+    @Param("id") id: string,
+    @Body()
+    body: Partial<{
+      name: string;
+      description: string;
+      environmentId: string | null;
+      stopOnFailure: boolean;
+    }>,
+  ) {
+    return this.scenariosService.update(id, body);
+  }
+
+  @Delete(":id")
+  remove(@Param("id") id: string) {
+    return this.scenariosService.remove(id);
+  }
+
+  @Post(":id/duplicate")
+  duplicate(@Param("id") id: string) {
+    return this.scenariosService.duplicate(id);
+  }
+
+  @Post(":id/steps")
+  addStep(
+    @Param("id") id: string,
+    @Body()
+    body: {
+      name: string;
+      type: string;
+      config?: Record<string, unknown>;
+      enabled?: boolean;
+    },
+  ) {
+    return this.scenariosService.addStep(id, body);
+  }
+
+  @Post(":id/reorder")
+  reorder(@Param("id") id: string, @Body() body: { stepIds: string[] }) {
+    return this.scenariosService.reorderSteps(id, body.stepIds);
+  }
+
+  @Post(":id/import-curl")
+  importCurl(@Param("id") id: string, @Body() body: { text?: string }) {
+    return this.scenariosService.importCurl(id, body.text ?? "");
+  }
+
+  @Post(":id/analyze-flow")
+  analyzeFlow(@Param("id") id: string) {
+    return this.scenariosService.analyzeFlow(id);
+  }
+
+  @Post(":id/dependencies/accept")
+  acceptDependency(
+    @Param("id") id: string,
+    @Body()
+    body: {
+      producerStepId: string;
+      consumerStepId: string;
+      sourcePath: string;
+      variable: string;
+      location: "url" | "header" | "query" | "body";
+      locationDetail: string;
+    },
+  ) {
+    return this.scenariosService.acceptDependency(id, body);
+  }
+
+  @Post(":id/run")
+  start(@Param("id") id: string) {
+    return this.scenariosService.start(id);
+  }
+
+  @Post(":id/run/sync")
+  runSync(@Param("id") id: string) {
+    return this.scenariosService.run(id);
+  }
+}
