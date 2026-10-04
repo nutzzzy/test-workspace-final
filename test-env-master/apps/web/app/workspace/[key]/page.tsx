@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ProgressBanner } from "@/components/ui/progress";
 import { useToast } from "@/components/ui/toast";
+import { DeepAnalysisPanel, type DeepStatus } from "@/components/workspace/deep-analysis-panel";
 import { useAsyncProgress } from "@/hooks/use-async-progress";
 import { useI18n } from "@/lib/i18n";
 import { BidiText } from "@/components/bidi-text";
@@ -35,7 +36,16 @@ type Issue = {
     questionsBusiness: string[];
     /** Why each question was asked (older analyses may not have it). */
     questionDetails?: Array<{ question: string; category: string; reason: string; source: string }>;
-    suggestedCriteria?: Array<{ text: string; reason: string; source: string }>;
+    suggestedCriteria?: Array<{
+      text: string;
+      reason: string;
+      source: string;
+      /** Present on AI-proposed criteria. */
+      confidence?: "HIGH" | "MEDIUM" | "LOW";
+      evidence?: string;
+      grounded?: boolean;
+      needsConfirmation?: boolean;
+    }>;
   } | null;
   testStrategy: {
     scope: string;
@@ -175,6 +185,8 @@ export default function WorkspaceDetailPage() {
   const [evidence, setEvidence] = useState<Record<string, string>>({});
   const [media, setMedia] = useState<Record<string, MediaItem[]>>({});
   const [manualOpen, setManualOpen] = useState(false);
+  const [deep, setDeep] = useState<DeepStatus | null>(null);
+  const [showOriginal, setShowOriginal] = useState(false);
   const [manual, setManual] = useState({
     title: "",
     acceptanceKey: "",
@@ -263,6 +275,7 @@ export default function WorkspaceDetailPage() {
     path: string,
     mode?: "all" | "missing" | "drafts",
     acceptanceKeys?: string[],
+    targetLocale: string = locale,
   ) => {
     if (!issue) return;
     setMessage(null);
@@ -277,7 +290,7 @@ export default function WorkspaceDetailPage() {
           await api(`/analysis/${issue.id}/${path}`, {
             method: "POST",
             body: JSON.stringify({
-              locale,
+              locale: targetLocale,
               ...(mode ? { mode } : {}),
               ...(acceptanceKeys?.length ? { acceptanceKeys } : {}),
             }),
@@ -470,6 +483,12 @@ export default function WorkspaceDetailPage() {
     }
   };
 
+  // The model's translation of the issue into the workspace language, unless the user wants the original.
+  const translated = deep?.translation && !showOriginal ? deep.translation : null;
+  const shownTitle = translated?.title || issue?.title || "";
+  const shownDescription = translated?.description || issue?.description || "";
+  const shownCriterion = (index: number, text: string) => translated?.acceptanceCriteria[index] || text;
+
   if (!issue) {
     return (
       <p className="text-sm text-muted-foreground">
@@ -495,7 +514,12 @@ export default function WorkspaceDetailPage() {
           <div className="dir-ltr inline-block font-mono text-xs text-primary">
             {issue.key}
           </div>
-          <h1 className="break-words text-lg font-semibold">{issue.title}</h1>
+          <h1 className="break-words text-lg font-semibold">{shownTitle}</h1>
+          {deep?.translation ? (
+            <button type="button" className="text-[11px] text-primary hover:underline" onClick={() => setShowOriginal((current) => !current)}>
+              {showOriginal ? t("deepAnalysis.showTranslation") : t("deepAnalysis.showOriginal")}
+            </button>
+          ) : null}
           {trace ? (
             <p className="mt-1 font-mono text-[11px] text-muted-foreground">
               {t("workspace.coverageLine", {
@@ -529,13 +553,13 @@ export default function WorkspaceDetailPage() {
 
       {tab === "overview" && (
         <div className="space-y-3">
-          <p className="text-sm text-muted-foreground">{issue.description}</p>
+          <BidiText text={shownDescription} className="block whitespace-pre-line text-sm text-muted-foreground" />
           <ReleaseGate issue={issue} />
           <div className="space-y-1">
             <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
               {t("workspace.acHeading")}
             </h2>
-            {issue.acceptanceCriteria.map((ac) => (
+            {issue.acceptanceCriteria.map((ac, index) => (
               <div
                 key={ac.id}
                 className="rounded border border-border px-2 py-1.5 text-sm"
@@ -543,14 +567,22 @@ export default function WorkspaceDetailPage() {
                 <span className="dir-ltr inline-block font-mono text-xs text-primary">
                   {ac.key}
                 </span>{" "}
-                {ac.text}
+                {shownCriterion(index, ac.text)}
                 <AcOrigin origin={ac.origin} />
               </div>
             ))}
           </div>
-          <Button disabled={busy} onClick={() => generate("all")}>
-            {busy ? t("common.processing") : t("workspace.generateAll")}
-          </Button>
+          <DeepAnalysisPanel
+            issueId={issue.id}
+            hasAcceptanceCriteria={issue.acceptanceCriteria.some((ac) => ac.origin !== "derived")}
+            busy={busy}
+            onStatus={setDeep}
+            onFallback={(target) => generate("all", undefined, undefined, target)}
+            onFinished={async () => {
+              await reload();
+              toast.notify("success", t("deepAnalysis.done"));
+            }}
+          />
           <p className="text-[11px] leading-snug text-muted-foreground">
             {t("workspace.generationNote")}
           </p>
@@ -635,12 +667,41 @@ export default function WorkspaceDetailPage() {
                 </CardHeader>
                 <CardContent className="space-y-2">
                   {issue.requirementAnalysis.suggestedCriteria.map((item) => (
-                    <div key={item.text}>
-                      <BidiText text={item.text} className="block text-sm" />
-                      <BidiText
-                        text={t("workspace.questionReason", { reason: item.reason })}
-                        className="block text-[11px] text-muted-foreground"
-                      />
+                    <div key={item.text} className="space-y-0.5">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {item.confidence ? (
+                          <span className="rounded border border-primary/40 px-1 font-mono text-[10px] text-primary dir-ltr">{item.source}</span>
+                        ) : null}
+                        <BidiText text={item.text} className="text-sm" />
+                        {item.confidence ? (
+                          <span
+                            className={`rounded border px-1 text-[10px] ${
+                              item.confidence === "HIGH"
+                                ? "border-success/40 text-success"
+                                : item.confidence === "MEDIUM"
+                                  ? "border-primary/40 text-primary"
+                                  : "border-warning/50 text-warning"
+                            }`}
+                          >
+                            {t(`deepAnalysis.confidence.${item.confidence}`)}
+                          </span>
+                        ) : null}
+                        {item.needsConfirmation ? (
+                          <span className="rounded border border-warning/50 px-1 text-[10px] text-warning">{t("deepAnalysis.needsConfirmation")}</span>
+                        ) : null}
+                      </div>
+                      {item.reason ? (
+                        <BidiText
+                          text={t("workspace.questionReason", { reason: item.reason })}
+                          className="block text-[11px] text-muted-foreground"
+                        />
+                      ) : null}
+                      {item.evidence ? (
+                        <BidiText
+                          text={t(item.grounded ? "deepAnalysis.evidence" : "deepAnalysis.evidenceMissing", { quote: item.evidence })}
+                          className="block text-[11px] text-muted-foreground"
+                        />
+                      ) : null}
                     </div>
                   ))}
                 </CardContent>

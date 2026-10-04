@@ -58,13 +58,59 @@ Stepها می‌توانند شامل موارد زیر باشند:
 - Condition
 - Database Operation
 
-اجرای Scenario به‌صورت Live انجام می‌شود.
+صفحه Scenario سه بخش اصلی دارد:
 
-امکان Cancel کردن Execution، توقف هنگام Failure یا Skip کردن Step ناموفق وجود دارد.
+- **Overview:** نام، توضیح، Environment، دکمه‌های Run / Stop / Run again، Progress و خلاصه Stepهای موفق، ناموفق، ردشده و در انتظار.
+- **Request Flow:** فهرست فشرده Stepها با Method، URL، وضعیت، Status Code، مدت اجرا و نشانگر اینکه Step از داده کدام Stepهای قبلی استفاده می‌کند.
+- **Step Panel:** با انتخاب هر Step باز می‌شود و Tabهای Request، Response، Data Mapping، Assertions، Attempts و Advanced دارد.
 
-Variableها در Scope همان Scenario Execution باقی می‌مانند و مقادیر Sensitive در Logها Mask می‌شوند.
+#### ورود چند cURL
 
-HTTP Requestها دارای محدودیت‌هایی مانند Timeout، Response Size Limit و محافظت در برابر آدرس‌های خطرناک هستند.
+در دیالوگ «Import cURL» می‌توان چند دستور cURL را (جدا شده با خط خالی) یکجا Paste کرد.
+
+قبل از ذخیره، یک صفحه Review نمایش داده می‌شود که شامل موارد زیر است:
+
+- Method، URL، تعداد Headerها و نوع Body هر Request
+- Warningها مثل Header تکراری، Optionهای پشتیبانی‌نشده یا اعمال‌نشده (`-k`، `-L`، `--proxy`) و Request تکراری
+- دستورهای Malformed همراه با علت خطا (این دستورها Import نمی‌شوند)
+- ارتباط‌های شناسایی‌شده بین Requestها که با Checkbox انتخاب می‌شوند
+
+دستور cURL اصلی در Config هر Step نگه داشته می‌شود. Import هیچ Requestی را اجرا نمی‌کند.
+
+#### شناسایی خودکار وابستگی‌ها
+
+سیستم بررسی می‌کند کدام فیلد یک Request احتمالاً از پاسخ یک Request قبلی می‌آید؛ مثلاً Token در Header `Authorization` یا شناسه کاربر در URL Path. شواهد به ترتیب قدرت:
+
+1. فیلدهایی که Retry خودکار در آخرین اجرا آن‌ها را درست کرده است
+2. مقدارهایی که عیناً در یک Response واقعی دیده شده‌اند
+3. استنباط فقط از روی Requestها (مثلاً Token صادرشده توسط Login، یا Requestی که یک Entity را می‌سازد یا برمی‌گرداند)؛ این موارد با برچسب «Inferred» نشان داده می‌شوند و هیچ‌وقت High Confidence نیستند
+
+هیچ پیشنهادی تا زمانی که کاربر آن را Accept نکند اعمال نمی‌شود. فیلدی که Mapping ذخیره‌شده دارد پیشنهاد جدید نمی‌گیرد.
+
+#### Data Mapping بدون Variable
+
+کاربر برای اتصال Requestها نیازی به تعریف Variable یا نوشتن JSONPath ندارد:
+
+- در Tab «Request» کنار هر فیلد (Path، Query، Header، JSON Body، Form) گزینه «پر کردن از پاسخ قبلی» وجود دارد.
+- در Tab «Response» با Response Explorer (درختی، قابل جستجو، با نمای Raw) می‌توان یک مقدار را انتخاب و «در درخواست بعدی استفاده» کرد.
+
+Mapping روی خود Step ذخیره می‌شود (`config.bindings`) و فقط **محل** مقدار ذخیره می‌شود، نه خود مقدار. در هر اجرا مقدار دوباره از پاسخ همان اجرا خوانده می‌شود. Mappingهای Inferred بعد از اولین اجرای موفق به Path واقعی Pin و Verified می‌شوند.
+
+Tab «Data Mapping» وضعیت هر Mapping را نشان می‌دهد و Mappingهایی را که نیاز به بررسی دارند علامت می‌زند: Step مبدأ حذف شده، بعد از مقصد اجرا می‌شود یا خاموش است، فیلد مقصد دیگر وجود ندارد، یا مقدار در آخرین Response نیست. Mappingها قابل تغییر، خاموش/روشن و حذف هستند. Mapping انتخابی کاربر بر Mapping شناسایی‌شده اولویت دارد و مبدأ همیشه باید یک Step قبلی از همان Scenario باشد.
+
+#### اجرا، Retry و Recovery
+
+- اجرای Scenario به‌صورت Live انجام می‌شود و قابل Cancel است. «اجرا تا همین مرحله» یک Step را همراه با Stepهای قبلی‌اش در یک Context تازه اجرا می‌کند.
+- اگر مقدار یک Mapping در اجرای جاری موجود نباشد، Step با وضعیت **Blocked** متوقف می‌شود و Request با مقدار قدیمی ارسال نمی‌شود.
+- Retry خودکار حداکثر ۱۰ بار (قابل تنظیم در Advanced) و فقط با مقدارهای Responseهای قبلی انجام می‌شود و هیچ Request یکسانی دوبار ارسال نمی‌شود.
+- شرط موفقیت از `expectedStatus` و Assertionهای بعد از Step خوانده می‌شود؛ در نبود آن‌ها هر Status 2xx موفق است.
+- Requestهای GET/HEAD/OPTIONS قابل Retry هستند. POST/PUT/PATCH فقط با تنظیم Idempotent یا `Idempotency-Key` Retry می‌شوند و حتی در این حالت فیلدهای Body تغییر نمی‌کنند مگر `allowDataChanges` روشن باشد. DELETE هرگز خودکار Retry نمی‌شود.
+- اگر Retry خودکار موفق نشود، اجرا متوقف می‌شود و در Step Panel می‌توان فیلد و مقدار درست را انتخاب کرد، دوباره امتحان کرد و انتخاب را برای اجراهای بعدی ذخیره کرد.
+- Tab «Attempts» تاریخچه تلاش‌ها، تغییر هر تلاش، Status و علت توقف را نشان می‌دهد و Request دقیق هر تلاش با Mask شدن مقادیر Sensitive قابل مشاهده است.
+
+Variableها و مقدارهای Response در Scope همان Scenario Execution باقی می‌مانند و بین اجراها یا Scenarioها به اشتراک گذاشته نمی‌شوند. مقادیر Sensitive در UI، Logها و تاریخچه Mask می‌شوند.
+
+HTTP Requestها دارای محدودیت‌هایی مانند Timeout، Response Size Limit و محافظت در برابر آدرس‌های خطرناک (SSRF) هستند.
 
 ### Environment و Database Connector
 
@@ -218,42 +264,6 @@ npm run demo:seed
 ```
 
 بعد از این مرحله می‌توانید Demo Flow سیستم را بدون Jira، Redis یا Ollama اجرا کنید.
-
----
-
-# اجرای سریع بدون Docker
-
-### Terminal اصلی
-
-```bash
-npm install
-npx prisma generate --schema=apps/api/prisma/schema.prisma
-npm run build
-```
-
-### Terminal 1
-
-```bash
-npm run demo:db
-```
-
-### Terminal 2
-
-```bash
-npm run dev:api
-```
-
-### Terminal 3
-
-```bash
-npm run dev:web
-```
-
-### بعد از بالا آمدن API
-
-```bash
-npm run demo:seed
-```
 
 ---
 
@@ -423,6 +433,19 @@ Prisma.JiraIssueGetPayload
 
 ---
 
+# تست‌ها
+
+```bash
+npm run test        # Testهای API (Jest)، شامل Scenario Builder و i18n parity
+npm run typecheck
+npm run lint
+npx tsx --test apps/web/lib/curl/parse-curl.spec.ts packages/shared/src/secrets.spec.ts
+```
+
+Testهای Scenario از Mock API استفاده می‌کنند و به سرویس واقعی Request ارسال نمی‌کنند.
+
+---
+
 # مشکلات Port
 
 اگر Port `3001` اشغال باشد، ابتدا Process مربوط به آن را پیدا کنید:
@@ -465,8 +488,9 @@ npm run demo:db
 8. Test Case موردنظر را اجرا کنید.
 9. در صورت Failure از Execution یک Bug ایجاد کنید.
 10. یک Test Suite ایجاد کنید.
-11. وارد بخش Scenario شوید.
-12. یک HTTP یا Database Scenario تعریف کنید.
-13. Scenario را اجرا کرده و نتیجه Stepها را مشاهده کنید.
+11. وارد بخش Scenario شوید و یک Scenario جدید بسازید.
+12. با «Import cURL» چند دستور cURL را Paste کنید، Review را بررسی و ارتباط‌های پیشنهادی را تأیید کنید.
+13. Scenario را اجرا کرده و نتیجه Stepها را در Request Flow و Step Panel مشاهده کنید.
+14. برای Step ناموفق، از Tab «Data Mapping» یا Response Explorer مقدار درست را از پاسخ یک Step قبلی انتخاب کرده و «اجرا تا همین مرحله» را بزنید.
 
 برای اجرای این Demo Flow نیازی به Jira، Redis یا Ollama نیست.

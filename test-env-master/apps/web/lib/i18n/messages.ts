@@ -106,6 +106,8 @@ const EXACT: Record<string, string> = {
   "Only HTTP steps take dependency mappings": "errors.mappingHttpOnly",
   "This run is not waiting for input": "errors.notWaiting",
   "Choose a target field and a value": "errors.chooseTargetValue",
+  "AI analysis was cancelled": "errors.aiCancelled",
+  "AI base URL must be a valid http(s) URL": "errors.aiBaseUrl",
 };
 
 const CURL_CODES = new Set(["missing_url", "unclosed_quote", "missing_value", "file_body", "bad_url"]);
@@ -193,6 +195,7 @@ export function localizeUserMessage(raw: string, t: Translate): string {
     [/^Invalid response mapping\s*(.+)$/, "errors.invalidMapping", "value"],
     [/^Invalid status:\s*(.+)$/, "errors.invalidStatus", "value"],
     [/^Run finished:\s*(.+)$/, "errors.runFinished", "status"],
+    [/^AI analysis is not available:\s*(.+)$/, "errors.aiNotAvailable", "reason"],
     [/^Unresolved variable:\s*(.+)$/, "errors.unresolvedVariable", "value"],
     [/^SSRF protection blocked host:\s*(.+)$/, "errors.hostBlocked", "value"],
     [/^Request timed out after\s*(\d+) ms$/, "errors.requestTimeout", "value"],

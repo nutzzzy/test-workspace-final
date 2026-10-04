@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { AiSettings } from "@/components/ai/ai-settings";
 import { ConnectorSettings } from "@/components/connectors/connector-settings";
 import { useI18n, type Locale } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
@@ -24,20 +25,6 @@ export default function SettingsPage() {
   const [apiToken, setApiToken] = useState("");
   const [projectKey, setProjectKey] = useState("");
   const [message, setMessage] = useState<string | null>(null);
-  const [ai, setAi] = useState({
-    provider: "ollama",
-    baseUrl: "http://localhost:11434",
-    model: "",
-    temperature: "0.2",
-    timeoutMs: "60000",
-    connection: "unknown",
-    latencyMs: null as number | null,
-    structuredOutput: null as string | null,
-    lastError: null as string | null,
-  });
-  const [models, setModels] = useState<string[]>([]);
-  const [aiMessage, setAiMessage] = useState<string | null>(null);
-
   useEffect(() => {
     api<Config>("/jira/config")
       .then((c) => {
@@ -49,21 +36,6 @@ export default function SettingsPage() {
         }
       })
       .catch(() => setConfig(null));
-    api<typeof ai>("/ai/settings")
-      .then((settings) => {
-        setAi({
-          provider: settings.provider,
-          baseUrl: settings.baseUrl,
-          model: settings.model,
-          temperature: String(settings.temperature),
-          timeoutMs: String(settings.timeoutMs),
-          connection: settings.connection,
-          latencyMs: settings.latencyMs,
-          structuredOutput: settings.structuredOutput,
-          lastError: settings.lastError,
-        });
-      })
-      .catch(() => undefined);
   }, []);
 
   return (
@@ -189,133 +161,7 @@ export default function SettingsPage() {
 
       <ConnectorSettings />
 
-      <Card>
-        <CardHeader>
-          <CardTitle>{t("settings.aiTitle")}</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          <p className="text-xs text-muted-foreground">{t("settings.aiHint")}</p>
-          <Field
-            label={t("settings.provider")}
-            value={ai.provider}
-            onChange={(provider) => setAi((current) => ({ ...current, provider }))}
-            dir="ltr"
-          />
-          <Field
-            label={t("settings.baseUrl")}
-            value={ai.baseUrl}
-            onChange={(baseUrl) => setAi((current) => ({ ...current, baseUrl }))}
-            dir="ltr"
-          />
-          <Field
-            label={t("settings.model")}
-            value={ai.model}
-            onChange={(model) => setAi((current) => ({ ...current, model }))}
-            dir="ltr"
-          />
-          {models.length > 0 ? (
-            <label className="block space-y-1 text-xs">
-              <span className="text-muted-foreground">{t("settings.refreshModels")}</span>
-              <select
-                className="h-8 w-full rounded-md border border-border bg-background px-2 text-sm"
-                value={ai.model}
-                onChange={(event) =>
-                  setAi((current) => ({ ...current, model: event.target.value }))
-                }
-              >
-                {models.map((model) => (
-                  <option key={model} value={model}>
-                    {model}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : null}
-          <div className="grid grid-cols-2 gap-2">
-            <Field
-              label={t("settings.temperature")}
-              value={ai.temperature}
-              onChange={(temperature) => setAi((current) => ({ ...current, temperature }))}
-              dir="ltr"
-            />
-            <Field
-              label={t("settings.timeout")}
-              value={ai.timeoutMs}
-              onChange={(timeoutMs) => setAi((current) => ({ ...current, timeoutMs }))}
-              dir="ltr"
-            />
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button
-              type="button"
-              onClick={() => {
-                void api("/ai/settings", {
-                  method: "PUT",
-                  body: JSON.stringify({
-                    provider: ai.provider,
-                    baseUrl: ai.baseUrl,
-                    model: ai.model,
-                    temperature: Number(ai.temperature),
-                    timeoutMs: Number(ai.timeoutMs),
-                  }),
-                })
-                  .then(() => setAiMessage(t("settings.saved")))
-                  .catch((error: unknown) =>
-                    setAiMessage(error instanceof Error ? err(error.message) : t("settings.lastError")),
-                  );
-              }}
-            >
-              {t("common.save")}
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => {
-                void api<typeof ai>("/ai/settings/test", { method: "POST" })
-                  .then((settings) => {
-                    setAi((current) => ({
-                      ...current,
-                      connection: settings.connection,
-                      latencyMs: settings.latencyMs,
-                      structuredOutput: settings.structuredOutput,
-                      lastError: settings.lastError,
-                    }));
-                  })
-                  .catch((error: unknown) =>
-                    setAiMessage(error instanceof Error ? err(error.message) : t("settings.lastError")),
-                  );
-              }}
-            >
-              {t("settings.testConnection")}
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => {
-                void api<{ models: string[]; error: string | null }>("/ai/settings/models")
-                  .then((result) => {
-                    setModels(result.models);
-                    setAiMessage(result.error ?? (result.models.length ? null : t("settings.noModels")));
-                  })
-                  .catch((error: unknown) =>
-                    setAiMessage(error instanceof Error ? err(error.message) : t("settings.lastError")),
-                  );
-              }}
-            >
-              {t("settings.refreshModels")}
-            </Button>
-          </div>
-          <p className="font-mono text-[10px] text-muted-foreground">
-            {t("settings.connection")}: {ai.connection}
-            {ai.latencyMs !== null ? ` · ${t("settings.latency")}: ${ai.latencyMs}ms` : ""}
-            {ai.structuredOutput ? ` · ${t("settings.structuredOutput")}: ${ai.structuredOutput}` : ""}
-          </p>
-          {ai.lastError ? (
-            <p className="text-xs text-destructive">{err(ai.lastError)}</p>
-          ) : null}
-          {aiMessage ? <p className="text-xs text-muted-foreground">{aiMessage}</p> : null}
-        </CardContent>
-      </Card>
+      <AiSettings />
     </div>
   );
 }

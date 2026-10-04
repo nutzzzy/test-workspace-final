@@ -19,6 +19,10 @@ export class AiController {
       model?: string;
       temperature?: number;
       timeoutMs?: number;
+      apiKey?: string;
+      clearApiKey?: boolean;
+      allowExternal?: boolean;
+      deepAnalysis?: boolean;
     },
   ) {
     return this.ai.saveSettings(body ?? {});

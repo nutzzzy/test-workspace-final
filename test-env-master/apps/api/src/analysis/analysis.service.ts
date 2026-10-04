@@ -4,6 +4,9 @@ import {
   NotFoundException,
 } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
+import { createHash } from "crypto";
+import { maskSecrets } from "@qa-workbench/shared";
+import { AIService } from "../ai/ai.service";
 import {
   localizeIssueContentToFa,
   normalizeLocale,
@@ -21,7 +24,14 @@ import {
 
 const PIPELINE_CACHE_SIZE = 50;
 import { criterionMatchKey, syncAcceptanceCriteria } from "./acceptance-sync";
-import { analyzeRequirementGaps } from "./requirement-questions";
+import {
+  DEEP_STEPS,
+  mergeDeepAnalysis,
+  runDeepAnalysis,
+  type DeepAnalysis,
+  type DeepStep,
+} from "./deep-analysis";
+import { analyzeRequirementGaps, dedupeQuestions, type AnalysisQuestion } from "./requirement-questions";
 import {
   designAcceptanceCriteria,
   designAnalysis,
@@ -40,9 +50,50 @@ function sourceCriteria(
   return current.map((item) => item.text);
 }
 
+/** A deep (model-assisted) analysis running in the background for one issue. */
+export type DeepJob = {
+  state: "running" | "done" | "failed" | "cancelled";
+  locale: AppLocale;
+  step: DeepStep | "apply";
+  index: number;
+  total: number;
+  detail?: string;
+  startedAt: string;
+  finishedAt?: string;
+  error?: string;
+  /** The model was not called: a stored analysis of the same content was reused. */
+  reused?: boolean;
+  /** The model failed; the rule-based design was generated instead. */
+  warning?: string;
+};
+
+type StoredDeep = DeepAnalysis & { sourceHash: string };
+
+/** Fingerprint of the issue text a stored analysis (and its translation) was made from. */
+function sourceHashOf(issue: { title: string; description: string; acceptanceCriteria: Array<{ text: string }> }) {
+  return createHash("sha256")
+    .update(JSON.stringify([issue.title, issue.description, issue.acceptanceCriteria.map((item) => item.text)]))
+    .digest("hex");
+}
+
+/** "ai" when a model analysis is merged into this result. */
+function providerOf(result: PipelineResult): "ai" | "heuristic" {
+  return result.intelligence.ai ? "ai" : "heuristic";
+}
+
+function readDeep(intelligence: unknown): Partial<Record<AppLocale, StoredDeep>> {
+  const deep = (intelligence as { deep?: unknown } | null)?.deep;
+  return deep && typeof deep === "object" ? (deep as Partial<Record<AppLocale, StoredDeep>>) : {};
+}
+
 @Injectable()
 export class AnalysisService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ai: AIService,
+  ) {}
+
+  private readonly deepJobs = new Map<string, DeepJob & { cancel: AbortController }>();
 
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly pipelineCache = new Map<string, PipelineResult>();
@@ -104,6 +155,19 @@ export class AnalysisService {
    */
   async localizeIssueContent(jiraIssueId: string, locale: AppLocale) {
     const issue = await this.loadIssue(jiraIssueId);
+    // The model's translation (made during deep analysis of this exact text) is preferred.
+    const profile = await this.prisma.requirementProfile.findUnique({ where: { jiraIssueId: issue.id } });
+    const stored = readDeep(profile?.intelligence)[locale];
+    if (stored?.translation && stored.sourceHash === sourceHashOf(issue)) {
+      const translation = stored.translation;
+      return {
+        ...issue,
+        title: translation.title || issue.title,
+        description: translation.description || issue.description,
+        acceptanceCriteria: issue.acceptanceCriteria.map((ac, index) => ({ ...ac, text: translation.acceptanceCriteria[index] ?? ac.text })),
+        localizedPreview: true as const,
+      };
+    }
     if (locale !== "fa") return issue;
     const localized = localizeIssueContentToFa({
       title: issue.title,
@@ -142,6 +206,7 @@ export class AnalysisService {
       locale,
     });
     const pipeline = await this.pipelineFor(issue, locale);
+    const deep = await this.deepFor(issue.id, pipeline.contentHash, locale);
     const gaps = [
       ...new Set([
         ...data.gaps,
@@ -159,15 +224,44 @@ export class AnalysisService {
       inferred: pipeline.inferredAc,
       locale,
     });
+    const allQuestions: AnalysisQuestion[] = deep
+      ? dedupeQuestions([
+          ...questions,
+          ...deep.questions.map((item) => ({ question: item.question, category: item.category, reason: item.reason, source: "ai" })),
+        ])
+      : questions;
     const byCategory = (category: string) =>
-      questions.filter((item) => item.category === category).map((item) => item.question);
+      allQuestions.filter((item) => item.category === category).map((item) => item.question);
     const questionFields = {
       questionsProduct: byCategory("product"),
       questionsDeveloper: byCategory("developer"),
       questionsBusiness: byCategory("business"),
-      questionDetails: questions,
-      suggestedCriteria,
+      questionDetails: allQuestions,
+      // AI-proposed criteria carry their evidence and confidence; they stay suggestions.
+      suggestedCriteria: [
+        ...(deep?.criteria ?? []).map((item) => ({
+          text: item.text,
+          reason: item.rationale,
+          source: item.id,
+          confidence: item.confidence,
+          evidence: item.evidence,
+          grounded: item.grounded,
+          category: item.category,
+          needsConfirmation: item.needsConfirmation,
+        })),
+        ...suggestedCriteria,
+      ],
     };
+    if (deep) {
+      data.summary = deep.understanding.summary || data.summary;
+      data.ambiguities = [...new Set([...data.ambiguities, ...deep.understanding.assumptions])];
+      data.missingScenarios = [
+        ...new Set([
+          ...data.missingScenarios,
+          ...deep.testCases.filter((item) => item.edgeCase).map((item) => item.title),
+        ]),
+      ];
+    }
 
     const saved = await this.prisma.requirementAnalysis.upsert({
       where: { jiraIssueId: issue.id },
@@ -191,7 +285,7 @@ export class AnalysisService {
         ...questionFields,
       },
     });
-    return { ...saved, provider: "heuristic" as const };
+    return { ...saved, provider: deep ? ("ai" as const) : ("heuristic" as const) };
   }
 
   async generateStrategy(jiraIssueId: string, localeInput?: unknown) {
@@ -208,7 +302,8 @@ export class AnalysisService {
         "Strategy was manually edited; refuse automatic overwrite",
       );
     }
-    const data = (await this.pipelineFor(issue, locale)).strategy;
+    const pipeline = await this.pipelineFor(issue, locale);
+    const data = pipeline.strategy;
     const saved = await this.prisma.testStrategy.upsert({
       where: { jiraIssueId: issue.id },
       create: {
@@ -229,7 +324,7 @@ export class AnalysisService {
         assumptions: data.assumptions,
       },
     });
-    return { ...saved, provider: "heuristic" as const };
+    return { ...saved, provider: providerOf(pipeline) };
   }
 
   async generateTestCases(
@@ -372,7 +467,7 @@ export class AnalysisService {
       }
     }
 
-    return { created, provider: "heuristic" as const };
+    return { created, provider: providerOf(pipeline) };
   }
 
   async generateEdgeCases(jiraIssueId: string, localeInput?: unknown) {
@@ -381,7 +476,8 @@ export class AnalysisService {
       await this.loadIssue(jiraIssueId),
       locale,
     );
-    const designed = (await this.pipelineFor(issue, locale)).edgeCases;
+    const pipeline = await this.pipelineFor(issue, locale);
+    const designed = pipeline.edgeCases;
     const created = await this.prisma.$transaction(async (tx) => {
       await tx.edgeCase.deleteMany({
         where: { jiraIssueId: issue.id, manuallyEdited: false },
@@ -400,7 +496,7 @@ export class AnalysisService {
       }
       return rows;
     });
-    return { created, provider: "heuristic" as const };
+    return { created, provider: providerOf(pipeline) };
   }
 
   async generateRisks(jiraIssueId: string, localeInput?: unknown) {
@@ -409,7 +505,8 @@ export class AnalysisService {
       await this.loadIssue(jiraIssueId),
       locale,
     );
-    const risks = (await this.pipelineFor(issue, locale)).risks;
+    const pipeline = await this.pipelineFor(issue, locale);
+    const risks = pipeline.risks;
     const created = await this.prisma.$transaction(async (tx) => {
       await tx.risk.deleteMany({
         where: { jiraIssueId: issue.id, manuallyEdited: false },
@@ -432,7 +529,7 @@ export class AnalysisService {
       }
       return rows;
     });
-    return { created, provider: "heuristic" as const };
+    return { created, provider: providerOf(pipeline) };
   }
 
   async generateAutomation(jiraIssueId: string, localeInput?: unknown) {
@@ -441,7 +538,8 @@ export class AnalysisService {
       await this.loadIssue(jiraIssueId),
       locale,
     );
-    const candidates = (await this.pipelineFor(issue, locale)).automation;
+    const pipeline = await this.pipelineFor(issue, locale);
+    const candidates = pipeline.automation;
     const created = await this.prisma.$transaction(async (tx) => {
       await tx.automationCandidate.deleteMany({
         where: { jiraIssueId: issue.id, manuallyEdited: false },
@@ -465,7 +563,7 @@ export class AnalysisService {
       }
       return rows;
     });
-    return { created, provider: "heuristic" as const };
+    return { created, provider: providerOf(pipeline) };
   }
 
   async generateAll(jiraIssueId: string, localeInput?: unknown) {
@@ -552,27 +650,180 @@ export class AnalysisService {
     // per-tab actions reuse it instead of re-analysing the same text. The key
     // includes the content hash, so any change to title, description or
     // criteria is a cache miss.
-    const cacheKey = `${issue.id}|${requirementHash(input)}|${input.issueType ?? ""}|${locale}`;
+    const hash = requirementHash(input);
+    const deep = await this.deepFor(issue.id, hash, locale);
+    const cacheKey = `${issue.id}|${hash}|${input.issueType ?? ""}|${locale}|${deep?.createdAt ?? "-"}`;
     const cached = this.pipelineCache.get(cacheKey);
     if (cached) return cached;
-    const result = runQaPipeline(input);
+    const base = runQaPipeline(input);
+    // A stored model analysis of exactly this content is merged on top of the rule-based design.
+    const result = deep ? mergeDeepAnalysis(base, deep, input) : base;
     this.pipelineCache.set(cacheKey, result);
     if (this.pipelineCache.size > PIPELINE_CACHE_SIZE) {
       this.pipelineCache.delete(this.pipelineCache.keys().next().value!);
     }
+    const profile = await this.prisma.requirementProfile.findUnique({ where: { jiraIssueId: issue.id } });
+    const intelligence = { ...result.intelligence, deep: readDeep(profile?.intelligence) } as Prisma.InputJsonValue;
     await this.prisma.requirementProfile.upsert({
       where: { jiraIssueId: issue.id },
-      create: {
-        jiraIssueId: issue.id,
-        intelligence: result.intelligence as Prisma.InputJsonValue,
-        contentHash: result.contentHash,
-      },
-      update: {
-        intelligence: result.intelligence as Prisma.InputJsonValue,
-        contentHash: result.contentHash,
-      },
+      create: { jiraIssueId: issue.id, intelligence, contentHash: result.contentHash },
+      update: { intelligence, contentHash: result.contentHash },
     });
     return result;
+  }
+
+  /** The stored model analysis for this content and language, if any. */
+  private async deepFor(issueId: string, contentHash: string, locale: AppLocale): Promise<StoredDeep | null> {
+    const profile = await this.prisma.requirementProfile.findUnique({ where: { jiraIssueId: issueId } });
+    const stored = readDeep(profile?.intelligence)[locale];
+    return stored && stored.version === 1 && stored.contentHash === contentHash ? stored : null;
+  }
+
+  private async saveDeep(issueId: string, deep: StoredDeep) {
+    const profile = await this.prisma.requirementProfile.findUnique({ where: { jiraIssueId: issueId } });
+    const current = (profile?.intelligence ?? {}) as Record<string, unknown>;
+    const intelligence = { ...current, deep: { ...readDeep(current), [deep.locale]: deep } } as unknown as Prisma.InputJsonValue;
+    await this.prisma.requirementProfile.upsert({
+      where: { jiraIssueId: issueId },
+      create: { jiraIssueId: issueId, intelligence, contentHash: deep.contentHash },
+      update: { intelligence },
+    });
+  }
+
+  private inputOf(
+    issue: { key: string; title: string; description: string; issueType: string | null; acceptanceCriteria: Array<{ key: string; text: string; origin: string }> },
+    locale: AppLocale,
+  ): QaInput {
+    return {
+      title: issue.title,
+      description: issue.description,
+      issueKey: issue.key,
+      issueType: issue.issueType ?? undefined,
+      locale,
+      acceptanceCriteria: issue.acceptanceCriteria.map((item) => ({
+        key: item.key,
+        text: item.text,
+        origin: item.origin === "derived" ? "derived" : "cleaned",
+      })),
+    };
+  }
+
+  /**
+   * Start a deep analysis in the requested language: the model analyses the
+   * requirement in several passes (in the background — it may take minutes),
+   * then every artifact is regenerated with its findings merged in. Manually
+   * edited and approved items are never overwritten. A stored analysis of the
+   * same content and language is reused unless `force`.
+   */
+  async startDeepAnalysis(jiraIssueId: string, localeInput?: unknown, force = false) {
+    const locale = normalizeLocale(localeInput);
+    const issue = await this.loadIssue(jiraIssueId);
+    const status = await this.ai.analysisStatus();
+    if (!status.ready) throw new BadRequestException(`AI analysis is not available: ${status.reason}`);
+    const running = this.deepJobs.get(issue.id);
+    if (running?.state === "running") return this.deepStatus(issue.id, locale);
+
+    const job: DeepJob & { cancel: AbortController } = {
+      state: "running",
+      locale,
+      step: DEEP_STEPS[0],
+      index: 0,
+      total: DEEP_STEPS.length + 1,
+      startedAt: new Date().toISOString(),
+      cancel: new AbortController(),
+    };
+    this.deepJobs.set(issue.id, job);
+    void this.exclusive(issue.id, async () => {
+      const designed = await this.ensureDesignedCriteria(await this.loadIssue(issue.id), locale);
+      const input = this.inputOf(designed, locale);
+      const hash = requirementHash(input);
+      const existing = force ? null : await this.deepFor(designed.id, hash, locale);
+      if (existing) {
+        job.reused = true;
+      } else {
+        try {
+          const deep = await runDeepAnalysis({
+            input,
+            base: runQaPipeline(input),
+            provider: status.provider,
+            model: status.model,
+            llm: (call) => this.ai.structured(call, { signal: job.cancel.signal }),
+            isCancelled: () => job.cancel.signal.aborted,
+            onProgress: (progress) => {
+              job.step = progress.step;
+              job.index = progress.index;
+              job.detail = progress.detail;
+            },
+          });
+          await this.saveDeep(designed.id, { ...deep, sourceHash: sourceHashOf(designed) });
+        } catch (error) {
+          if (job.cancel.signal.aborted) throw error;
+          // An unreachable or failing model must not leave the user with nothing.
+          job.warning = maskSecrets(error instanceof Error ? error.message : "AI analysis failed").slice(0, 500);
+        }
+      }
+      job.step = "apply";
+      job.index = DEEP_STEPS.length + 1;
+      job.detail = undefined;
+      await this.generateAll(designed.id, locale);
+    })
+      .then(() => {
+        job.state = "done";
+      })
+      .catch((error: unknown) => {
+        job.state = job.cancel.signal.aborted ? "cancelled" : "failed";
+        job.error = maskSecrets(error instanceof Error ? error.message : "AI analysis failed").slice(0, 500);
+      })
+      .finally(() => {
+        job.finishedAt = new Date().toISOString();
+      });
+    return this.deepStatus(issue.id, locale);
+  }
+
+  async cancelDeepAnalysis(jiraIssueId: string) {
+    const issue = await this.loadIssue(jiraIssueId);
+    this.deepJobs.get(issue.id)?.cancel.abort();
+    return { ok: true };
+  }
+
+  /**
+   * What the workspace needs to show: whether the model can be used, the
+   * running job, the analyses stored per language, and — when the issue is
+   * written in another language — the model's translation for display.
+   */
+  async deepStatus(jiraIssueId: string, localeInput?: unknown) {
+    const locale = normalizeLocale(localeInput);
+    const issue = await this.loadIssue(jiraIssueId);
+    const ai = await this.ai.analysisStatus();
+    const profile = await this.prisma.requirementProfile.findUnique({ where: { jiraIssueId: issue.id } });
+    const stored = readDeep(profile?.intelligence);
+    const sourceHash = sourceHashOf(issue);
+    const runs = Object.fromEntries(
+      Object.entries(stored).map(([key, deep]) => [
+        key,
+        {
+          createdAt: deep!.createdAt,
+          provider: deep!.provider,
+          model: deep!.model,
+          durationMs: deep!.durationMs,
+          hadExplicitCriteria: deep!.hadExplicitCriteria,
+          criteria: deep!.criteria.length,
+          testCases: deep!.testCases.length,
+          questions: deep!.questions.length,
+          dropped: deep!.dropped,
+          current: deep!.sourceHash === sourceHash,
+        },
+      ]),
+    );
+    const own = stored[locale];
+    const job = this.deepJobs.get(issue.id);
+    return {
+      ai,
+      job: job ? { ...job, cancel: undefined } : null,
+      runs,
+      translation: own && own.sourceHash === sourceHash ? own.translation : null,
+      sourceLanguage: own?.sourceLanguage ?? null,
+    };
   }
 
   private linkCriteria(

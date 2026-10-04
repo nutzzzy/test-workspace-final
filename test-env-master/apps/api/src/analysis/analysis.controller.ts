@@ -1,4 +1,4 @@
-import { Body, Controller, Param, Post } from "@nestjs/common";
+import { Body, Controller, Get, Param, Post, Query } from "@nestjs/common";
 import { AnalysisService } from "./analysis.service";
 
 @Controller("analysis")
@@ -78,6 +78,25 @@ export class AnalysisController {
     return this.analysisService.exclusive(jiraIssueId, () =>
       this.analysisService.generateAll(jiraIssueId, body?.locale),
     );
+  }
+
+  /** Start a background deep analysis (model-assisted) in the given language. */
+  @Post(":jiraIssueId/deep")
+  startDeep(
+    @Param("jiraIssueId") jiraIssueId: string,
+    @Body() body: { locale?: string; force?: boolean },
+  ) {
+    return this.analysisService.startDeepAnalysis(jiraIssueId, body?.locale, body?.force === true);
+  }
+
+  @Get(":jiraIssueId/deep")
+  deepStatus(@Param("jiraIssueId") jiraIssueId: string, @Query("locale") locale?: string) {
+    return this.analysisService.deepStatus(jiraIssueId, locale);
+  }
+
+  @Post(":jiraIssueId/deep/cancel")
+  cancelDeep(@Param("jiraIssueId") jiraIssueId: string) {
+    return this.analysisService.cancelDeepAnalysis(jiraIssueId);
   }
 
   @Post(":jiraIssueId/localize")
