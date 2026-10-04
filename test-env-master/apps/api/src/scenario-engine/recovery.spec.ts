@@ -95,7 +95,7 @@ describe("bounded scenario recovery", () => {
 
     expect(outcome.status).toBe("PASSED");
     const step3 = results[2]!;
-    expect(step3.status).toBe("PASSED");
+    expect(step3.status).toBe("RECOVERED");
     expect(step3.recovery?.outcome).toBe("RECOVERED");
     expect(step3.recovery?.originalStatus).toBe(500);
     expect(step3.recovery?.attempts).toHaveLength(1);
@@ -134,7 +134,8 @@ describe("bounded scenario recovery", () => {
     const step = results[1]!;
     expect(step.recovery?.outcome).toBe("FAILED");
     expect(step.recovery?.attempts[0]).toMatchObject({ status: 200, expectationMet: false });
-    expect(outcome.status).toBe("FAILED");
+    expect(step.status).toBe("NEEDS_INPUT");
+    expect(outcome.status).toBe("NEEDS_INPUT");
   });
 
   it("never retries a POST automatically; it suggests the correction", async () => {
@@ -200,7 +201,10 @@ describe("bounded scenario recovery", () => {
     expect(trace.outcome).toBe("FAILED");
     expect(trace.attempts).toHaveLength(3);
     expect(trace.blockedReason).toBe("BUDGET");
-    expect(trace.suggestions).toHaveLength(1);
+    expect(trace.stoppedBecause).toBe("MAX_ATTEMPTS");
+    // 1 combined (all four fields) + 4 single-field candidates; 3 were sent.
+    expect(trace.attempts[0]!.candidate.reason).toBe("COMBINED");
+    expect(trace.suggestions).toHaveLength(2);
     expect(calls.filter((call) => call.url.includes("/find"))).toHaveLength(4);
   });
 
@@ -214,10 +218,9 @@ describe("bounded scenario recovery", () => {
       replacement: "9821",
       source: { stepName: "profile", orderIndex: 0, path: "response.body.data.bikerId" },
       originalSource: null,
-      confidence: "HIGH" as const,
-      reason: "SAME_KEY" as const,
     };
-    jest.spyOn(recovery, "planRecoveryCandidates").mockReturnValue([duplicate, { ...duplicate }]);
+    const candidate = { ...duplicate, changes: [duplicate], confidence: "HIGH" as const, reason: "SAME_KEY" as const };
+    jest.spyOn(recovery, "planRecoveryCandidates").mockReturnValue([candidate, { ...candidate }]);
     const { results } = await run([
       http("profile", { method: "GET", url: `${BASE}/profile` }),
       http("activate", { method: "GET", url: `${BASE}/activate`, query: { bikerId: "125" } }),
@@ -260,7 +263,13 @@ describe("bounded scenario recovery", () => {
       http("activate", { method: "GET", url: `${BASE}/bikers/{{bikerId}}/activate` }),
     ]);
     expect(results[0]!.extractedVars?.bikerId).toBe("B-9821");
-    expect(results[1]!.consumedVars).toEqual([{ variable: "bikerId", location: "url" }]);
+    expect(results[1]!.consumedVars).toEqual([
+      expect.objectContaining({
+        variable: "bikerId",
+        location: "url",
+        source: expect.objectContaining({ stepName: "profile", path: "response.body.data.bikerId" }),
+      }),
+    ]);
   });
 });
 
@@ -288,18 +297,17 @@ describe("recovery planning", () => {
     ).toEqual([]);
   });
 
-  it("maps entity ids by structure and URL segments at MEDIUM confidence", () => {
+  it("maps entity ids by semantic key (HIGH) and URL segments (MEDIUM)", () => {
     const candidates = planRecoveryCandidates(
       { method: "GET", url: `${BASE}/bikers/125/activate`, body: { bikerId: 125 } },
       [history({ biker: { id: 9821 } })],
     );
     expect(candidates).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ location: "body", confidence: "MEDIUM", reason: "ENTITY_ID" }),
-        expect.objectContaining({ location: "url", confidence: "MEDIUM", replacement: "9821" }),
+        expect.objectContaining({ location: "body", confidence: "HIGH", reason: "SEMANTIC_KEY", replacement: "9821" }),
+        expect.objectContaining({ location: "path", confidence: "MEDIUM", reason: "URL_ENTITY", replacement: "9821" }),
       ]),
     );
-    expect(candidates.some((item) => item.confidence === "HIGH")).toBe(false);
   });
 
   it("fingerprints the effective request independent of key order and header case", () => {
@@ -310,8 +318,15 @@ describe("recovery planning", () => {
   });
 
   it("applies safe defaults", () => {
-    expect(recoverySettings({})).toEqual({ enabled: true, maxAttempts: 3, allowMedium: false, idempotent: false });
-    expect(recoverySettings({ recovery: { maxAttempts: 99 } }).maxAttempts).toBe(5);
+    expect(recoverySettings({})).toEqual({
+      enabled: true,
+      maxAttempts: 10,
+      allowMedium: true,
+      allowMediumExplicit: false,
+      idempotent: false,
+      aiAssist: false,
+    });
+    expect(recoverySettings({ recovery: { maxAttempts: 99 } }).maxAttempts).toBe(10);
     expect(isRetrySafe("GET", false)).toBe(true);
     expect(isRetrySafe("POST", false)).toBe(false);
     expect(isRetrySafe("PUT", true)).toBe(true);

@@ -1,3 +1,6 @@
+import { isFormBody, parseForm } from "./request-inputs";
+import { semanticKeyOf, singular } from "./value-registry";
+
 export type FlowHttpStep = {
   id: string;
   name: string;
@@ -13,7 +16,7 @@ export type SampleResponse = {
   body?: unknown;
 };
 
-export type DependencyLocation = "url" | "header" | "query" | "body";
+export type DependencyLocation = "url" | "path" | "header" | "query" | "body" | "form" | "cookie";
 
 export type DependencySuggestion = {
   id: string;
@@ -156,10 +159,18 @@ type Target = { location: DependencyLocation; detail: string; value: string };
 
 function requestTargets(config: Record<string, unknown>): Target[] {
   const targets: Target[] = [];
-  if (typeof config.url === "string") targets.push({ location: "url", detail: "url", value: config.url });
+  if (typeof config.url === "string") targets.push(...urlTargets(config.url));
   const headers = asRecord(config.headers);
   for (const [key, value] of Object.entries(headers)) {
-    if (typeof value === "string") targets.push({ location: "header", detail: key, value });
+    if (typeof value !== "string") continue;
+    if (key.toLowerCase() === "cookie") {
+      for (const part of value.split(";")) {
+        const eq = part.indexOf("=");
+        if (eq > 0) targets.push({ location: "cookie", detail: part.slice(0, eq).trim(), value: part.slice(eq + 1).trim() });
+      }
+      continue;
+    }
+    targets.push({ location: "header", detail: key, value });
   }
   const query = asRecord(config.query);
   for (const [key, value] of Object.entries(query)) {
@@ -167,8 +178,43 @@ function requestTargets(config: Record<string, unknown>): Target[] {
       targets.push({ location: "query", detail: key, value: String(value) });
     }
   }
-  collectBody(config.body, "body", targets);
+  if (isFormBody({ body: config.body, headers: headers as Record<string, string> })) {
+    for (const pair of parseForm(config.body as string)) targets.push({ location: "form", detail: pair.key, value: pair.value });
+  } else {
+    collectBody(config.body, "body", targets);
+  }
   return targets;
+}
+
+/**
+ * URL path segments (named after the collection before them: /trips/8912 →
+ * tripId) and query parameters written into the URL. The host is never a target.
+ */
+function urlTargets(raw: string): Target[] {
+  const targets: Target[] = [];
+  const pathStart = raw.search(/[^/:]\/(?!\/)/);
+  const rest = pathStart >= 0 ? raw.slice(pathStart + 1) : raw;
+  const [path = "", query = ""] = rest.split("?");
+  const segments = path.split("/");
+  segments.forEach((segment, index) => {
+    if (!segment || segment.includes("{{")) return;
+    const previous = segments[index - 1] ?? "";
+    const name = previous && !/\d/.test(previous) ? `${singular(previous).replace(/[^A-Za-z0-9]/g, "")}Id` : `segment${index}`;
+    targets.push({ location: "path", detail: name, value: decodeSafe(segment) });
+  });
+  for (const pair of query.split("&")) {
+    const eq = pair.indexOf("=");
+    if (eq > 0) targets.push({ location: "query", detail: decodeSafe(pair.slice(0, eq)), value: decodeSafe(pair.slice(eq + 1)) });
+  }
+  return targets;
+}
+
+function decodeSafe(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 function collectBody(value: unknown, detail: string, targets: Target[]) {
@@ -195,11 +241,13 @@ function tokenPresent(haystack: string, needle: string): boolean {
 
 function scoreMatch(leaf: Leaf, target: Target, unique: boolean): number {
   let score = 0.4;
-  const segment = target.location === "url" && target.value.split(/[/?#=&]/).includes(leaf.value);
+  const segment =
+    (target.location === "url" && target.value.split(/[/?#=&]/).includes(leaf.value)) ||
+    (target.location === "path" && target.value === leaf.value);
   if (segment) score += 0.35;
   if (target.location === "header" && /authorization/i.test(target.detail)) score += 0.4;
-  else if (target.location === "header") score += 0.2;
-  if (target.location === "query") score += 0.25;
+  else if (target.location === "header" || target.location === "cookie") score += 0.2;
+  if (target.location === "query" || target.location === "form") score += 0.25;
   if (target.location === "body") score += 0.25;
   if (leaf.value.length >= 8) score += 0.15;
   if (unique) score += 0.1;
@@ -211,8 +259,12 @@ function scoreMatch(leaf: Leaf, target: Target, unique: boolean): number {
   return score;
 }
 
+/** Name a variable after what it identifies: $.data.trip.id → tripId. */
 function variableName(path: string, taken: string[]): string {
-  const leaf = path.split(".").pop()?.replace(/[^A-Za-z0-9_]/g, "") || "value";
+  const segments = path.replace(/^\$\.?/, "").split(".").filter(Boolean);
+  const key = segments[segments.length - 1] ?? "";
+  const parent = [...segments.slice(0, -1)].reverse().find((segment) => !/^\d+$/.test(segment) && !/^(data|result|payload|body|response)$/i.test(segment));
+  const leaf = semanticKeyOf(key, parent ? singular(parent) : "").replace(/[^A-Za-z0-9_]/g, "") || "value";
   const base = /^[A-Za-z_]/.test(leaf) ? leaf : `value${leaf}`;
   if (!taken.includes(base)) return base;
   let index = 2;

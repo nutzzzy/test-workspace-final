@@ -47,6 +47,29 @@ export class ScenariosController {
     return this.scenariosService.cancel(runId);
   }
 
+  /** Manual Recovery: continue a paused run with values chosen by the user. */
+  @Post("runs/:runId/resolve")
+  resolveInput(@Param("runId") runId: string, @Body() body: unknown) {
+    return this.scenariosService.resolveInput(runId, body);
+  }
+
+  /** Manual Recovery: leave the step as NEEDS_INPUT and let the run finish. */
+  @Post("runs/:runId/skip-input")
+  skipInput(@Param("runId") runId: string) {
+    return this.scenariosService.skipInput(runId);
+  }
+
+  /** Save (or replace) a dependency mapping for one input of the step. */
+  @Post("steps/:stepId/bindings")
+  saveBinding(@Param("stepId") stepId: string, @Body() body: unknown) {
+    return this.scenariosService.saveBinding(stepId, body);
+  }
+
+  @Post("steps/:stepId/bindings/remove")
+  removeBinding(@Param("stepId") stepId: string, @Body() body: { location?: string; field?: string }) {
+    return this.scenariosService.removeBinding(stepId, body);
+  }
+
   @Patch("steps/:stepId")
   updateStep(
     @Param("stepId") stepId: string,
@@ -138,7 +161,7 @@ export class ScenariosController {
       consumerStepId: string;
       sourcePath: string;
       variable: string;
-      location: "url" | "header" | "query" | "body";
+      location: "url" | "path" | "header" | "query" | "body" | "form" | "cookie";
       locationDetail: string;
     },
   ) {

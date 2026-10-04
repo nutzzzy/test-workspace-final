@@ -7,6 +7,13 @@ import { Prisma } from "@prisma/client";
 import { DatabaseConnectorsService } from "../database-connectors/database-connectors.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { applyDependency, type DependencyChange } from "../scenario-engine/flow/apply-dependency";
+import {
+  isBinding,
+  readBindings,
+  removeBinding,
+  upsertBinding,
+} from "../scenario-engine/flow/bindings";
+import type { InputLocation } from "../scenario-engine/flow/request-inputs";
 import { analyzeDependencies, type FlowHttpStep } from "../scenario-engine/flow/dependency-analyzer";
 import { flowHealth, validateFlow } from "../scenario-engine/flow/flow-validator";
 import { parseCurl, splitCurlCommands } from "../scenario-engine/flow/parse-curl";
@@ -238,6 +245,45 @@ export class ScenariosService {
 
   cancel(runId: string) {
     return this.runner.cancel(runId);
+  }
+
+  resolveInput(runId: string, body: unknown) {
+    return this.runner.resolveInput(runId, body);
+  }
+
+  skipInput(runId: string) {
+    return this.runner.skipInput(runId);
+  }
+
+  /**
+   * Save a mapping `target ← source` on an HTTP step. Only the binding for the
+   * same target is replaced; other saved mappings are never changed.
+   */
+  async saveBinding(stepId: string, body: unknown) {
+    const step = await this.prisma.scenarioStep.findUnique({ where: { id: stepId } });
+    if (!step) throw new NotFoundException("Step not found");
+    if (step.type !== "HTTP_REQUEST") throw new BadRequestException("Only HTTP steps take dependency mappings");
+    if (!isBinding(body)) throw new BadRequestException("A mapping needs a target field and a source");
+    const config = asRecord(step.config);
+    const binding = { ...body, origin: body.origin ?? "manual", createdAt: new Date().toISOString() };
+    return this.prisma.scenarioStep.update({
+      where: { id: stepId },
+      data: { config: { ...config, bindings: upsertBinding(readBindings(config), binding) } as Prisma.InputJsonValue },
+    });
+  }
+
+  async removeBinding(stepId: string, target: { location?: string; field?: string }) {
+    const step = await this.prisma.scenarioStep.findUnique({ where: { id: stepId } });
+    if (!step) throw new NotFoundException("Step not found");
+    if (typeof target.location !== "string" || typeof target.field !== "string") {
+      throw new BadRequestException("A mapping target needs a location and a field");
+    }
+    const config = asRecord(step.config);
+    const next = removeBinding(readBindings(config), { location: target.location as InputLocation, field: target.field });
+    return this.prisma.scenarioStep.update({
+      where: { id: stepId },
+      data: { config: { ...config, bindings: next } as unknown as Prisma.InputJsonValue },
+    });
   }
 
   async importCurl(scenarioId: string, text: string) {

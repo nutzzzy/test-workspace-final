@@ -1,4 +1,5 @@
-import type { ExecutionContext } from "./types";
+import { isFormBody, parseForm, serializeForm } from "./flow/request-inputs";
+import type { ExecutionContext, ValueSource } from "./types";
 
 const ALIAS_GROUPS = [
   ["token", "access_token", "accessToken", "jwt", "id_token", "idToken"],
@@ -63,6 +64,7 @@ export function captureResponse(
     for (const key of aliasesFor(path)) {
       if (context.isInitial(key) || context.get(key) !== undefined) continue;
       context.set(key, text);
+      context.describeVariable(key, { type: typeof value, path: `response.body.${path.join(".")}` });
       learned[key] = text;
     }
   };
@@ -115,7 +117,7 @@ function lookup(key: string, context: ExecutionContext): string | undefined {
   return undefined;
 }
 
-export type ConsumedVar = { variable: string; location: string };
+export type ConsumedVar = { variable: string; location: string; source?: ValueSource };
 
 function bindString(
   input: string,
@@ -125,7 +127,10 @@ function bindString(
   fieldKey?: string,
 ) {
   const use = (variable: string, value: string | undefined) => {
-    if (value !== undefined) consumed.push({ variable, location });
+    if (value !== undefined) {
+      const source = context.sourceOf(variable);
+      consumed.push({ variable, location, ...(source ? { source } : {}) });
+    }
     return value;
   };
   let next = input.replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (match, key: string) => {
@@ -144,6 +149,35 @@ function bindString(
   return next;
 }
 
+const WHOLE_PLACEHOLDER = /^\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}$/;
+
+/**
+ * A JSON body field that is exactly "{{orderId}}" takes the variable in its
+ * original JSON type: a numeric id from an earlier response stays a number.
+ * Environment/text variables stay text.
+ */
+function typedBodyValue(value: string, context: ExecutionContext, location: string, consumed: ConsumedVar[]) {
+  if (!location.startsWith("body")) return undefined;
+  const match = WHOLE_PLACEHOLDER.exec(value.trim());
+  if (!match) return undefined;
+  const typed = context.typedValue(match[1]!);
+  if (typed === undefined || typeof typed === "string") return undefined;
+  const source = context.sourceOf(match[1]!);
+  consumed.push({ variable: match[1]!, location, ...(source ? { source } : {}) });
+  return typed;
+}
+
+/** form-urlencoded body: bind each field by name and re-encode its value. */
+function bindForm(body: string, context: ExecutionContext, consumed: ConsumedVar[]) {
+  return serializeForm(
+    parseForm(body).map((pair) => ({
+      key: pair.key,
+      // An unresolved {{x}} must fail loudly, not be sent URL-encoded.
+      value: context.interpolate(bindString(pair.value, context, `form.${pair.key}`, consumed, pair.key)),
+    })),
+  );
+}
+
 function bindValue(
   value: unknown,
   context: ExecutionContext,
@@ -151,7 +185,11 @@ function bindValue(
   consumed: ConsumedVar[],
   fieldKey?: string,
 ): unknown {
-  if (typeof value === "string") return bindString(value, context, location, consumed, fieldKey);
+  if (typeof value === "string") {
+    const typed = typedBodyValue(value, context, location, consumed);
+    if (typed !== undefined) return typed;
+    return bindString(value, context, location, consumed, fieldKey);
+  }
   if (Array.isArray(value)) {
     return value.map((item, index) => bindValue(item, context, `${location}.${index}`, consumed));
   }
@@ -171,7 +209,9 @@ export function bindRequest(
   context: ExecutionContext,
   consumed: ConsumedVar[] = [],
 ): Record<string, unknown> {
-  const bound = bindValue(config, context, "", consumed) as Record<string, unknown>;
+  const form = isFormBody({ body: config.body, headers: config.headers as Record<string, string> | undefined });
+  const bound = bindValue(form ? { ...config, body: undefined } : config, context, "", consumed) as Record<string, unknown>;
+  if (form) bound.body = bindForm(config.body as string, context, consumed);
   const token = lookup("token", context);
   if (!token || !tokenAllowedFor(bound.url, context)) return bound;
 

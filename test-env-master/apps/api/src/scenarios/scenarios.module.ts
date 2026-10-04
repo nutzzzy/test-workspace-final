@@ -1,4 +1,5 @@
 import { Module } from "@nestjs/common";
+import { AIModule } from "../ai/ai.module";
 import { DatabaseConnectorsModule } from "../database-connectors/database-connectors.module";
 import { EnvironmentsModule } from "../environments/environments.module";
 import { ScenarioRunner } from "../scenario-engine/scenario.runner";
@@ -6,7 +7,7 @@ import { ScenariosController } from "./scenarios.controller";
 import { ScenariosService } from "./scenarios.service";
 
 @Module({
-  imports: [EnvironmentsModule, DatabaseConnectorsModule],
+  imports: [EnvironmentsModule, DatabaseConnectorsModule, AIModule],
   controllers: [ScenariosController],
   providers: [ScenariosService, ScenarioRunner],
   exports: [ScenariosService, ScenarioRunner],

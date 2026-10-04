@@ -1,5 +1,6 @@
 import { assertResolvedHostAllowed, normalizeHost } from "../../common/network-policy";
 import { bindRequest, captureResponse, type ConsumedVar } from "../auto-bind";
+import { isFormBody } from "../flow/request-inputs";
 import type { ExecutionContext, StepExecutionResult, StepExecutor } from "../types";
 
 async function assertSafeUrl(raw: string) {
@@ -31,8 +32,9 @@ export type ResolvedHttpRequest = {
 };
 
 /**
- * Optional `expectedStatus` (number or list). Without it the HTTP step keeps
- * its historical behaviour: any response is PASSED and assertions decide.
+ * Optional `expectedStatus` (number or list). Without it the executor itself
+ * reports any response as PASSED; in a scenario the orchestrator then requires
+ * 2xx (or a status assertion) plus every attached assertion.
  */
 export function expectedStatuses(config: Record<string, unknown>): number[] | null {
   const raw = config.expectedStatus;
@@ -50,6 +52,21 @@ function dedupeConsumed(items: ConsumedVar[]): ConsumedVar[] {
     seen.add(key);
     return true;
   });
+}
+
+/** name → value of every Set-Cookie of the response. */
+function readSetCookies(headers: Headers): Record<string, string> {
+  const list =
+    typeof (headers as Headers & { getSetCookie?: () => string[] }).getSetCookie === "function"
+      ? (headers as Headers & { getSetCookie: () => string[] }).getSetCookie()
+      : [];
+  const out: Record<string, string> = {};
+  for (const line of list) {
+    const pair = line.split(";")[0] ?? "";
+    const eq = pair.indexOf("=");
+    if (eq > 0) out[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+  }
+  return out;
 }
 
 function hasHeader(headers: Record<string, string> | undefined, name: string) {
@@ -77,6 +94,8 @@ export class HttpRequestExecutor implements StepExecutor {
     delete requestConfig.originalCurl;
     delete requestConfig.recovery;
     delete requestConfig.expectedStatus;
+    delete requestConfig.bindings;
+    delete requestConfig.continueOnFailure;
     const consumed: ConsumedVar[] = [];
     const request = context.interpolateDeep(bindRequest(requestConfig, context, consumed)) as ResolvedHttpRequest;
     return { request, consumed: dedupeConsumed(consumed) };
@@ -123,11 +142,16 @@ export class HttpRequestExecutor implements StepExecutor {
 
     const sendsBody = resolved.body !== undefined && method !== "GET" && method !== "HEAD";
     const jsonBody = sendsBody && typeof resolved.body !== "string";
-    // An object body is JSON; without this fetch labels it text/plain.
+    const formBody = sendsBody && !jsonBody && isFormBody({ body: resolved.body, headers: resolved.headers });
+    // An object body is JSON and a=b&c=d is a form; without this fetch labels both text/plain.
     const headers =
-      jsonBody && !hasHeader(resolved.headers, "content-type")
-        ? { ...(resolved.headers ?? {}), "Content-Type": "application/json" }
+      (jsonBody || formBody) && !hasHeader(resolved.headers, "content-type")
+        ? {
+            ...(resolved.headers ?? {}),
+            "Content-Type": jsonBody ? "application/json" : "application/x-www-form-urlencoded",
+          }
         : resolved.headers;
+    const requestStarted = Date.now();
 
     try {
       const response = await fetch(url.toString(), {
@@ -166,12 +190,17 @@ export class HttpRequestExecutor implements StepExecutor {
       response.headers.forEach((value, key) => {
         responseHeaders[key] = value;
       });
+      const cookies = readSetCookies(response.headers);
+      for (const value of Object.values(cookies)) context.markSecret(value);
+      const durationMs = Date.now() - requestStarted;
 
       context.lastHttpResponse = {
         status: response.status,
         headers: responseHeaders,
         body,
         rawBody,
+        cookies,
+        durationMs,
       };
       const learned = captureResponse(body, context, url.origin);
 
@@ -195,6 +224,8 @@ export class HttpRequestExecutor implements StepExecutor {
           status: response.status,
           headers: responseHeaders,
           body,
+          durationMs,
+          ...(Object.keys(cookies).length ? { cookies: Object.keys(cookies) } : {}),
         }),
       };
     } catch (error) {

@@ -72,8 +72,8 @@ function patchConfig(
   literal: string,
 ): Record<string, unknown> {
   const next = structuredClone(config);
-  if (change.location === "url" && typeof next.url === "string") {
-    next.url = replaceToken(next.url, literal, change.variable);
+  if ((change.location === "url" || change.location === "path") && typeof next.url === "string") {
+    next.url = replaceInUrl(next.url, literal, change.variable, change.location === "path" ? "path" : "all");
   }
   if (change.location === "header") {
     const headers = { ...((next.headers as Record<string, string> | undefined) ?? {}) };
@@ -90,12 +90,72 @@ function patchConfig(
     if (typeof query[change.locationDetail] === "string") {
       query[change.locationDetail] = replaceToken(query[change.locationDetail], literal, change.variable);
       next.query = query;
+    } else if (typeof next.url === "string") {
+      // The parameter is written into the URL itself (?bikerId=125).
+      next.url = replaceInUrl(next.url, literal, change.variable, "query", change.locationDetail);
+    }
+  }
+  if (change.location === "form" && typeof next.body === "string") {
+    next.body = next.body
+      .split("&")
+      .map((pair) => {
+        const eq = pair.indexOf("=");
+        if (eq < 0 || decodeSafe(pair.slice(0, eq)) !== change.locationDetail) return pair;
+        return `${pair.slice(0, eq)}=${replaceToken(decodeSafe(pair.slice(eq + 1)), literal, change.variable)}`;
+      })
+      .join("&");
+  }
+  if (change.location === "cookie") {
+    const headers = { ...((next.headers as Record<string, string> | undefined) ?? {}) };
+    const key = Object.keys(headers).find((item) => item.toLowerCase() === "cookie");
+    if (key && typeof headers[key] === "string") {
+      headers[key] = headers[key]
+        .split(";")
+        .map((part) => {
+          const eq = part.indexOf("=");
+          if (eq < 0 || part.slice(0, eq).trim() !== change.locationDetail) return part;
+          return `${part.slice(0, eq)}=${replaceToken(part.slice(eq + 1).trim(), literal, change.variable)}`;
+        })
+        .join(";");
+      next.headers = headers;
     }
   }
   if (change.location === "body") {
     next.body = patchBody(next.body, change.locationDetail, literal, change.variable);
   }
   return next;
+}
+
+function decodeSafe(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** Replace the literal in the URL path and/or query, never in the host. */
+function replaceInUrl(url: string, literal: string, variable: string, part: "path" | "query" | "all", queryKey?: string) {
+  const pathStart = url.search(/[^/:]\/(?!\/)/);
+  if (pathStart < 0) return part === "all" ? replaceToken(url, literal, variable) : url;
+  const origin = url.slice(0, pathStart + 1);
+  const rest = url.slice(pathStart + 1);
+  const q = rest.indexOf("?");
+  const path = q < 0 ? rest : rest.slice(0, q);
+  const query = q < 0 ? "" : rest.slice(q + 1);
+  const nextPath = part === "query" ? path : replaceToken(path, literal, variable);
+  const nextQuery =
+    part === "path"
+      ? query
+      : query
+          .split("&")
+          .map((pair) => {
+            const eq = pair.indexOf("=");
+            if (eq < 0 || (queryKey && decodeSafe(pair.slice(0, eq)) !== queryKey)) return pair;
+            return `${pair.slice(0, eq)}=${replaceToken(decodeSafe(pair.slice(eq + 1)), literal, variable)}`;
+          })
+          .join("&");
+  return `${origin}${nextPath}${query || q >= 0 ? `?${nextQuery}` : ""}`;
 }
 
 function patchBody(value: unknown, detail: string, literal: string, variable: string): unknown {

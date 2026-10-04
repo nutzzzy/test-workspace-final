@@ -46,7 +46,7 @@ curl -X GET 'https://api.example.test/orders/123'
       { stepId: "s1", status: 200, body: { data: { accessToken: "TOKEN-ABC", userId: 582 } } },
     ]);
     const token = suggestions.find((item) => item.location === "header");
-    const path = suggestions.find((item) => item.location === "url");
+    const path = suggestions.find((item) => item.location === "path");
     expect(token).toMatchObject({
       sourcePath: "$.data.accessToken",
       variable: "accessToken",
@@ -96,7 +96,7 @@ curl -X GET 'https://api.example.test/orders/123'
       sourcePath: "$.result.reference",
       variable: "reference",
       confidence: "HIGH",
-      location: "url",
+      location: "path",
     });
   });
 
@@ -188,7 +188,7 @@ curl -X GET 'https://api.example.test/orders/123'
         ],
         [{ stepId: "a", status: 201, body: { data: { bikerId: "BK-98210", userId: "US-12577" } } }],
       );
-      expect(suggestions.find((item) => item.location === "url")?.sourcePath).toBe("$.data.bikerId");
+      expect(suggestions.find((item) => item.location === "path")?.sourcePath).toBe("$.data.bikerId");
       expect(suggestions.find((item) => item.location === "body")?.sourcePath).toBe("$.data.userId");
     });
 

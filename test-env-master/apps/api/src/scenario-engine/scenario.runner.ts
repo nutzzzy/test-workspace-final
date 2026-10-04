@@ -1,10 +1,14 @@
 import {
+  BadRequestException,
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
   type OnModuleInit,
 } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
+import { z } from "zod";
+import { AIService } from "../ai/ai.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { EnvironmentsService } from "../environments/environments.service";
 import { DatabaseConnectorsService } from "../database-connectors/database-connectors.service";
@@ -15,23 +19,43 @@ import { DelayExecutor } from "./executors/delay.executor";
 import { ExtractVariableExecutor } from "./executors/extract-variable.executor";
 import { HttpRequestExecutor } from "./executors/http-request.executor";
 import { SetVariableExecutor } from "./executors/set-variable.executor";
-import { orchestrateSteps } from "./orchestrate";
+import type { StepBinding } from "./flow/bindings";
+import { parseResolution, type ManualResolution } from "./flow/manual-recovery";
+import type { SemanticRanker } from "./flow/recover-step";
+import { orchestrateSteps, type LiveStepProgress, type PendingInput } from "./orchestrate";
 import { StepExecutorRegistry } from "./step-executor.registry";
 import { ExecutionContext } from "./types";
 
 export const INTERRUPTED_RUN_ERROR =
   "Run was interrupted because the API restarted before it finished";
 
+/** How long a run waits for Manual Recovery before the step stays NEEDS_INPUT. */
+const INPUT_TIMEOUT_MS = 30 * 60 * 1000;
+
+type Waiting = {
+  orderIndex: number;
+  stepRunId: string;
+  resolve: (resolution: ManualResolution | null) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+const RANK_SCHEMA = z.object({ candidateIds: z.array(z.string()).max(10) });
+
 @Injectable()
 export class ScenarioRunner implements OnModuleInit {
   private readonly logger = new Logger(ScenarioRunner.name);
   private readonly registry = new StepExecutorRegistry();
   private readonly active = new Map<string, ExecutionContext>();
+  /** Live (not persisted) progress per run: running step, recovery attempt. */
+  private readonly live = new Map<string, LiveStepProgress>();
+  /** Runs paused on a NEEDS_INPUT step, waiting for Manual Recovery. */
+  private readonly waiting = new Map<string, Waiting>();
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly environments: EnvironmentsService,
     connectors: DatabaseConnectorsService,
+    @Optional() private readonly ai?: AIService,
   ) {
     for (const executor of [
       new HttpRequestExecutor(),
@@ -54,7 +78,7 @@ export class ScenarioRunner implements OnModuleInit {
   async onModuleInit() {
     try {
       const { count } = await this.prisma.scenarioRun.updateMany({
-        where: { status: { in: ["RUNNING", "PENDING"] } },
+        where: { status: { in: ["RUNNING", "PENDING", "NEEDS_INPUT"] }, finishedAt: null },
         data: { status: "FAILED", finishedAt: new Date(), error: INTERRUPTED_RUN_ERROR },
       });
       if (count > 0) this.logger.warn(`Marked ${count} interrupted scenario run(s) as FAILED`);
@@ -69,6 +93,24 @@ export class ScenarioRunner implements OnModuleInit {
     return this.registry;
   }
 
+  /**
+   * Optional model ranking for `recovery.aiAssist` steps. It only sees
+   * candidate metadata (step, key, path, type) and the error message — never
+   * values — and the heuristic fallback counts as "no suggestion".
+   */
+  private semanticRanker(): SemanticRanker {
+    return async (input) => {
+      if (!this.ai) return [];
+      const { data, provider } = await this.ai.generateStructured({
+        system:
+          "You rank which earlier API response field most likely supplies a request input. Answer with candidate ids only.",
+        prompt: JSON.stringify(input),
+        schema: RANK_SCHEMA,
+      });
+      return provider === "heuristic" ? [] : data.candidateIds.slice(0, 3);
+    };
+  }
+
   async getRun(runId: string) {
     const run = await this.prisma.scenarioRun.findUnique({
       where: { id: runId },
@@ -78,19 +120,52 @@ export class ScenarioRunner implements OnModuleInit {
       },
     });
     if (!run) throw new NotFoundException("Scenario run not found");
-    return run;
+    const live = this.live.get(runId);
+    const waiting = this.waiting.get(runId);
+    return {
+      ...run,
+      live: live ? { ...live, awaitingInput: Boolean(waiting), stepRunId: waiting?.stepRunId ?? null } : null,
+    };
+  }
+
+  /** Continue a paused run with the user's Manual Recovery choice. */
+  async resolveInput(runId: string, body: unknown) {
+    const waiting = this.waiting.get(runId);
+    if (!waiting) throw new BadRequestException("This run is not waiting for input");
+    const resolution = parseResolution(body);
+    if (!resolution) throw new BadRequestException("Choose a target field and a value");
+    this.release(runId, resolution);
+    await this.prisma.scenarioRun.updateMany({ where: { id: runId, status: "NEEDS_INPUT" }, data: { status: "RUNNING" } });
+    return this.getRun(runId);
+  }
+
+  /** Stop waiting: the step stays NEEDS_INPUT and the run continues or stops as configured. */
+  async skipInput(runId: string) {
+    if (!this.waiting.has(runId)) throw new BadRequestException("This run is not waiting for input");
+    this.release(runId, null);
+    await this.prisma.scenarioRun.updateMany({ where: { id: runId, status: "NEEDS_INPUT" }, data: { status: "RUNNING" } });
+    return this.getRun(runId);
+  }
+
+  private release(runId: string, resolution: ManualResolution | null) {
+    const waiting = this.waiting.get(runId);
+    if (!waiting) return;
+    clearTimeout(waiting.timer);
+    this.waiting.delete(runId);
+    waiting.resolve(resolution);
   }
 
   async cancel(runId: string) {
     const ctx = this.active.get(runId);
     if (ctx) {
       ctx.cancel();
+      this.release(runId, null);
       return { ok: true, live: true };
     }
     const run = await this.prisma.scenarioRun.findUnique({
       where: { id: runId },
     });
-    if (run && run.status === "RUNNING") {
+    if (run && !run.finishedAt && (run.status === "RUNNING" || run.status === "NEEDS_INPUT")) {
       await this.prisma.scenarioRun.update({
         where: { id: runId },
         data: { status: "CANCELLED", finishedAt: new Date() },
@@ -105,7 +180,7 @@ export class ScenarioRunner implements OnModuleInit {
    */
   async start(scenarioId: string) {
     const prepared = await this.prepareRun(scenarioId);
-    void this.executePrepared(prepared).catch((error) => {
+    void this.executePrepared(prepared, { interactive: true }).catch((error) => {
       this.logger.error(
         `Scenario run ${prepared.runId} crashed`,
         error instanceof Error ? error.stack : String(error),
@@ -117,7 +192,7 @@ export class ScenarioRunner implements OnModuleInit {
   /** Synchronous full run — useful for scripts / demos that await completion. */
   async run(scenarioId: string) {
     const prepared = await this.prepareRun(scenarioId);
-    await this.executePrepared(prepared);
+    await this.executePrepared(prepared, { interactive: false });
     return this.getRun(prepared.runId);
   }
 
@@ -172,10 +247,82 @@ export class ScenarioRunner implements OnModuleInit {
     };
     context: ExecutionContext;
     startedAt: Date;
-  }) {
+  }, mode: { interactive: boolean }) {
     const { runId, scenario, context, startedAt } = prepared;
-    let finalStatus: "PASSED" | "FAILED" | "CANCELLED" = "PASSED";
+    let finalStatus: "PASSED" | "FAILED" | "CANCELLED" | "NEEDS_INPUT" = "PASSED";
     let runError: string | undefined;
+    /** Step-run rows written while a step waited for input, updated when it finishes. */
+    const interimRows = new Map<number, string>();
+
+    const rowData = (stepResult: import("./types").OrchestrationStepResult) => {
+      const matching = scenario.steps.find(
+        (s) => s.orderIndex === stepResult.orderIndex && s.name === stepResult.name,
+      );
+      const finishedAt = new Date();
+      return {
+        scenarioRunId: runId,
+        scenarioStepId: matching?.id,
+        name: stepResult.name,
+        type: stepResult.type,
+        orderIndex: stepResult.orderIndex,
+        status: stepResult.status,
+        startedAt: new Date(finishedAt.getTime() - stepResult.durationMs),
+        finishedAt,
+        durationMs: stepResult.durationMs,
+        resolvedInput: stepResult.resolvedInput
+          ? (context.redact(stepResult.resolvedInput) as Prisma.InputJsonValue)
+          : undefined,
+        output: persistedOutput(stepResult, context),
+        error: stepResult.error ? (context.redact(stepResult.error) as string) : null,
+        extractedVars: stepResult.extractedVars
+          ? (context.redact(stepResult.extractedVars) as Prisma.InputJsonValue)
+          : undefined,
+      };
+    };
+    const createRow = async (data: ReturnType<typeof rowData>) => {
+      try {
+        return await this.prisma.scenarioStepRun.create({ data });
+      } catch (error) {
+        // The step may have been deleted while the run was executing;
+        // keep the result (it is a snapshot) without the dangling link.
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === "P2003" &&
+          data.scenarioStepId
+        ) {
+          return this.prisma.scenarioStepRun.create({ data: { ...data, scenarioStepId: undefined } });
+        }
+        throw error;
+      }
+    };
+
+    const awaitInput = async (pending: PendingInput) => {
+      const data = rowData(pending.result);
+      const existing = interimRows.get(pending.orderIndex);
+      const row = existing
+        ? await this.prisma.scenarioStepRun.update({ where: { id: existing }, data })
+        : await createRow(data);
+      interimRows.set(pending.orderIndex, row.id);
+      await this.prisma.scenarioRun.updateMany({
+        where: { id: runId, status: "RUNNING" },
+        data: { status: "NEEDS_INPUT", variablesJson: context.redact(context.entries()) as Prisma.InputJsonValue },
+      });
+      if (context.isCancelled()) return null;
+      return new Promise<ManualResolution | null>((resolve) => {
+        const timer = setTimeout(() => this.release(runId, null), INPUT_TIMEOUT_MS);
+        this.waiting.set(runId, { orderIndex: pending.orderIndex, stepRunId: row.id, resolve, timer });
+      });
+    };
+
+    const onSaveBindings = async (stepId: string, bindings: StepBinding[]) => {
+      const current = await this.prisma.scenarioStep.findUnique({ where: { id: stepId } });
+      if (!current) return;
+      const config = (current.config ?? {}) as Record<string, unknown>;
+      await this.prisma.scenarioStep.update({
+        where: { id: stepId },
+        data: { config: { ...config, bindings } as unknown as Prisma.InputJsonValue },
+      });
+    };
 
     try {
       const result = await orchestrateSteps(
@@ -191,53 +338,19 @@ export class ScenarioRunner implements OnModuleInit {
         context,
         {
           stopOnFailure: scenario.stopOnFailure,
+          ranker: this.ai ? this.semanticRanker() : undefined,
+          onProgress: (progress) => {
+            this.live.set(runId, progress);
+          },
+          ...(mode.interactive ? { awaitInput, onSaveBindings } : { onSaveBindings }),
           onStepComplete: async (stepResult) => {
-            const matching = scenario.steps.find(
-              (s) =>
-                s.orderIndex === stepResult.orderIndex &&
-                s.name === stepResult.name,
-            );
-            const finishedAt = new Date();
-            const startedAtStep = new Date(
-              finishedAt.getTime() - stepResult.durationMs,
-            );
-            const data = {
-                scenarioRunId: runId,
-                scenarioStepId: matching?.id,
-                name: stepResult.name,
-                type: stepResult.type,
-                orderIndex: stepResult.orderIndex,
-                status: stepResult.status,
-                startedAt: startedAtStep,
-                finishedAt,
-                durationMs: stepResult.durationMs,
-                resolvedInput: stepResult.resolvedInput
-                  ? (context.redact(stepResult.resolvedInput) as Prisma.InputJsonValue)
-                  : undefined,
-                output: persistedOutput(stepResult, context),
-                error: stepResult.error
-                  ? (context.redact(stepResult.error) as string)
-                  : undefined,
-                extractedVars: stepResult.extractedVars
-                  ? (context.redact(stepResult.extractedVars) as Prisma.InputJsonValue)
-                  : undefined,
-            };
-            try {
-              await this.prisma.scenarioStepRun.create({ data });
-            } catch (error) {
-              // The step may have been deleted while the run was executing;
-              // keep the result (it is a snapshot) without the dangling link.
-              if (
-                error instanceof Prisma.PrismaClientKnownRequestError &&
-                error.code === "P2003" &&
-                data.scenarioStepId
-              ) {
-                await this.prisma.scenarioStepRun.create({
-                  data: { ...data, scenarioStepId: undefined },
-                });
-              } else {
-                throw error;
-              }
+            const data = rowData(stepResult);
+            const interim = interimRows.get(stepResult.orderIndex);
+            if (interim) {
+              await this.prisma.scenarioStepRun.update({ where: { id: interim }, data });
+              interimRows.delete(stepResult.orderIndex);
+            } else {
+              await createRow(data);
             }
             // Live variables snapshot for polling UI
             await this.prisma.scenarioRun.update({
@@ -260,6 +373,8 @@ export class ScenarioRunner implements OnModuleInit {
         error instanceof Error ? error.message : "Scenario execution failed";
     } finally {
       this.active.delete(runId);
+      this.live.delete(runId);
+      this.release(runId, null);
     }
 
     if (context.isCancelled()) {
@@ -270,7 +385,7 @@ export class ScenarioRunner implements OnModuleInit {
     // Only a run that is still RUNNING is finalized here: a cancellation
     // recorded meanwhile (e.g. through the non-live cancel path) wins.
     await this.prisma.scenarioRun.updateMany({
-      where: { id: runId, status: "RUNNING" },
+      where: { id: runId, status: { in: ["RUNNING", "NEEDS_INPUT"] } },
       data: {
         status: finalStatus,
         finishedAt,
@@ -284,17 +399,18 @@ export class ScenarioRunner implements OnModuleInit {
 
 /**
  * Step output as stored: the executor output plus, when present, the
- * variables the step consumed and its recovery trace — both redacted. Kept
- * inside `output` so existing runs and readers stay compatible.
+ * variables the step consumed, its recovery trace, assertion checks, the
+ * values it produced and Manual Recovery options — all redacted. Kept inside
+ * `output` so existing runs and readers stay compatible.
  */
 function persistedOutput(
-  stepResult: { output?: unknown; consumedVars?: unknown; recovery?: unknown },
+  stepResult: import("./types").StepExecutionResult,
   context: ExecutionContext,
 ): Prisma.InputJsonValue | undefined {
-  const flow = {
-    ...(stepResult.consumedVars ? { consumedVars: stepResult.consumedVars } : {}),
-    ...(stepResult.recovery ? { recovery: stepResult.recovery } : {}),
-  };
+  const flow: Record<string, unknown> = {};
+  for (const key of ["consumedVars", "recovery", "assertions", "manual", "bindingWarnings", "values", "important"] as const) {
+    if (stepResult[key] !== undefined) flow[key] = stepResult[key];
+  }
   if (Object.keys(flow).length === 0) {
     return stepResult.output ? (context.redact(stepResult.output) as Prisma.InputJsonValue) : undefined;
   }
