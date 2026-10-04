@@ -91,7 +91,37 @@ const EXACT: Record<string, string> = {
   "Invalid test case": "errors.invalidInput",
   "Invalid test run": "errors.invalidInput",
   "Invalid suite": "errors.invalidInput",
+  "JSON body is not valid JSON after variable substitution": "errors.invalidJsonBody",
+  "No HTTP response available for response mapping": "errors.noMappingResponse",
 };
+
+const EXTRACTION_REASONS: Record<string, string> = {
+  "not found in the response": "errors.extractionReasons.missing",
+  "the value is null": "errors.extractionReasons.null",
+  "the response body is empty": "errors.extractionReasons.empty",
+  "the response body is not JSON": "errors.extractionReasons.notJson",
+};
+
+/** Response-mapping and variable messages carry several values each. */
+function localizeVariableMessage(text: string, t: Translate): string | null {
+  let match = /^Variable (\{\{[^}]+\}\}) was not produced: step (\d+) \((.*)\) did not provide it$/.exec(text);
+  if (match) return t("errors.variableNotProduced", { name: match[1]!, n: match[2]!, step: match[3]! });
+  match = /^Variable (\{\{[^}]+\}\}) is used before step (\d+) \((.*)\) produces it$/.exec(text);
+  if (match) return t("errors.variableUsedEarly", { name: match[1]!, n: match[2]!, step: match[3]! });
+  match = /^Variable (\{\{[^}]+\}\}) contains a line break and cannot be used in a header$/.exec(text);
+  if (match) return t("errors.headerLineBreak", { name: match[1]! });
+  if (text.startsWith("Extraction failed for ")) {
+    // Several failed mappings of one step are joined with "; ".
+    const parts = text.split("; ").map((part) => {
+      const hit = /^Extraction failed for (\{\{[^}]+\}\}) \((.*)\): (.*)$/.exec(part);
+      if (!hit) return part;
+      const reasonKey = EXTRACTION_REASONS[hit[3]!];
+      return t("errors.extractionFailed", { name: hit[1]!, target: hit[2]!, reason: reasonKey ? t(reasonKey) : hit[3]! });
+    });
+    return parts.join(" ");
+  }
+  return null;
+}
 
 function extractMessage(raw: string): string {
   const trimmed = raw.trim();
@@ -113,9 +143,12 @@ export function localizeUserMessage(raw: string, t: Translate): string {
   const text = extractMessage(raw);
   const exact = EXACT[text];
   if (exact) return t(exact);
+  const variable = localizeVariableMessage(text, t);
+  if (variable) return variable;
 
   const prefixed: Array<[RegExp, string, string]> = [
     [/^Unknown StepType:\s*(.+)$/, "errors.unknownStep", "value"],
+    [/^Invalid response mapping\s*(.+)$/, "errors.invalidMapping", "value"],
     [/^Invalid status:\s*(.+)$/, "errors.invalidStatus", "value"],
     [/^Run finished:\s*(.+)$/, "errors.runFinished", "status"],
     [/^Unresolved variable:\s*(.+)$/, "errors.unresolvedVariable", "value"],

@@ -1,3 +1,5 @@
+import { readMappings, validateMappings } from "@qa-workbench/shared";
+
 export type FlowIssue = {
   stepId: string;
   severity: "error" | "warning";
@@ -8,6 +10,8 @@ export type FlowIssue = {
     | "invalid_url"
     | "duplicate_extraction"
     | "broken_extraction"
+    | "invalid_mapping"
+    | "variable_conflict"
     | "circular";
   detail: string;
 };
@@ -33,8 +37,14 @@ export function validateFlow(
   const issues: FlowIssue[] = [];
   const defined = new Set(options.environmentKeys ?? []);
   const ordered = [...steps].sort((a, b) => a.orderIndex - b.orderIndex);
+  const environment = new Set(options.environmentKeys ?? []);
   const producers = new Map<string, number>();
   for (const step of ordered) {
+    if (step.type === "HTTP_REQUEST" && step.enabled) {
+      for (const mapping of readMappings(step.config)) {
+        if (mapping.variable && !producers.has(mapping.variable)) producers.set(mapping.variable, step.orderIndex);
+      }
+    }
     if (step.type !== "SET_VARIABLE" && step.type !== "EXTRACT_VARIABLE") continue;
     const variable = String(step.config.variable ?? step.config.key ?? "").trim();
     if (variable) producers.set(variable, step.orderIndex);
@@ -61,6 +71,26 @@ export function validateFlow(
       const url = typeof step.config.url === "string" ? step.config.url : "";
       if (url && !url.includes("{{") && !/^https?:\/\//i.test(url)) {
         issues.push({ stepId: step.id, severity: "error", code: "invalid_url", detail: url });
+      }
+      for (const problem of validateMappings(step.config.extract)) {
+        issues.push({
+          stepId: step.id,
+          severity: "error",
+          code: "invalid_mapping",
+          detail: `${problem.variable || `#${problem.index + 1}`}: ${problem.code} (${problem.detail})`,
+        });
+      }
+      // Mapped variables exist only after this step's response, so they are
+      // defined after its own references were checked above.
+      for (const mapping of readMappings(step.config)) {
+        if (!mapping.variable) continue;
+        if (environment.has(mapping.variable)) {
+          issues.push({ stepId: step.id, severity: "warning", code: "variable_conflict", detail: mapping.variable });
+        } else if (extracted.has(mapping.variable)) {
+          issues.push({ stepId: step.id, severity: "warning", code: "duplicate_extraction", detail: mapping.variable });
+        }
+        extracted.set(mapping.variable, step.id);
+        defined.add(mapping.variable);
       }
     }
 
@@ -125,7 +155,9 @@ export function flowHealth(input: {
   issues: FlowIssue[];
 }) {
   const http = input.steps.filter((step) => step.type === "HTTP_REQUEST").length;
-  const extracts = input.steps.filter((step) => step.type === "EXTRACT_VARIABLE").length;
+  const extracts =
+    input.steps.filter((step) => step.type === "EXTRACT_VARIABLE").length +
+    input.steps.reduce((sum, step) => sum + (step.type === "HTTP_REQUEST" ? readMappings(step.config).length : 0), 0);
   const assertions = input.steps.filter((step) => step.type === "ASSERTION").length;
   const errors = input.issues.filter((issue) => issue.severity === "error").length;
   const warnings = input.issues.filter((issue) => issue.severity === "warning").length;

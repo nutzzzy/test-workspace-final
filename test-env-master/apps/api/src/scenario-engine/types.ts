@@ -24,6 +24,8 @@ export type StepExecutionResult = {
   manual?: ManualRecoveryOptions;
   /** Saved mappings that had no value in this run. */
   bindingWarnings?: string[];
+  /** Response mappings (`config.extract`) of this step and what each produced (no values). */
+  extractions?: ExtractionOutcome[];
   /** Registry values this step produced, and the few worth showing first. */
   values?: RegistryView[];
   important?: RegistryView[];
@@ -32,6 +34,7 @@ export type StepExecutionResult = {
 import { isSecretKey, maskDeep } from "../common/mask.util";
 import type { FlowHistoryEntry, RecoveryTrace } from "./flow/recovery";
 import type { ManualRecoveryOptions } from "./flow/manual-recovery";
+import type { ExtractionOutcome } from "./flow/response-mapping";
 import type { AssertionCheck } from "./flow/recover-step";
 import { ValueRegistry, type RegistryView } from "./flow/value-registry";
 
@@ -47,8 +50,8 @@ export class ExecutionContext {
   readonly registry = new ValueRegistry();
   /** Variable → the response value it was learned from. */
   private varSources = new Map<string, ValueSource>();
-  /** Variable → JSON type of the value it was learned from (numbers stay numbers). */
-  private varTypes = new Map<string, "number" | "boolean">();
+  /** Variable → JSON type of the value it was learned from (numbers stay numbers, objects stay objects). */
+  private varTypes = new Map<string, "number" | "boolean" | "json">();
   private cancelled = false;
   private readonly abortHandlers = new Set<() => void>();
   lastHttpResponse: {
@@ -124,6 +127,7 @@ export class ExecutionContext {
   /** Remember the JSON type and origin path of a learned variable. */
   describeVariable(key: string, meta: { type?: string; path?: string; source?: ValueSource }) {
     if (meta.type === "number" || meta.type === "boolean") this.varTypes.set(key, meta.type);
+    else if (meta.type === "object" || meta.type === "array") this.varTypes.set(key, "json");
     else if (meta.type) this.varTypes.delete(key);
     if (meta.source) this.varSources.set(key, meta.source);
     else if (meta.path) this.pendingPaths.set(key, meta.path);
@@ -136,13 +140,25 @@ export class ExecutionContext {
     return this.varSources.get(key);
   }
 
-  /** The variable's value in its original JSON type (number/boolean), else the text. */
-  typedValue(key: string): string | number | boolean | undefined {
+  /** The value was read from an API response (untrusted data, not configuration). */
+  fromResponse(key: string): boolean {
+    return this.varSources.has(key) || this.pendingPaths.has(key);
+  }
+
+  /** The variable's value in its original JSON type (number/boolean/object/array), else the text. */
+  typedValue(key: string): unknown {
     const value = this.variables.get(key);
     if (value === undefined) return undefined;
     const type = this.varTypes.get(key);
     if (type === "number" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
     if (type === "boolean" && (value === "true" || value === "false")) return value === "true";
+    if (type === "json") {
+      try {
+        return JSON.parse(value) as unknown;
+      } catch {
+        return value;
+      }
+    }
     return value;
   }
 

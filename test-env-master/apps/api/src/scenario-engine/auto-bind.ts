@@ -100,7 +100,8 @@ function tokenAllowedFor(url: unknown, context: ExecutionContext): boolean {
   return BASE_URL_KEYS.some((key) => originOf(context.get(key)) === target);
 }
 
-function lookup(key: string, context: ExecutionContext): string | undefined {
+/** Exact name, then a normalized or alias match (token ↔ accessToken). */
+export function lookup(key: string, context: ExecutionContext): string | undefined {
   const direct = context.get(key);
   if (direct !== undefined) return direct;
   const norm = normalizeKey(key);
@@ -119,6 +120,26 @@ function lookup(key: string, context: ExecutionContext): string | undefined {
 
 export type ConsumedVar = { variable: string; location: string; source?: ValueSource };
 
+/**
+ * Marks a {{name}} nothing could resolve. Substitution is single-pass: a
+ * value is never scanned for placeholders again, so a response value such as
+ * "{{db_password}}" stays literal text instead of expanding a secret.
+ */
+const UNRESOLVED = "\u0000unresolved:";
+const UNRESOLVED_MARK = /\u0000unresolved:([^\u0000]*)\u0000/;
+
+const PLACEHOLDER = /\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}|\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g;
+
+/** Make a value safe for the field it is written into. */
+function placeValue(variable: string, value: string, location: string, offset: number, context: ExecutionContext) {
+  if (location.startsWith("headers.") && /[\r\n]/.test(value)) {
+    throw new Error(`Variable {{${variable}}} contains a line break and cannot be used in a header`);
+  }
+  // Response data inside a URL is one path/query component, never URL structure.
+  if (location === "url" && offset > 0 && context.fromResponse(variable)) return encodeURIComponent(value);
+  return value;
+}
+
 function bindString(
   input: string,
   context: ExecutionContext,
@@ -133,11 +154,11 @@ function bindString(
     }
     return value;
   };
-  let next = input.replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (match, key: string) => {
-    return use(key, lookup(key, context)) ?? match;
-  });
-  next = next.replace(/\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g, (match, key: string) => {
-    return use(key, lookup(key, context)) ?? match;
+  const next = input.replace(PLACEHOLDER, (match, double: string | undefined, single: string | undefined, offset: number) => {
+    const key = (double ?? single)!;
+    const value = use(key, lookup(key, context));
+    if (value !== undefined) return placeValue(key, value, location, offset, context);
+    return double !== undefined ? `${UNRESOLVED}${key}\u0000` : match;
   });
   if (
     fieldKey &&
@@ -147,6 +168,21 @@ function bindString(
     if (found !== undefined) return found;
   }
   return next;
+}
+
+/** Fail with "Unresolved variable: {{name}}" if any placeholder stayed unresolved. */
+export function assertResolved<T>(value: T): T {
+  const visit = (item: unknown) => {
+    if (typeof item === "string") {
+      const hit = UNRESOLVED_MARK.exec(item);
+      if (hit) throw new Error(`Unresolved variable: {{${hit[1]}}}`);
+      return;
+    }
+    if (Array.isArray(item)) item.forEach(visit);
+    else if (item && typeof item === "object") Object.values(item as Record<string, unknown>).forEach(visit);
+  };
+  visit(value);
+  return value;
 }
 
 const WHOLE_PLACEHOLDER = /^\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}$/;
@@ -173,7 +209,7 @@ function bindForm(body: string, context: ExecutionContext, consumed: ConsumedVar
     parseForm(body).map((pair) => ({
       key: pair.key,
       // An unresolved {{x}} must fail loudly, not be sent URL-encoded.
-      value: context.interpolate(bindString(pair.value, context, `form.${pair.key}`, consumed, pair.key)),
+      value: assertResolved(bindString(pair.value, context, `form.${pair.key}`, consumed, pair.key)),
     })),
   );
 }
@@ -224,7 +260,8 @@ export function bindRequest(
     (typeof authorization === "string" &&
       (authorization.trim() === "" ||
         authorization.trim() === "Bearer" ||
-        authorization.includes("{{")));
+        authorization.includes("{{") ||
+        authorization.includes(UNRESOLVED)));
   if (missing) {
     consumed.push({ variable: "token", location: "headers.Authorization" });
     headers.Authorization = `Bearer ${token}`;

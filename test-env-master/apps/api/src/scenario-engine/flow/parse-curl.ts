@@ -271,9 +271,21 @@ export function parseCurl(input: string): CurlParseResult {
     method = bodySource && !forceGet ? "POST" : "GET";
   }
 
+  // {{variables}} must survive URL normalization: swap them for plain tokens
+  // (a leading {{base_url}} for a stand-in origin), parse, then restore.
+  const vars: string[] = [];
+  const leading = /^\{\{\s*[A-Za-z0-9_.-]+\s*\}\}/.exec(url)?.[0] ?? null;
+  let template = leading === null ? url : `${LEADING_ORIGIN}${url.slice(leading.length)}`;
+  template = template.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (match) => {
+    vars.push(match);
+    return `qavar${vars.length - 1}x`;
+  });
+  const restore = (text: string) =>
+    text.replace(/qavar(\d+)x/g, (match, index: string) => vars[Number(index)] ?? match);
+
   let parsed: URL;
   try {
-    parsed = new URL(url);
+    parsed = new URL(template);
   } catch {
     return { ok: false, code: "bad_url" };
   }
@@ -283,9 +295,14 @@ export function parseCurl(input: string): CurlParseResult {
 
   const query: Record<string, string> = {};
   parsed.searchParams.forEach((value, key) => {
-    query[key] = value;
+    query[restore(key)] = restore(value);
   });
   parsed.search = "";
+  let finalUrl = restore(parsed.toString());
+  if (leading !== null) {
+    const rest = finalUrl.slice(LEADING_ORIGIN.length);
+    finalUrl = `${leading}${rest === "/" && url.length === leading.length ? "" : rest}`;
+  }
 
   const sendsBody = method !== "GET" && method !== "HEAD" && bodySource.length > 0;
 
@@ -293,7 +310,7 @@ export function parseCurl(input: string): CurlParseResult {
     ok: true,
     config: {
       method,
-      url: parsed.toString(),
+      url: finalUrl,
       headers,
       query,
       body: sendsBody ? coerceBody(bodySource, headers) : {},
@@ -301,6 +318,8 @@ export function parseCurl(input: string): CurlParseResult {
     },
   };
 }
+
+const LEADING_ORIGIN = "http://qavar-base.invalid";
 
 function tokenize(input: string): string[] {
   const source = input.replace(/^\s*\$\s*/, "").replace(/\r\n/g, "\n");

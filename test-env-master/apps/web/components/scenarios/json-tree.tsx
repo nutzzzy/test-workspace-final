@@ -2,6 +2,11 @@
 
 import { useState } from "react";
 
+/** JSONPath of a child: dot notation, or ['key'] for keys a dot path cannot express. */
+function childPath(path: string, key: string) {
+  return /^[A-Za-z_$][A-Za-z0-9_$-]*$/.test(key) ? `${path}.${key}` : `${path}['${key.replace(/(['\\])/g, "\\$1")}']`;
+}
+
 export function JsonTree({
   value,
   path = "$",
@@ -33,7 +38,7 @@ export function JsonTree({
               const [key, child] = Array.isArray(value)
                 ? [String(index), entry]
                 : (entry as readonly [string, unknown]);
-              const next = Array.isArray(value) ? `${path}[${key}]` : `${path}.${key}`;
+              const next = Array.isArray(value) ? `${path}[${key}]` : childPath(path, key);
               return (
                 <JsonTree
                   key={next}

@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
+import { validateMappings } from "@qa-workbench/shared";
 import { DatabaseConnectorsService } from "../database-connectors/database-connectors.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { applyDependency, type DependencyChange } from "../scenario-engine/flow/apply-dependency";
@@ -18,6 +19,7 @@ import { analyzeDependencies, type FlowHttpStep } from "../scenario-engine/flow/
 import { flowHealth, validateFlow } from "../scenario-engine/flow/flow-validator";
 import { parseCurl, splitCurlCommands } from "../scenario-engine/flow/parse-curl";
 import { analyzeResponse } from "../scenario-engine/flow/response-analyzer";
+import { variableCatalog } from "../scenario-engine/flow/response-mapping";
 import { ScenarioRunner } from "../scenario-engine/scenario.runner";
 
 @Injectable()
@@ -131,6 +133,7 @@ export class ScenariosService {
     if (input.type === "DATABASE_ACTION") {
       await this.connectors.assertStepConfig(input.config ?? {});
     }
+    if (input.type === "HTTP_REQUEST") assertMappings(input.config);
     return this.prisma.scenarioStep.create({
       data: {
         scenarioId,
@@ -157,6 +160,7 @@ export class ScenariosService {
       if (current?.type === "DATABASE_ACTION") {
         await this.connectors.assertStepConfig(data.config);
       }
+      if (current?.type === "HTTP_REQUEST") assertMappings(data.config);
     }
     return this.prisma.scenarioStep.update({
       where: { id: stepId },
@@ -301,8 +305,10 @@ export class ScenariosService {
       try {
         pathname = new URL(parsed.config.url).pathname || parsed.config.url;
       } catch {
-        pathname = parsed.config.url;
+        // {{base_url}}/v1/items: name the step after the path after the variable
+        pathname = parsed.config.url.replace(/^\{\{[^}]+\}\}/, "") || parsed.config.url;
       }
+      pathname = pathname.replace(/%7B%7B([A-Za-z0-9_.-]+)%7D%7D/gi, "{{$1}}");
       await this.addStep(scenarioId, {
         name: `${parsed.config.method} ${pathname}`,
         type: "HTTP_REQUEST",
@@ -328,15 +334,16 @@ export class ScenariosService {
     const sampleBodies = Object.fromEntries(
       samples.map((sample) => [sample.stepId, sample.body]),
     );
+    const flowSteps = scenario.steps.map((step) => ({
+      id: step.id,
+      name: step.name,
+      type: step.type,
+      orderIndex: step.orderIndex,
+      enabled: step.enabled,
+      config: asRecord(step.config),
+    }));
     const issues = validateFlow(
-      scenario.steps.map((step) => ({
-        id: step.id,
-        name: step.name,
-        type: step.type,
-        orderIndex: step.orderIndex,
-        enabled: step.enabled,
-        config: asRecord(step.config),
-      })),
+      flowSteps,
       { environmentKeys: envKeys, sampleBodies },
     );
     const responses = scenario.steps
@@ -362,15 +369,10 @@ export class ScenariosService {
     return {
       dependencies,
       issues,
+      variables: variableCatalog(flowSteps),
+      environmentKeys: envKeys,
       health: flowHealth({
-        steps: scenario.steps.map((step) => ({
-          id: step.id,
-          name: step.name,
-          type: step.type,
-          orderIndex: step.orderIndex,
-          enabled: step.enabled,
-          config: asRecord(step.config),
-        })),
+        steps: flowSteps,
         dependencies: dependencies.filter((item) => item.confidence === "HIGH").length,
         issues,
       }),
@@ -430,6 +432,16 @@ export class ScenariosService {
       orderBy: { createdAt: "desc" },
       take: 100,
     });
+  }
+}
+
+/** Reject response mappings that could never run (bad name, path, duplicate). */
+function assertMappings(config: Record<string, unknown> | undefined) {
+  const problem = validateMappings(config?.extract)[0];
+  if (problem) {
+    throw new BadRequestException(
+      `Invalid response mapping ${problem.variable ? `{{${problem.variable}}}` : `#${problem.index + 1}`}: ${problem.code} (${problem.detail})`,
+    );
   }
 }
 

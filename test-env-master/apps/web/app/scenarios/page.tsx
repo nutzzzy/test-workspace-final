@@ -21,6 +21,13 @@ import {
   type ConnectorChoice,
   type DatabaseStepValue,
 } from "@/components/scenarios/database-step-form";
+import {
+  ResponseMappingEditor,
+  suggestVariable,
+  type VariableProducer,
+} from "@/components/scenarios/response-mapping-editor";
+import { VariablePicker } from "@/components/scenarios/variable-picker";
+import { findVariableRefs, readMappings, validateMappings, type ResponseMapping } from "@qa-workbench/shared";
 import { useI18n } from "@/lib/i18n";
 
 type Step = {
@@ -34,6 +41,7 @@ type Step = {
 
 type StepRun = {
   id: string;
+  scenarioStepId?: string | null;
   name: string;
   type: string;
   status: string;
@@ -82,6 +90,8 @@ type FlowDependency = {
 
 type FlowAnalysis = {
   dependencies: FlowDependency[];
+  variables?: VariableProducer[];
+  environmentKeys?: string[];
   issues: Array<{ stepId: string; severity: string; code: string; detail: string }>;
   health: {
     ready: boolean;
@@ -191,6 +201,8 @@ export default function ScenariosPage() {
   const [analysis, setAnalysis] = useState<FlowAnalysis | null>(null);
   const [hiddenDeps, setHiddenDeps] = useState<string[]>([]);
   const [editingStepId, setEditingStepId] = useState<string | null>(null);
+  const [mappings, setMappings] = useState<ResponseMapping[]>([]);
+  const editorRef = useRef<HTMLTextAreaElement | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [liveRun, setLiveRun] = useState<ScenarioRun | null>(null);
@@ -267,6 +279,7 @@ export default function ScenariosPage() {
       setCurlText("");
       setEditingStepId(null);
       setDbStep(EMPTY_DATABASE_STEP);
+      setMappings([]);
       return;
     }
     const template = TEMPLATES[type];
@@ -278,7 +291,27 @@ export default function ScenariosPage() {
     setCurlText("");
     setEditingStepId(null);
     setDbStep(EMPTY_DATABASE_STEP);
+    setMappings([]);
     return template;
+  };
+
+  /** Open a step in the editor; response mappings are edited apart from the JSON. */
+  const startEdit = (step: Step, extra?: ResponseMapping) => {
+    const current = readMappings(step.config);
+    const { extract: _extract, ...rest } = step.config;
+    void _extract;
+    setEditingStepId(step.id);
+    setStepType(step.type as (typeof STEP_TYPES)[number]);
+    setStepName(step.name);
+    setConfigText(JSON.stringify(step.type === "HTTP_REQUEST" ? rest : step.config, null, 2));
+    setMappings(step.type === "HTTP_REQUEST" ? (extra ? [...current, extra] : current) : []);
+    setDbStep(
+      step.type === "DATABASE_ACTION"
+        ? databaseStepFromConfig(step.config)
+        : EMPTY_DATABASE_STEP,
+    );
+    setCurlMode(false);
+    setCurlText("");
   };
 
   const configPlaceholder = stepType
@@ -293,6 +326,47 @@ export default function ScenariosPage() {
       : null;
   const selectedConnector = connectors.find((item) => item.id === dbStep.connectorId);
   const databaseProblem = databaseStepProblem(dbStep, selectedConnector?.type);
+
+  const producers: VariableProducer[] = analysis?.variables ?? [];
+  const stepNumberOf = (producer: { stepId?: string; orderIndex: number }) => {
+    const index = selected?.steps.findIndex((item) => item.id === producer.stepId) ?? -1;
+    return index >= 0 ? index + 1 : producer.orderIndex + 1;
+  };
+  const editingStep = selected?.steps.find((item) => item.id === editingStepId) ?? null;
+  const editingSample = (() => {
+    if (!editingStepId) return null;
+    const run = selected?.runs?.[0]?.stepRuns.find((item) => item.scenarioStepId === editingStepId);
+    const output = run?.output;
+    if (!output || typeof output !== "object" || Array.isArray(output)) return null;
+    const record = output as { body?: unknown; headers?: unknown };
+    return {
+      body: record.body,
+      headers:
+        record.headers && typeof record.headers === "object" ? (record.headers as Record<string, string>) : undefined,
+    };
+  })();
+  const mappingProblems = stepType === "HTTP_REQUEST" ? validateMappings(mappings).length : 0;
+
+  /** Insert {{name}} at the cursor of the request editor. */
+  const insertVariable = (name: string) => {
+    const curl = stepType === "HTTP_REQUEST" && curlMode;
+    const current = curl ? curlText : configText;
+    const setText = curl ? setCurlText : setConfigText;
+    if (!current.trim() && !curl) {
+      // Start from the template so there is a structure to insert into.
+      setText(configPlaceholder);
+      return;
+    }
+    const element = editorRef.current;
+    const start = element?.selectionStart ?? current.length;
+    const end = element?.selectionEnd ?? current.length;
+    const token = `{{${name}}}`;
+    setText(`${current.slice(0, start)}${token}${current.slice(end)}`);
+    requestAnimationFrame(() => {
+      element?.focus();
+      element?.setSelectionRange(start + token.length, start + token.length);
+    });
+  };
 
   const startLivePoll = (runId: string, scenarioId: string) => {
     stopPolling();
@@ -670,11 +744,12 @@ export default function ScenariosPage() {
                         curlMode &&
                         curlParsed?.ok !== true) ||
                       (stepType === "DATABASE_ACTION" &&
-                        (!dbStep.connectorId || !dbStep.query.trim() || Boolean(databaseProblem)))
+                        (!dbStep.connectorId || !dbStep.query.trim() || Boolean(databaseProblem))) ||
+                      (stepType === "HTTP_REQUEST" && mappingProblems > 0)
                     }
                     onClick={async () => {
                       try {
-                        const config =
+                        const config: Record<string, unknown> =
                           stepType === "DATABASE_ACTION"
                             ? databaseStepConfig(dbStep)
                             : stepType === "HTTP_REQUEST" && curlMode
@@ -688,6 +763,15 @@ export default function ScenariosPage() {
                             : (JSON.parse(
                                 configText.trim() ? configText : configPlaceholder,
                               ) as Record<string, unknown>);
+                        if (stepType === "HTTP_REQUEST" && mappings.length > 0) {
+                          config.extract = mappings.map((row) => ({
+                            variable: row.variable,
+                            path: (row.from ?? "body") === "status" ? "" : row.path,
+                            from: row.from ?? "body",
+                            ...(row.optional ? { optional: true } : {}),
+                            ...(row.secret ? { secret: true } : {}),
+                          }));
+                        }
                         if (editingStepId) {
                           await api(`/scenarios/steps/${editingStepId}`, {
                             method: "PATCH",
@@ -758,6 +842,8 @@ export default function ScenariosPage() {
                 ) : (
                 <>
                 <textarea
+                  ref={editorRef}
+                  aria-label={t("scenarios.request")}
                   className="min-h-28 w-full min-w-0 max-w-full rounded-md border border-border bg-background p-2 font-mono text-xs dir-ltr"
                   dir="ltr"
                   value={stepType === "HTTP_REQUEST" && curlMode ? curlText : configText}
@@ -781,6 +867,24 @@ export default function ScenariosPage() {
                   <p className="text-xs text-destructive">
                     {t(`scenarios.curlErrors.${curlParsed.code}`)}
                   </p>
+                ) : null}
+                <VariablePicker
+                  producers={producers.filter((producer) => producer.stepId !== editingStepId)}
+                  environmentKeys={analysis?.environmentKeys ?? []}
+                  position={editingStep ? editingStep.orderIndex : Number.POSITIVE_INFINITY}
+                  stepNumber={stepNumberOf}
+                  template={stepType === "HTTP_REQUEST" && curlMode ? curlText : configText}
+                  onInsert={insertVariable}
+                />
+                {stepType === "HTTP_REQUEST" ? (
+                  <ResponseMappingEditor
+                    value={mappings}
+                    onChange={setMappings}
+                    sample={editingSample}
+                    otherProducers={producers.filter((producer) => producer.stepId !== editingStepId)}
+                    environmentKeys={analysis?.environmentKeys ?? []}
+                    stepNumber={stepNumberOf}
+                  />
                 ) : null}
                 </>
                 )}
@@ -844,6 +948,16 @@ export default function ScenariosPage() {
                       ];
                       if (item.type === "EXTRACT_VARIABLE" && typeof item.config.variable === "string") {
                         outputs.push(item.config.variable);
+                      }
+                      if (item.type === "HTTP_REQUEST") {
+                        outputs.push(...readMappings(item.config).map((row) => row.variable).filter(Boolean));
+                      }
+                      // {{references}} with the earlier step that produces them.
+                      for (const name of findVariableRefs(item.config)) {
+                        const producer = [...producers]
+                          .reverse()
+                          .find((candidate) => candidate.name === name && candidate.orderIndex < item.orderIndex);
+                        uses.push(producer ? `#${n(stepNumberOf(producer))}.${name}` : name);
                       }
                       const issue = analysis?.issues.find((problem) => problem.stepId === item.id);
                       const run = (liveRun ?? selected.runs?.[0])?.stepRuns?.find(
@@ -958,6 +1072,12 @@ export default function ScenariosPage() {
                             extractLabel={t("scenarios.detectedOutputs")}
                             assertLabel={t("scenarios.accept")}
                             onExtract={(path) => {
+                              if (step.type === "HTTP_REQUEST") {
+                                // Map into this step's response mapping, then review it in the editor.
+                                const taken = [...readMappings(step.config).map((row) => row.variable), ...producers.map((item) => item.name)];
+                                startEdit(step, { variable: suggestVariable(path, taken), path, from: "body" });
+                                return;
+                              }
                               const variable = path.split(".").pop()?.replace(/[^A-Za-z0-9_]/g, "") || "value";
                               void api(`/scenarios/${selected.id}/steps`, {
                                 method: "POST",
@@ -1006,19 +1126,7 @@ export default function ScenariosPage() {
                         <Button
                           size="sm"
                           variant="outline"
-                          onClick={() => {
-                            setEditingStepId(step.id);
-                            setStepType(step.type as (typeof STEP_TYPES)[number]);
-                            setStepName(step.name);
-                            setConfigText(JSON.stringify(step.config, null, 2));
-                            setDbStep(
-                              step.type === "DATABASE_ACTION"
-                                ? databaseStepFromConfig(step.config)
-                                : EMPTY_DATABASE_STEP,
-                            );
-                            setCurlMode(false);
-                            setCurlText("");
-                          }}
+                          onClick={() => startEdit(step)}
                         >
                           {t("common.edit")}
                         </Button>

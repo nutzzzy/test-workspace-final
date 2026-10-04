@@ -52,9 +52,14 @@ describe("i18n parity", () => {
         "Request timed out after 15000 ms",
         "Jira issue QA-1 was not found, or the configured account cannot see it.",
         "Invalid test case field: priority",
+        "Variable {{accessToken}} was not produced: step 1 (Login) did not provide it",
+        "Variable {{userId}} is used before step 3 (Create user) produces it",
+        "Extraction failed for {{orderId}} (body $.data.order.id): not found in the response",
+        "Invalid response mapping {{x}}: invalid_path (recursive descent (..) is not supported)",
+        "JSON body is not valid JSON after variable substitution",
       ]) {
         const text = localizeUserMessage(raw, t);
-        if (text.startsWith("MISSING:")) unresolved.push(text);
+        if (text.includes("MISSING:")) unresolved.push(text);
       }
     }
     expect(unresolved).toEqual([]);

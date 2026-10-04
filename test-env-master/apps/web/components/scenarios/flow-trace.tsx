@@ -26,10 +26,19 @@ type Trace = {
   maxAttempts: number;
 };
 type Consumed = { variable: string; location: string };
+type Extraction = {
+  variable: string;
+  from: string;
+  path: string;
+  status: "EXTRACTED" | "MISSING" | "NULL" | "SKIPPED" | "INVALID";
+  type?: string;
+  secret?: boolean;
+  reason?: string;
+};
 
-function readFlow(output: unknown): { recovery: Trace | null; consumed: Consumed[] } {
-  if (!output || typeof output !== "object" || Array.isArray(output)) return { recovery: null, consumed: [] };
-  const record = output as { recovery?: unknown; consumedVars?: unknown };
+function readFlow(output: unknown): { recovery: Trace | null; consumed: Consumed[]; extractions: Extraction[] } {
+  if (!output || typeof output !== "object" || Array.isArray(output)) return { recovery: null, consumed: [], extractions: [] };
+  const record = output as { recovery?: unknown; consumedVars?: unknown; extractions?: unknown };
   const recovery =
     record.recovery && typeof record.recovery === "object" && "outcome" in record.recovery
       ? (record.recovery as Trace)
@@ -40,18 +49,24 @@ function readFlow(output: unknown): { recovery: Trace | null; consumed: Consumed
           !!item && typeof item === "object" && typeof (item as Consumed).variable === "string",
       )
     : [];
-  return { recovery, consumed };
+  const extractions = Array.isArray(record.extractions)
+    ? record.extractions.filter(
+        (item): item is Extraction =>
+          !!item && typeof item === "object" && typeof (item as Extraction).variable === "string",
+      )
+    : [];
+  return { recovery, consumed, extractions };
 }
 
 /** Variables a step used and produced, then its recovery trace, if any. */
 export function FlowTrace({ output, extractedVars }: { output: unknown; extractedVars?: unknown }) {
   const { t, n } = useI18n();
-  const { recovery, consumed } = readFlow(output);
+  const { recovery, consumed, extractions } = readFlow(output);
   const produced =
     extractedVars && typeof extractedVars === "object" && !Array.isArray(extractedVars)
       ? Object.keys(extractedVars as Record<string, unknown>)
       : [];
-  if (!recovery && consumed.length === 0 && produced.length === 0) return null;
+  if (!recovery && consumed.length === 0 && produced.length === 0 && extractions.length === 0) return null;
 
   const step = (source: Source) =>
     t("scenarios.flow.stepRef", { n: n(source.orderIndex + 1), name: source.stepName });
@@ -78,6 +93,34 @@ export function FlowTrace({ output, extractedVars }: { output: unknown; extracte
               {name}
             </Badge>
           ))}
+        </div>
+      ) : null}
+
+      {extractions.length > 0 ? (
+        <div className="space-y-0.5">
+          <p className="text-muted-foreground">{t("scenarios.mapping.resultTitle")}</p>
+          <ul className="space-y-0.5">
+            {extractions.map((item) => (
+              <li key={item.variable} className="flex flex-wrap items-center gap-1.5">
+                <Badge
+                  className={
+                    item.status === "EXTRACTED"
+                      ? "border-success/40 text-success"
+                      : item.status === "SKIPPED"
+                        ? "border-warning/40 text-warning"
+                        : "border-destructive/40 text-destructive"
+                  }
+                >
+                  {t(`scenarios.mapping.statuses.${item.status}`)}
+                </Badge>
+                <code className="dir-ltr inline-block font-mono">
+                  {`{{${item.variable}}}`} ← {item.from === "status" ? "status" : `${item.from} ${item.path}`}
+                  {item.type ? ` : ${item.type}` : ""}
+                </code>
+                {item.secret ? <span className="text-warning">{t("scenarios.variables.secret")}</span> : null}
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
 

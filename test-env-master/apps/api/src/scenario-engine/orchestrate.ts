@@ -17,6 +17,7 @@ import {
 } from "./flow/recover-step";
 import type { RecoveryTrace } from "./flow/recovery";
 import { describeAddress } from "./flow/request-inputs";
+import { explainUnresolved, runExtractions, variableCatalog, type ExtractionOutcome } from "./flow/response-mapping";
 import { importantValues, viewEntry, type RegistryEntry } from "./flow/value-registry";
 import type { StepExecutorRegistry } from "./step-executor.registry";
 import type {
@@ -83,6 +84,7 @@ export async function orchestrateSteps(
   const ordered = [...steps].sort((a, b) => a.orderIndex - b.orderIndex);
   const assertions = new AssertionExecutor();
   const learnedMappings: Array<{ fieldName: string; ref: string }> = [];
+  const catalog = variableCatalog(ordered);
 
   for (const [position, step] of ordered.entries()) {
     if (context.isCancelled()) {
@@ -124,7 +126,7 @@ export async function orchestrateSteps(
       result = {
         status: "FAILED" as const,
         error:
-          error instanceof Error ? error.message : "Step execution failed",
+          error instanceof Error ? explainUnresolved(error.message, step, catalog) : "Step execution failed",
       };
     }
 
@@ -214,6 +216,8 @@ async function runHttpStep(
   const request = { ...prepared.request, ...bound.request };
   const consumed = [...prepared.consumed, ...bound.consumed];
   context.pendingPaths.clear();
+  // A step that does not succeed must not leave values behind for later steps.
+  const before = context.snapshot();
   const sent = await http.send(request, context, expectedStatusOf(config));
   const firstResult = consumed.length ? { ...sent, consumedVars: consumed } : sent;
 
@@ -312,8 +316,36 @@ async function runHttpStep(
   }
   if (savedMapping && recovery) recovery.savedMapping = true;
 
-  let produced: RegistryEntry[] = [];
+  // Response mapping runs only on success, before anything is published to later steps.
+  let extractions: ExtractionOutcome[] | undefined;
   const response = context.lastHttpResponse;
+  if ((state === "PASSED" || state === "RECOVERED") && Array.isArray(config.extract) && config.extract.length > 0) {
+    if (!response) {
+      state = "FAILED";
+      result = { ...result, error: "No HTTP response available for response mapping" };
+    } else {
+      const mapped = runExtractions(config, response, context, { stepId: step.id, stepName: step.name, orderIndex: step.orderIndex });
+      extractions = mapped.outcomes;
+      if (mapped.error) {
+        state = "FAILED";
+        result = { ...result, error: mapped.error };
+      } else if (Object.keys(mapped.learned).length > 0) {
+        // The response was redacted before a mapping marked some of its values secret.
+        result = {
+          ...result,
+          output: context.redact(result.output),
+          resolvedInput: context.redact(result.resolvedInput),
+          extractedVars: context.redact({ ...(result.extractedVars ?? {}), ...mapped.learned }) as Record<string, string>,
+        };
+      }
+    }
+  }
+  if (state !== "PASSED" && state !== "RECOVERED") {
+    context.restore(before);
+    result = { ...result, extractedVars: undefined };
+  }
+
+  let produced: RegistryEntry[] = [];
   if ((state === "PASSED" || state === "RECOVERED") && response && response.status < 400) {
     context.history.push({ stepId: step.id, orderIndex: step.orderIndex, name: step.name, response });
     produced = context.registry.addResponse(
@@ -330,11 +362,16 @@ async function runHttpStep(
       }
     }
     for (const [key, path] of context.pendingPaths) context.describeVariable(key, { source: source(path) });
+    for (const outcome of extractions ?? []) {
+      const mappedPath = outcome.status === "EXTRACTED" ? context.sourceOf(outcome.variable)?.path : undefined;
+      if (mappedPath) context.registry.markExplicit(step.orderIndex, mappedPath, outcome.variable);
+    }
   }
   context.pendingPaths.clear();
 
+  const finished = finish(result, state, recovery, checks, state === "NEEDS_INPUT" ? manual ?? buildManualOptions(request, recovery, context.registry, context.secretSet()) : undefined, bound.warnings, produced, context);
   return {
-    result: finish(result, state, recovery, checks, state === "NEEDS_INPUT" ? manual ?? buildManualOptions(request, recovery, context.registry, context.secretSet()) : undefined, bound.warnings, produced, context),
+    result: extractions ? { ...finished, extractions } : finished,
     pausedMs,
   };
 }

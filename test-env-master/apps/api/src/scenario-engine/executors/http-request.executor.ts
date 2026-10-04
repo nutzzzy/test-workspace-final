@@ -1,6 +1,7 @@
 import { assertResolvedHostAllowed, normalizeHost } from "../../common/network-policy";
-import { bindRequest, captureResponse, type ConsumedVar } from "../auto-bind";
+import { assertResolved, bindRequest, captureResponse, lookup, type ConsumedVar } from "../auto-bind";
 import { isFormBody } from "../flow/request-inputs";
+import { interpolateJsonText, isJsonText } from "../flow/response-mapping";
 import type { ExecutionContext, StepExecutionResult, StepExecutor } from "../types";
 
 async function assertSafeUrl(raw: string) {
@@ -96,9 +97,42 @@ export class HttpRequestExecutor implements StepExecutor {
     delete requestConfig.expectedStatus;
     delete requestConfig.bindings;
     delete requestConfig.continueOnFailure;
+    delete requestConfig.extract;
+    // cURL imports saved before placeholders were preserved hold {{x}} percent-encoded.
+    if (typeof requestConfig.url === "string") {
+      requestConfig.url = requestConfig.url.replace(/%7B%7B([A-Za-z0-9_.-]+)%7D%7D/gi, "{{$1}}");
+    }
     const consumed: ConsumedVar[] = [];
-    const request = context.interpolateDeep(bindRequest(requestConfig, context, consumed)) as ResolvedHttpRequest;
+    const headers = requestConfig.headers as Record<string, string> | undefined;
+    const jsonText = isJsonText(requestConfig.body, headers) && !isFormBody({ body: requestConfig.body, headers })
+      ? this.bindJsonText(requestConfig.body as string, context, consumed)
+      : undefined;
+    if (jsonText !== undefined) delete requestConfig.body;
+    const request = assertResolved(bindRequest(requestConfig, context, consumed)) as ResolvedHttpRequest;
+    if (jsonText !== undefined) request.body = jsonText;
     return { request, consumed: dedupeConsumed(consumed) };
+  }
+
+  /** A raw JSON text body: substitute values so the text stays valid JSON. */
+  private bindJsonText(body: string, context: ExecutionContext, consumed: ConsumedVar[]) {
+    const result = interpolateJsonText(body, (name) => {
+      if (context.get(name) !== undefined) return { value: context.typedValue(name) };
+      const loose = lookup(name, context);
+      return loose === undefined ? undefined : { value: loose };
+    });
+    if (result.missing.length > 0) throw new Error(`Unresolved variable: {{${result.missing[0]}}}`);
+    for (const variable of result.used) {
+      const source = context.sourceOf(variable);
+      consumed.push({ variable, location: "body", ...(source ? { source } : {}) });
+    }
+    if (result.used.length > 0) {
+      try {
+        JSON.parse(result.text);
+      } catch {
+        throw new Error("JSON body is not valid JSON after variable substitution");
+      }
+    }
+    return result.text;
   }
 
   /** Send an already resolved request (also used verbatim by recovery retries). */
