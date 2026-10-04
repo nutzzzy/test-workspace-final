@@ -155,7 +155,7 @@ describe("bounded scenario recovery", () => {
     expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
   });
 
-  it("retries a POST marked idempotent and keeps the JSON type of the value", async () => {
+  it("never rewrites the body of a POST marked idempotent unless data changes are allowed", async () => {
     const calls = mockFetch((url, body) => {
       if (url.pathname === "/profile") return { status: 200, body: { data: { userId: 125, bikerId: 9821 } } };
       return (body as { bikerId?: unknown }).bikerId === 9821 ? { status: 200, body: {} } : { status: 500, body: {} };
@@ -164,8 +164,28 @@ describe("bounded scenario recovery", () => {
       http("profile", { method: "GET", url: `${BASE}/profile` }),
       http("activate", { method: "POST", url: `${BASE}/activate`, body: { bikerId: 125 }, recovery: { idempotent: true } }),
     ]);
+    expect(results[1]!.recovery).toMatchObject({ outcome: "SUGGESTED", blockedReason: "UNSAFE_METHOD", stoppedBecause: "UNSAFE_ONLY" });
+    expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+  });
+
+  it("retries a POST body change when the user allowed it and keeps the JSON type of the value", async () => {
+    const calls = mockFetch((url, body) => {
+      if (url.pathname === "/profile") return { status: 200, body: { data: { userId: 125, bikerId: 9821 } } };
+      return (body as { bikerId?: unknown }).bikerId === 9821 ? { status: 200, body: {} } : { status: 500, body: {} };
+    });
+    const { results } = await run([
+      http("profile", { method: "GET", url: `${BASE}/profile` }),
+      http("activate", {
+        method: "POST",
+        url: `${BASE}/activate`,
+        body: { bikerId: 125 },
+        recovery: { idempotent: true, allowDataChanges: true },
+      }),
+    ]);
     expect(results[1]!.recovery?.outcome).toBe("RECOVERED");
     expect(calls.at(-1)?.body).toEqual({ bikerId: 9821 });
+    // The attempt history records the exact request that was sent.
+    expect(results[1]!.recovery?.attempts[0]?.request).toMatchObject({ method: "POST", body: { bikerId: 9821 } });
   });
 
   it("never retries DELETE, even when marked idempotent", async () => {
@@ -325,6 +345,7 @@ describe("recovery planning", () => {
       allowMediumExplicit: false,
       idempotent: false,
       aiAssist: false,
+      allowDataChanges: false,
     });
     expect(recoverySettings({ recovery: { maxAttempts: 99 } }).maxAttempts).toBe(10);
     expect(isRetrySafe("GET", false)).toBe(true);

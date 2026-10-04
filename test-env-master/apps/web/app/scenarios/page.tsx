@@ -1,1294 +1,622 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { parseCurl } from "@/lib/curl/parse-curl";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, FileUp, Plus, Search } from "lucide-react";
 import { api } from "@/lib/api";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { ProgressBar, ProgressBanner } from "@/components/ui/progress";
-import { StepRunFacts, VariableFacts } from "@/components/scenarios/run-facts";
-import { JsonTree } from "@/components/scenarios/json-tree";
-import { FlowTrace } from "@/components/scenarios/flow-trace";
-import { ScenarioFlow } from "@/components/scenarios/scenario-flow";
-import { SmartResponse } from "@/components/scenarios/smart-response";
-import {
-  DatabaseStepForm,
-  EMPTY_DATABASE_STEP,
-  databaseStepConfig,
-  databaseStepFromConfig,
-  databaseStepProblem,
-  type ConnectorChoice,
-  type DatabaseStepValue,
-} from "@/components/scenarios/database-step-form";
-import {
-  ResponseMappingEditor,
-  suggestVariable,
-  type VariableProducer,
-} from "@/components/scenarios/response-mapping-editor";
-import { VariablePicker } from "@/components/scenarios/variable-picker";
-import { findVariableRefs, readMappings, validateMappings, type ResponseMapping } from "@qa-workbench/shared";
 import { useI18n } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Menu } from "@/components/ui/menu";
+import { useToast } from "@/components/ui/toast";
+import {
+  ACTIVE_RUN,
+  sameTarget,
+  stateTone,
+  type Env,
+  type FlowAnalysis,
+  type Scenario,
+  type ScenarioRun,
+  type Step,
+  type StepBinding,
+  type Suggestion,
+} from "@/components/scenarios/builder-types";
+import { CurlImportDialog } from "@/components/scenarios/curl-import-dialog";
+import type { ConnectorChoice } from "@/components/scenarios/database-step-form";
+import type { ManualChoice } from "@/components/scenarios/manual-recovery";
+import { RequestFlow } from "@/components/scenarios/request-flow";
+import { DetectedBanner, ScenarioOverview } from "@/components/scenarios/scenario-overview";
+import { StepPanel, type StepActions } from "@/components/scenarios/step-panel";
+import { ValuePicker, type PickerRequest } from "@/components/scenarios/value-picker";
 
-type Step = {
-  id: string;
-  name: string;
-  type: string;
-  orderIndex: number;
-  enabled: boolean;
-  config: Record<string, unknown>;
+/** Starting configuration of a step added by hand (the step is edited right after). */
+const TEMPLATES: Record<string, Record<string, unknown>> = {
+  HTTP_REQUEST: { method: "GET", url: "", headers: {}, query: {}, body: {}, timeoutMs: 15000 },
+  ASSERTION: { kind: "status_code", expected: 200 },
+  DELAY: { ms: 1000 },
+  SET_VARIABLE: { variable: "name", value: "" },
+  EXTRACT_VARIABLE: { variable: "name", path: "body.data.id" },
+  CONDITION: { left: "{{status}}", op: "equals", right: "OK" },
+  DATABASE_ACTION: { connectorId: "", operation: "SELECT", query: "" },
 };
+const OTHER_TYPES = ["ASSERTION", "DELAY", "DATABASE_ACTION", "SET_VARIABLE", "EXTRACT_VARIABLE", "CONDITION"];
+const POLL_MS = 500;
 
-type StepRun = {
-  id: string;
-  scenarioStepId?: string | null;
-  name: string;
-  type: string;
-  status: string;
-  durationMs?: number;
-  error?: string | null;
-  resolvedInput?: unknown;
-  output?: unknown;
-  extractedVars?: unknown;
-};
+function readDismissed(scenarioId: string): string[] {
+  try {
+    const raw = window.localStorage.getItem(`qa-workbench.dismissed.${scenarioId}`);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
 
-type ScenarioRun = {
-  id: string;
-  status: string;
-  durationMs?: number | null;
-  error?: string | null;
-  variablesJson?: Record<string, string> | null;
-  stepRuns: StepRun[];
-  startedAt?: string | null;
-  finishedAt?: string | null;
-};
-
-type Scenario = {
-  id: string;
-  name: string;
-  stopOnFailure: boolean;
-  environmentId?: string | null;
-  steps: Step[];
-  runs: ScenarioRun[];
-};
-
-type Env = { id: string; name: string };
-
-type FlowDependency = {
-  id: string;
-  producerStepId: string;
-  producerName: string;
-  consumerStepId: string;
-  consumerName: string;
-  sourcePath: string;
-  variable: string;
-  location: "url" | "header" | "query" | "body";
-  locationDetail: string;
-  confidence: "HIGH" | "MEDIUM" | "LOW";
-  masked: boolean;
-};
-
-type FlowAnalysis = {
-  dependencies: FlowDependency[];
-  variables?: VariableProducer[];
-  environmentKeys?: string[];
-  issues: Array<{ stepId: string; severity: string; code: string; detail: string }>;
-  health: {
-    ready: boolean;
-    http: number;
-    dependencies: number;
-    extracts: number;
-    assertions: number;
-    errors: number;
-    warnings: number;
-  };
-  responses: Array<{
-    stepId: string;
-    analysis: {
-      status: number | null;
-      durationMs: number | null;
-      sizeBytes: number | null;
-      contentType: string | null;
-      importantFields: Array<{ path: string; label: string; preview: string; masked: boolean }>;
-      candidateOutputs: Array<{ path: string; name: string; preview: string }>;
-      arraySummaries: Array<{ path: string; length: number; fields: string[]; previewCount: number }>;
-      errorInformation: { message: string; code: string | null } | null;
-      warnings: string[];
-    };
-  }>;
-};
-
-const STEP_TYPES = [
-  "HTTP_REQUEST",
-  "ASSERTION",
-  "EXTRACT_VARIABLE",
-  "SET_VARIABLE",
-  "DELAY",
-  "CONDITION",
-  "DATABASE_ACTION",
-] as const;
-
-const TEMPLATES: Record<(typeof STEP_TYPES)[number], { name: string; config: unknown }> = {
-  HTTP_REQUEST: {
-    name: "HTTP Request",
-    config: {
-      method: "GET",
-      url: "{{base_url}}/get",
-      headers: { Authorization: "Bearer {{token}}" },
-      query: {},
-      body: {},
-      timeoutMs: 15000,
-    },
-  },
-  ASSERTION: {
-    name: "Assert status",
-    config: { kind: "status_code", expected: 200 },
-  },
-  EXTRACT_VARIABLE: {
-    name: "Extract variable",
-    config: { path: "body.data.orderId", variable: "order_id" },
-  },
-  SET_VARIABLE: {
-    name: "Set variable",
-    config: { variable: "order_id", value: "ORD-{{suffix}}" },
-  },
-  DELAY: {
-    name: "Delay",
-    config: { ms: 1500 },
-  },
-  CONDITION: {
-    name: "Condition",
-    config: { left: "{{status}}", op: "equals", right: "CREATED" },
-  },
-  DATABASE_ACTION: {
-    name: "Database action",
-    config: {
-      connectorId: "",
-      operation: "SELECT",
-      query: "SELECT * FROM users WHERE id = {{userId}}",
-      inputMapping: { userId: "userId" },
-      outputMapping: { user_name: "name" },
-    },
-  },
-};
-
-const TERMINAL = new Set(["PASSED", "FAILED", "CANCELLED"]);
-
-function statusTone(status: string) {
-  if (status === "PASSED") return "text-success";
-  if (status === "FAILED") return "text-destructive";
-  if (status === "CANCELLED") return "text-warning";
-  if (status === "RUNNING") return "text-primary";
-  return "text-muted-foreground";
+function writeDismissed(scenarioId: string, ids: string[]) {
+  try {
+    window.localStorage.setItem(`qa-workbench.dismissed.${scenarioId}`, JSON.stringify(ids.slice(-500)));
+  } catch {
+    // storage unavailable: dismissals last for this visit only
+  }
 }
 
 export default function ScenariosPage() {
-  const { t, n, d, err, label } = useI18n();
+  const { t, n, err, label } = useI18n();
+  const toast = useToast();
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [envs, setEnvs] = useState<Env[]>([]);
   const [connectors, setConnectors] = useState<ConnectorChoice[]>([]);
-  const [dbStep, setDbStep] = useState<DatabaseStepValue>(EMPTY_DATABASE_STEP);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [name, setName] = useState("");
-  const [stepType, setStepType] =
-    useState<(typeof STEP_TYPES)[number] | "">("");
-  const [stepName, setStepName] = useState("");
-  const [configText, setConfigText] = useState("");
-  const [curlMode, setCurlMode] = useState(false);
-  const [curlText, setCurlText] = useState("");
-  const [importOpen, setImportOpen] = useState(false);
-  const [importText, setImportText] = useState("");
+  const [detail, setDetail] = useState<Scenario | null>(null);
   const [analysis, setAnalysis] = useState<FlowAnalysis | null>(null);
-  const [hiddenDeps, setHiddenDeps] = useState<string[]>([]);
-  const [editingStepId, setEditingStepId] = useState<string | null>(null);
-  const [mappings, setMappings] = useState<ResponseMapping[]>([]);
-  const editorRef = useRef<HTMLTextAreaElement | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
   const [liveRun, setLiveRun] = useState<ScenarioRun | null>(null);
-  const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [picker, setPicker] = useState<PickerRequest | null>(null);
+  const [confirm, setConfirm] = useState<{ title: string; body: string; action: () => Promise<void> } | null>(null);
+  const [dismissed, setDismissed] = useState<string[]>([]);
+  const [newName, setNewName] = useState("");
+  const [filter, setFilter] = useState("");
+  const [busy, setBusy] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const selectedRef = useRef<string | null>(null);
 
-  const statusLabel = (status: string) => label("status", status);
-  const selected = scenarios.find((s) => s.id === selectedId) ?? null;
+  const fail = useCallback((error: unknown) => toast.notify("error", err(error instanceof Error ? error.message : "Request failed")), [toast, err]);
 
   const stopPolling = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
+    if (pollRef.current) clearTimeout(pollRef.current);
+    pollRef.current = null;
   }, []);
 
-  const reload = async () => {
-    const [list, environmentList, connectorList] = await Promise.all([
-      api<Scenario[]>("/scenarios"),
-      api<Env[]>("/environments"),
-      api<ConnectorChoice[]>("/database-connectors"),
-    ]);
+  const loadList = useCallback(async () => {
+    const list = await api<Scenario[]>("/scenarios");
     setScenarios(list);
-    setEnvs(environmentList);
-    setConnectors(connectorList);
-    setSelectedId((current) => current ?? list[0]?.id ?? null);
-  };
+    return list;
+  }, []);
 
-  const refreshSelected = async (id: string) => {
-    const detail = await api<Scenario>(`/scenarios/${id}`);
-    setScenarios((prev) => {
-      const exists = prev.some((s) => s.id === id);
-      if (!exists) return [...prev, detail];
-      return prev.map((s) => (s.id === id ? detail : s));
-    });
-    try {
-      setAnalysis(await api<FlowAnalysis>(`/scenarios/${id}/analyze-flow`, { method: "POST", body: "{}" }));
-    } catch {
-      setAnalysis(null);
-    }
-  };
+  /** Scenario detail and its design-time analysis (suggestions, mapping health, request fields). */
+  const loadScenario = useCallback(async (id: string) => {
+    const [scenario, flow] = await Promise.all([
+      api<Scenario>(`/scenarios/${id}`),
+      api<FlowAnalysis>(`/scenarios/${id}/analyze-flow`, { method: "POST", body: "{}" }).catch(() => null),
+    ]);
+    if (selectedRef.current !== id) return;
+    setDetail(scenario);
+    setAnalysis(flow);
+    setScenarios((current) => current.map((item) => (item.id === id ? { ...item, ...scenario, runs: scenario.runs.slice(0, 1) } : item)));
+  }, []);
+
+  const poll = useCallback(
+    (runId: string, scenarioId: string) => {
+      stopPolling();
+      const tick = async () => {
+        try {
+          const run = await api<ScenarioRun>(`/scenarios/runs/${runId}`);
+          if (selectedRef.current !== scenarioId) return;
+          setLiveRun(run);
+          if (ACTIVE_RUN.has(run.status)) {
+            pollRef.current = setTimeout(() => void tick(), POLL_MS);
+            return;
+          }
+          setBusy(false);
+          await loadScenario(scenarioId);
+          setLiveRun(null);
+        } catch (error) {
+          setBusy(false);
+          fail(error);
+        }
+      };
+      pollRef.current = setTimeout(() => void tick(), POLL_MS);
+    },
+    [stopPolling, loadScenario, fail],
+  );
 
   useEffect(() => {
     let alive = true;
-    (async () => {
+    void (async () => {
       try {
         const [list, environmentList, connectorList] = await Promise.all([
           api<Scenario[]>("/scenarios"),
           api<Env[]>("/environments"),
-          api<ConnectorChoice[]>("/database-connectors"),
+          api<ConnectorChoice[]>("/database-connectors").catch(() => []),
         ]);
         if (!alive) return;
         setScenarios(list);
         setEnvs(environmentList);
         setConnectors(connectorList);
         setSelectedId((current) => current ?? list[0]?.id ?? null);
-      } catch (e) {
-        if (alive) setMessage(e instanceof Error ? e.message : "Load failed");
+      } catch (error) {
+        if (alive) fail(error);
       }
     })();
     return () => {
       alive = false;
       stopPolling();
     };
-  }, [stopPolling]);
+  }, [stopPolling, fail]);
 
-  const applyTemplate = (type: (typeof STEP_TYPES)[number] | "") => {
-    if (!type) {
-      setStepType("");
-      setStepName("");
-      setConfigText("");
-      setCurlMode(false);
-      setCurlText("");
-      setEditingStepId(null);
-      setDbStep(EMPTY_DATABASE_STEP);
-      setMappings([]);
-      return;
-    }
-    const template = TEMPLATES[type];
-    setStepType(type);
-    // Keep fields empty; show template only as placeholders/hints.
-    setStepName("");
-    setConfigText("");
-    setCurlMode(false);
-    setCurlText("");
-    setEditingStepId(null);
-    setDbStep(EMPTY_DATABASE_STEP);
-    setMappings([]);
-    return template;
-  };
-
-  /** Open a step in the editor; response mappings are edited apart from the JSON. */
-  const startEdit = (step: Step, extra?: ResponseMapping) => {
-    const current = readMappings(step.config);
-    const { extract: _extract, ...rest } = step.config;
-    void _extract;
-    setEditingStepId(step.id);
-    setStepType(step.type as (typeof STEP_TYPES)[number]);
-    setStepName(step.name);
-    setConfigText(JSON.stringify(step.type === "HTTP_REQUEST" ? rest : step.config, null, 2));
-    setMappings(step.type === "HTTP_REQUEST" ? (extra ? [...current, extra] : current) : []);
-    setDbStep(
-      step.type === "DATABASE_ACTION"
-        ? databaseStepFromConfig(step.config)
-        : EMPTY_DATABASE_STEP,
-    );
-    setCurlMode(false);
-    setCurlText("");
-  };
-
-  const configPlaceholder = stepType
-    ? JSON.stringify(TEMPLATES[stepType].config, null, 2)
-    : '{\n  "key": "value"\n}';
-  const stepNamePlaceholder = stepType
-    ? label("stepType", stepType)
-    : t("scenarios.stepNameHint");
-  const curlParsed =
-    curlMode && stepType === "HTTP_REQUEST" && curlText.trim()
-      ? parseCurl(curlText)
-      : null;
-  const selectedConnector = connectors.find((item) => item.id === dbStep.connectorId);
-  const databaseProblem = databaseStepProblem(dbStep, selectedConnector?.type);
-
-  const producers: VariableProducer[] = analysis?.variables ?? [];
-  const stepNumberOf = (producer: { stepId?: string; orderIndex: number }) => {
-    const index = selected?.steps.findIndex((item) => item.id === producer.stepId) ?? -1;
-    return index >= 0 ? index + 1 : producer.orderIndex + 1;
-  };
-  const editingStep = selected?.steps.find((item) => item.id === editingStepId) ?? null;
-  const editingSample = (() => {
-    if (!editingStepId) return null;
-    const run = selected?.runs?.[0]?.stepRuns.find((item) => item.scenarioStepId === editingStepId);
-    const output = run?.output;
-    if (!output || typeof output !== "object" || Array.isArray(output)) return null;
-    const record = output as { body?: unknown; headers?: unknown };
-    return {
-      body: record.body,
-      headers:
-        record.headers && typeof record.headers === "object" ? (record.headers as Record<string, string>) : undefined,
-    };
-  })();
-  const mappingProblems = stepType === "HTTP_REQUEST" ? validateMappings(mappings).length : 0;
-
-  /** Insert {{name}} at the cursor of the request editor. */
-  const insertVariable = (name: string) => {
-    const curl = stepType === "HTTP_REQUEST" && curlMode;
-    const current = curl ? curlText : configText;
-    const setText = curl ? setCurlText : setConfigText;
-    if (!current.trim() && !curl) {
-      // Start from the template so there is a structure to insert into.
-      setText(configPlaceholder);
-      return;
-    }
-    const element = editorRef.current;
-    const start = element?.selectionStart ?? current.length;
-    const end = element?.selectionEnd ?? current.length;
-    const token = `{{${name}}}`;
-    setText(`${current.slice(0, start)}${token}${current.slice(end)}`);
-    requestAnimationFrame(() => {
-      element?.focus();
-      element?.setSelectionRange(start + token.length, start + token.length);
-    });
-  };
-
-  const startLivePoll = (runId: string, scenarioId: string) => {
+  useEffect(() => {
+    selectedRef.current = selectedId;
     stopPolling();
-    pollRef.current = setInterval(async () => {
-      try {
-        const run = await api<ScenarioRun>(`/scenarios/runs/${runId}`);
-        setLiveRun(run);
-        if (TERMINAL.has(run.status)) {
-          stopPolling();
-          setBusy(false);
-          setMessage(`Run finished: ${run.status}`);
-          await refreshSelected(scenarioId);
-        }
-      } catch (e) {
-        stopPolling();
-        setBusy(false);
-        setMessage(e instanceof Error ? e.message : "Poll failed");
-      }
-    }, 400);
+    setLiveRun(null);
+    setDetail(null);
+    setAnalysis(null);
+    setSelectedStepId(null);
+    setBusy(false);
+    if (!selectedId) return;
+    setDismissed(readDismissed(selectedId));
+    void loadScenario(selectedId).catch(fail);
+  }, [selectedId, loadScenario, stopPolling, fail]);
+
+  // A run still going when the page opens (another tab, a reload) is followed live.
+  useEffect(() => {
+    const latest = detail?.runs[0];
+    if (detail && latest && ACTIVE_RUN.has(latest.status) && !pollRef.current) {
+      setBusy(true);
+      poll(latest.id, detail.id);
+    }
+  }, [detail, poll]);
+
+  const steps = useMemo(() => [...(detail?.steps ?? [])].sort((a, b) => a.orderIndex - b.orderIndex), [detail]);
+  const run = liveRun ?? detail?.runs[0] ?? null;
+  const selectedStep = steps.find((step) => step.id === selectedStepId) ?? null;
+  const stepNumber = useCallback((id: string | undefined) => steps.findIndex((step) => step.id === id) + 1, [steps]);
+  const suggestions = useMemo(
+    () => (analysis?.dependencies ?? []).filter((item) => !dismissed.includes(item.id)),
+    [analysis, dismissed],
+  );
+  const awaitingStepId = run?.live?.awaitingInput ? (run.live.stepId ?? null) : null;
+
+  // The step waiting for input opens by itself.
+  useEffect(() => {
+    if (awaitingStepId) setSelectedStepId(awaitingStepId);
+  }, [awaitingStepId]);
+
+  const refresh = async () => {
+    if (selectedId) await loadScenario(selectedId);
   };
 
-  const moveStep = async (stepId: string, direction: -1 | 1) => {
-    if (!selected) return;
-    const ordered = [...selected.steps].sort(
-      (a, b) => a.orderIndex - b.orderIndex,
-    );
-    const index = ordered.findIndex((s) => s.id === stepId);
-    const swapWith = index + direction;
-    if (index < 0 || swapWith < 0 || swapWith >= ordered.length) return;
-    const next = [...ordered];
-    [next[index], next[swapWith]] = [next[swapWith], next[index]];
-    await api(`/scenarios/${selected.id}/reorder`, {
-      method: "POST",
-      body: JSON.stringify({ stepIds: next.map((s) => s.id) }),
-    });
-    await refreshSelected(selected.id);
+  const guarded = async (work: () => Promise<unknown>) => {
+    try {
+      await work();
+    } catch (error) {
+      fail(error);
+    }
   };
+
+  const startRun = async (untilStepId?: string) => {
+    if (!detail) return;
+    setBusy(true);
+    try {
+      const started = await api<ScenarioRun>(`/scenarios/${detail.id}/run`, {
+        method: "POST",
+        body: JSON.stringify(untilStepId ? { untilStepId } : {}),
+      });
+      setLiveRun(started);
+      poll(started.id, detail.id);
+    } catch (error) {
+      setBusy(false);
+      fail(error);
+    }
+  };
+
+  const patchScenario = (data: Record<string, unknown>) =>
+    guarded(async () => {
+      if (!detail) return;
+      await api(`/scenarios/${detail.id}`, { method: "PATCH", body: JSON.stringify(data) });
+      await Promise.all([refresh(), loadList()]);
+    });
+
+  const saveBinding = async (stepId: string, binding: StepBinding) => {
+    await api(`/scenarios/steps/${stepId}/bindings`, { method: "POST", body: JSON.stringify(binding) });
+  };
+
+  const dismiss = (suggestion: Suggestion) => {
+    if (!detail) return;
+    const next = [...dismissed, suggestion.id];
+    setDismissed(next);
+    writeDismissed(detail.id, next);
+  };
+
+  const accept = (list: Suggestion[]) =>
+    guarded(async () => {
+      if (!detail) return;
+      for (const suggestion of list) {
+        try {
+          await api(`/scenarios/${detail.id}/dependencies/accept`, { method: "POST", body: JSON.stringify({ id: suggestion.id }) });
+        } catch (error) {
+          if (error instanceof Error && error.message === "A manual mapping already exists for this field") {
+            if (!window.confirm(t("builder.detected.replaceManual"))) continue;
+            await api(`/scenarios/${detail.id}/dependencies/accept`, {
+              method: "POST",
+              body: JSON.stringify({ id: suggestion.id, replace: true }),
+            });
+          } else {
+            throw error;
+          }
+        }
+      }
+      await refresh();
+    });
+
+  const addStep = (type: string) =>
+    guarded(async () => {
+      if (!detail) return;
+      const created = await api<Step>(`/scenarios/${detail.id}/steps`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: type === "HTTP_REQUEST" ? t("builder.flow.newRequestName") : label("stepType", type),
+          type,
+          config: TEMPLATES[type] ?? {},
+        }),
+      });
+      await refresh();
+      setSelectedStepId(created.id);
+    });
+
+  const moveStep = (step: Step, direction: -1 | 1) =>
+    guarded(async () => {
+      if (!detail) return;
+      const ids = steps.map((item) => item.id);
+      const index = ids.indexOf(step.id);
+      const swap = index + direction;
+      if (index < 0 || swap < 0 || swap >= ids.length) return;
+      [ids[index], ids[swap]] = [ids[swap]!, ids[index]!];
+      await api(`/scenarios/${detail.id}/reorder`, { method: "POST", body: JSON.stringify({ stepIds: ids }) });
+      await refresh();
+    });
+
+  const deleteStep = (step: Step) =>
+    setConfirm({
+      title: t("builder.flow.delete"),
+      body: t("builder.flow.confirmDelete", { name: step.name }),
+      action: async () => {
+        await api(`/scenarios/steps/${step.id}`, { method: "DELETE" });
+        if (selectedStepId === step.id) setSelectedStepId(null);
+        await refresh();
+      },
+    });
+
+  const actions: StepActions = {
+    pick: setPicker,
+    saveStep: async (stepId, patch) =>
+      guarded(async () => {
+        await api(`/scenarios/steps/${stepId}`, { method: "PATCH", body: JSON.stringify(patch) });
+        await refresh();
+      }),
+    runUntil: (step) => void startRun(step.id),
+    toggleBinding: (stepId, binding) =>
+      void guarded(async () => {
+        await saveBinding(stepId, { ...binding, enabled: binding.enabled === false });
+        await refresh();
+      }),
+    removeBinding: (stepId, binding) =>
+      void guarded(async () => {
+        await api(`/scenarios/steps/${stepId}/bindings/remove`, {
+          method: "POST",
+          body: JSON.stringify({ location: binding.target.location, field: binding.target.field }),
+        });
+        await refresh();
+      }),
+    accept: (suggestion) => void accept([suggestion]),
+    dismiss,
+    addAssertion: (step, path, value) =>
+      guarded(async () => {
+        if (!detail) return;
+        const created = await api<Step>(`/scenarios/${detail.id}/steps`, {
+          method: "POST",
+          body: JSON.stringify({
+            name: path,
+            type: "ASSERTION",
+            config: { kind: "equals", path: path.replace(/^\$\.?/, "body."), expected: value },
+          }),
+        });
+        // Assertions check the request right before them: place it after this step and its other assertions.
+        const ids = steps.map((item) => item.id);
+        let at = ids.indexOf(step.id) + 1;
+        while (at < steps.length && steps[at]!.type === "ASSERTION") at += 1;
+        ids.splice(at, 0, created.id);
+        await api(`/scenarios/${detail.id}/reorder`, { method: "POST", body: JSON.stringify({ stepIds: ids }) });
+        toast.notify("success", t("builder.assertions.added"));
+        await refresh();
+      }),
+    deleteStep,
+    resolve: async (choice: ManualChoice) =>
+      guarded(async () => {
+        if (!run) return;
+        const next = await api<ScenarioRun>(`/scenarios/runs/${run.id}/resolve`, {
+          method: "POST",
+          body: JSON.stringify({ changes: [{ target: choice.target, source: choice.source }], save: choice.save }),
+        });
+        setLiveRun(next);
+      }),
+    skipInput: async () =>
+      guarded(async () => {
+        if (!run) return;
+        setLiveRun(await api<ScenarioRun>(`/scenarios/runs/${run.id}/skip-input`, { method: "POST", body: "{}" }));
+      }),
+  };
+
+  const visible = scenarios.filter((item) => item.name.toLowerCase().includes(filter.trim().toLowerCase()));
+  const targetLabel = (suggestion: Suggestion) =>
+    `${t(`builder.picker.locations.${suggestion.target.location}`)} · ${suggestion.target.key}`;
 
   return (
-    <div className="mx-auto grid min-w-0 max-w-6xl grid-cols-1 gap-4 xl:grid-cols-[220px_minmax(0,1fr)]">
-      <Card className="h-fit min-w-0">
-        <CardHeader>
-          <CardTitle>{t("scenarios.title")}</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          <input
-            className="h-8 w-full rounded-md border border-border bg-background px-2 text-sm"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder={t("common.name")}
-          />
-          <Button
-            className="w-full"
-            disabled={!name.trim()}
-            onClick={async () => {
-              const created = await api<Scenario>("/scenarios", {
-                method: "POST",
-                body: JSON.stringify({ name }),
-              });
-              setName("");
-              await reload();
+    <div className="mx-auto grid min-w-0 max-w-[1500px] grid-cols-1 gap-4 lg:grid-cols-[230px_minmax(0,1fr)]">
+      <aside className="min-w-0 space-y-2" aria-label={t("nav.scenarios")}>
+        <form
+          className="flex gap-1"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!newName.trim()) return;
+            void guarded(async () => {
+              const created = await api<Scenario>("/scenarios", { method: "POST", body: JSON.stringify({ name: newName.trim() }) });
+              setNewName("");
+              await loadList();
               setSelectedId(created.id);
-              await refreshSelected(created.id);
-            }}
-          >
-            {t("scenarios.create")}
+            });
+          }}
+        >
+          <input
+            className="h-8 min-w-0 flex-1 rounded-md border border-border bg-background px-2 text-xs"
+            aria-label={t("builder.namePlaceholder")}
+            placeholder={t("builder.newScenario")}
+            value={newName}
+            onChange={(event) => setNewName(event.target.value)}
+          />
+          <Button type="submit" size="icon" aria-label={t("builder.newScenario")} disabled={!newName.trim()}>
+            <Plus className="h-4 w-4" />
           </Button>
-          <div className="flex gap-1 overflow-x-auto pt-2 xl:block xl:space-y-1 xl:overflow-visible">
-            {scenarios.map((s) => (
+        </form>
+        {scenarios.length > 6 ? (
+          <label className="relative block">
+            <span className="sr-only">{t("builder.search")}</span>
+            <Search className="pointer-events-none absolute start-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <input
+              className="h-8 w-full rounded-md border border-border bg-background ps-7 pe-2 text-xs"
+              placeholder={t("builder.search")}
+              value={filter}
+              onChange={(event) => setFilter(event.target.value)}
+            />
+          </label>
+        ) : null}
+        {scenarios.length === 0 ? <p className="px-1 text-xs text-muted-foreground">{t("builder.noScenarios")}</p> : null}
+        <nav className="flex gap-1 overflow-x-auto pb-1 lg:block lg:space-y-0.5 lg:overflow-visible">
+          {visible.map((item) => {
+            const last = item.runs[0];
+            const tone = stateTone(last?.status ?? "NOT_RUN");
+            return (
               <button
-                key={s.id}
-                onClick={() => {
-                  setSelectedId(s.id);
-                  void refreshSelected(s.id);
-                }}
-                className={`shrink-0 rounded px-2 py-1.5 text-start text-sm xl:block xl:w-full ${
-                  selectedId === s.id
-                    ? "bg-primary/15 text-primary"
-                    : "hover:bg-accent"
-                }`}
+                key={item.id}
+                type="button"
+                aria-current={selectedId === item.id ? "page" : undefined}
+                onClick={() => setSelectedId(item.id)}
+                className={cn(
+                  "flex shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-start lg:w-full",
+                  selectedId === item.id ? "bg-primary/15 text-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                )}
               >
-                <span className="block truncate">{s.name}</span>
-                <span className="block font-mono text-[10px] text-muted-foreground">
-                  {t("scenarios.stepsCount", { count: n(s.steps.length) })}
-                  {s.runs[0]?.status ? ` · ${s.runs[0].status}` : ""}
+                <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", tone.dot)} aria-hidden />
+                <span className="min-w-0 flex-1">
+                  <span className="block max-w-48 truncate text-xs">{item.name}</span>
+                  <span className="block text-[10px] text-muted-foreground">
+                    {t("builder.requestsCount", { count: n(item.steps.length) })}
+                    {last ? ` · ${label("status", last.status)}` : ""}
+                  </span>
                 </span>
               </button>
-            ))}
-          </div>
-        </CardContent>
-      </Card>
+            );
+          })}
+        </nav>
+      </aside>
 
-      <div className="min-w-0 space-y-3">
-        <p className="text-xs text-muted-foreground">{t("scenarios.subtitle")}</p>
-        {message ? <p className="text-xs text-destructive">{err(message)}</p> : null}
-        {liveRun?.status === "RUNNING" && selected ? (
-          <ProgressBanner
-            active
-            value={Math.max(
-              5,
-              Math.round(
-                ((liveRun.stepRuns?.length ?? 0) /
-                  Math.max(selected.steps.length, 1)) *
-                  100,
-              ),
-            )}
-            label={t("scenarios.liveExecution")}
-          />
-        ) : null}
-        {!selected ? (
-          <p className="text-sm text-muted-foreground">
-            {t("scenarios.selectOrCreate")}
-          </p>
+      <div className="min-w-0">
+        {!detail ? (
+          <p className="text-sm text-muted-foreground">{selectedId ? t("common.loading") : t("builder.selectScenario")}</p>
         ) : (
-          <>
-            <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <h1 className="min-w-0 basis-full break-words text-lg font-semibold sm:basis-auto">{selected.name}</h1>
-              <select
-                className="h-8 w-full min-w-0 basis-full rounded-md border border-border bg-background px-2 text-sm sm:w-auto sm:basis-auto"
-                value={selected.environmentId ?? ""}
-                onChange={async (e) => {
-                  await api(`/scenarios/${selected.id}`, {
-                    method: "PATCH",
-                    body: JSON.stringify({
-                      environmentId: e.target.value || null,
-                    }),
-                  });
-                  await refreshSelected(selected.id);
-                }}
-              >
-                <option value="">{t("scenarios.noEnvironment")}</option>
-                {envs.map((env) => (
-                  <option key={env.id} value={env.id}>
-                    {env.name}
-                  </option>
-                ))}
-              </select>
-              <label className="flex items-center gap-1 text-xs text-muted-foreground">
-                <input
-                  type="checkbox"
-                  checked={selected.stopOnFailure}
-                  onChange={async (e) => {
-                    await api(`/scenarios/${selected.id}`, {
-                      method: "PATCH",
-                      body: JSON.stringify({ stopOnFailure: e.target.checked }),
-                    });
-                    await refreshSelected(selected.id);
-                  }}
-                />
-                {t("scenarios.stopOnFailure")}
-              </label>
-              <Button
-                disabled={busy}
-                onClick={async () => {
-                  setBusy(true);
-                  setMessage(null);
-                  try {
-                    const run = await api<ScenarioRun>(
-                      `/scenarios/${selected.id}/run`,
-                      { method: "POST", body: "{}" },
-                    );
-                    setLiveRun(run);
-                    setExpandedRunId(run.id);
-                    startLivePoll(run.id, selected.id);
-                  } catch (e) {
-                    setBusy(false);
-                    setMessage(e instanceof Error ? e.message : "Run failed");
-                  }
-                }}
-              >
-                {t("common.run")}
-              </Button>
-              {liveRun && liveRun.status === "RUNNING" ? (
-                <Button
-                  variant="destructive"
-                  onClick={async () => {
-                    await api(`/scenarios/runs/${liveRun.id}/cancel`, {
-                      method: "POST",
-                      body: "{}",
-                    });
-                    setMessage(t("common.cancelRequested"));
-                  }}
-                >
-                  {t("scenarios.cancelRun")}
-                </Button>
-              ) : null}
-              <Button
-                variant="outline"
-                onClick={async () => {
-                  await api(`/scenarios/${selected.id}/duplicate`, {
-                    method: "POST",
-                    body: "{}",
-                  });
-                  await reload();
-                }}
-              >
-                {t("common.duplicate")}
-              </Button>
-              <Button
-                variant="destructive"
-                onClick={async () => {
-                  if (!window.confirm(t("common.confirmDelete", { name: selected.name }))) return;
-                  await api(`/scenarios/${selected.id}`, { method: "DELETE" });
-                  setSelectedId(null);
-                  await reload();
-                }}
-              >
-                {t("common.delete")}
-              </Button>
-            </div>
-
-            {liveRun ? (
-              <Card className="border-primary/40">
-                <CardHeader className="pb-2">
-                  <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-sm">
-                    {t("scenarios.liveExecution")}
-                    <Badge className={statusTone(liveRun.status)}>
-                      {statusLabel(liveRun.status)}
-                    </Badge>
-                    <span className="font-mono text-[10px] text-muted-foreground">
-                      {liveRun.id.slice(0, 8)}
-                    </span>
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-2">
-                  <ProgressBar
-                    value={
-                      selected.steps.length === 0
-                        ? 0
-                        : Math.round(
-                            ((liveRun.stepRuns?.length ?? 0) /
-                              selected.steps.length) *
-                              100,
-                          )
-                    }
-                    label={t("scenarios.liveExecution")}
-                    size="sm"
-                  />
-                  {(liveRun.stepRuns ?? []).map((sr) => (
-                    <div
-                      key={sr.id}
-                      className="flex min-w-0 flex-wrap items-center justify-between gap-1 font-mono text-xs"
-                    >
-                      <span className={statusTone(sr.status)}>
-                        {statusLabel(sr.status)} {sr.name}
-                        {sr.error ? ` — ${err(sr.error)}` : ""}
-                      </span>
-                      <span className="text-muted-foreground">
-                        {n(sr.durationMs ?? 0)}ms
-                      </span>
-                    </div>
-                  ))}
-                  {liveRun.status === "RUNNING" &&
-                  (liveRun.stepRuns?.length ?? 0) === 0 ? (
-                    <p className="text-xs text-muted-foreground">
-                      {t("common.loading")}
-                    </p>
-                  ) : null}
-                </CardContent>
-              </Card>
-            ) : null}
-
-            <div className="flex flex-wrap gap-2">
-              <Button variant="outline" onClick={() => applyTemplate("HTTP_REQUEST")}>
-                {t("scenarios.addStage")}
-              </Button>
-              <Button variant="outline" onClick={() => setImportOpen(true)}>
-                {t("scenarios.importCurl")}
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => void refreshSelected(selected.id)}
-              >
-                {t("scenarios.analyzeFlow")}
-              </Button>
-            </div>
-            {selected.steps.length === 0 && !stepType ? (
-              <div className="rounded-md border border-border px-3 py-4">
-                <p className="text-sm">{t("scenarios.emptyFlow")}</p>
-                <p className="mt-1 text-xs text-muted-foreground">{t("scenarios.emptyFlowHint")}</p>
-              </div>
-            ) : null}
-            {analysis ? (
-              <div className="rounded-md border border-border px-3 py-2 text-xs">
-                <div className={analysis.health.ready ? "text-success" : "text-destructive"}>
-                  {analysis.health.ready
-                    ? t("scenarios.flowReady")
-                    : t("scenarios.flowBroken", { count: n(analysis.health.errors) })}
-                </div>
-                <p className="mt-1 font-mono text-[10px] text-muted-foreground dir-ltr">
-                  HTTP {n(analysis.health.http)} · deps {n(analysis.health.dependencies)} · vars {n(analysis.health.extracts)} · assert {n(analysis.health.assertions)}
-                </p>
-              </div>
-            ) : null}
-            {analysis?.dependencies
-              .filter((item) => !hiddenDeps.includes(item.id))
-              .map((item) => (
-                <div key={item.id} className="rounded-md border border-border px-3 py-2 text-xs">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span>
-                      {item.producerName} → {item.consumerName}
-                    </span>
-                    <span className="font-mono text-[10px] dir-ltr">{item.confidence}</span>
-                  </div>
-                  <p className="mt-1 font-mono text-[11px] dir-ltr">
-                    {item.variable} ← {item.sourcePath} · {item.locationDetail}
-                  </p>
-                  <div className="mt-2 flex gap-2">
-                    <Button
-                      size="sm"
-                      onClick={() => {
-                        void (async () => {
-                          try {
-                            const next = await api<FlowAnalysis>(`/scenarios/${selected.id}/dependencies/accept`, {
-                              method: "POST",
-                              body: JSON.stringify(item),
-                            });
-                            setAnalysis(next);
-                            await refreshSelected(selected.id);
-                          } catch (error) {
-                            setMessage(error instanceof Error ? error.message : "Request failed");
-                          }
-                        })();
-                      }}
-                    >
-                      {t("scenarios.accept")}
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={() => setHiddenDeps((current) => [...current, item.id])}>
-                      {t("scenarios.reject")}
-                    </Button>
-                  </div>
-                </div>
-              ))}
-            {stepType || editingStepId ? (
-            <Card className="min-w-0">
-              <CardHeader>
-                <CardTitle>
-                  {editingStepId
-                    ? t("scenarios.editStep")
-                    : t("scenarios.addStep")}
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2">
-                  <input
-                    className="h-8 w-full min-w-0 rounded-md border border-border bg-background px-2 text-sm"
-                    value={stepName}
-                    onChange={(e) => setStepName(e.target.value)}
-                    placeholder={stepNamePlaceholder}
-                  />
-                  <select
-                    className="h-8 w-full min-w-0 rounded-md border border-border bg-background px-2 text-sm"
-                    value={stepType}
-                    onChange={(e) =>
-                      applyTemplate(
-                        (e.target.value || "") as
-                          | (typeof STEP_TYPES)[number]
-                          | "",
-                      )
-                    }
-                  >
-                    <option value="">{t("scenarios.selectStepType")}</option>
-                    {STEP_TYPES.map((typeKey) => (
-                      <option key={typeKey} value={typeKey}>
-                        {label("stepType", typeKey)}
-                      </option>
-                    ))}
-                  </select>
-                  <Button
-                    className="justify-self-start sm:col-span-2"
-                    disabled={
-                      !stepName.trim() ||
-                      !stepType ||
-                      (stepType === "HTTP_REQUEST" &&
-                        curlMode &&
-                        curlParsed?.ok !== true) ||
-                      (stepType === "DATABASE_ACTION" &&
-                        (!dbStep.connectorId || !dbStep.query.trim() || Boolean(databaseProblem))) ||
-                      (stepType === "HTTP_REQUEST" && mappingProblems > 0)
-                    }
-                    onClick={async () => {
-                      try {
-                        const config: Record<string, unknown> =
-                          stepType === "DATABASE_ACTION"
-                            ? databaseStepConfig(dbStep)
-                            : stepType === "HTTP_REQUEST" && curlMode
-                            ? (() => {
-                                const parsed = parseCurl(curlText);
-                                if (!parsed.ok) {
-                                  throw new Error(t(`scenarios.curlErrors.${parsed.code}`));
-                                }
-                                return parsed.config;
-                              })()
-                            : (JSON.parse(
-                                configText.trim() ? configText : configPlaceholder,
-                              ) as Record<string, unknown>);
-                        if (stepType === "HTTP_REQUEST" && mappings.length > 0) {
-                          config.extract = mappings.map((row) => ({
-                            variable: row.variable,
-                            path: (row.from ?? "body") === "status" ? "" : row.path,
-                            from: row.from ?? "body",
-                            ...(row.optional ? { optional: true } : {}),
-                            ...(row.secret ? { secret: true } : {}),
-                          }));
-                        }
-                        if (editingStepId) {
-                          await api(`/scenarios/steps/${editingStepId}`, {
-                            method: "PATCH",
-                            body: JSON.stringify({ name: stepName, config }),
-                          });
-                          setEditingStepId(null);
-                        } else {
-                          await api(`/scenarios/${selected.id}/steps`, {
-                            method: "POST",
-                            body: JSON.stringify({
-                              name: stepName,
-                              type: stepType,
-                              config,
-                            }),
-                          });
-                        }
-                        applyTemplate("");
-                        await refreshSelected(selected.id);
-                        setMessage(null);
-                      } catch (e) {
-                        setMessage(
-                          e instanceof Error ? e.message : "Invalid step JSON",
-                        );
-                      }
-                    }}
-                  >
-                    {editingStepId
-                      ? t("scenarios.saveStep")
-                      : t("scenarios.addStep")}
-                  </Button>
-                </div>
-                {stepType === "HTTP_REQUEST" ? (
-                  <div className="flex items-center justify-between gap-3 rounded-md border border-border px-2 py-1.5">
-                    <div className="min-w-0">
-                      <div className="text-xs text-foreground">
-                        {t("scenarios.curlToggle")}
-                      </div>
-                      <p className="text-[11px] text-muted-foreground">
-                        {t("scenarios.curlHint")}
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={curlMode}
-                      aria-label={t("scenarios.curlToggle")}
-                      onClick={() => setCurlMode((current) => !current)}
-                      className={`relative h-4 w-7 shrink-0 rounded-full border ${
-                        curlMode
-                          ? "border-primary bg-primary"
-                          : "border-border bg-background"
-                      }`}
-                    >
-                      <span
-                        className={`absolute top-0.5 h-2.5 w-2.5 rounded-full bg-foreground ${
-                          curlMode ? "start-3.5" : "start-0.5"
-                        }`}
-                      />
-                    </button>
-                  </div>
-                ) : null}
-                {stepType === "DATABASE_ACTION" ? (
-                  <DatabaseStepForm
-                    connectors={connectors}
-                    value={dbStep}
-                    onChange={setDbStep}
-                  />
-                ) : (
-                <>
-                <textarea
-                  ref={editorRef}
-                  aria-label={t("scenarios.request")}
-                  className="min-h-28 w-full min-w-0 max-w-full rounded-md border border-border bg-background p-2 font-mono text-xs dir-ltr"
-                  dir="ltr"
-                  value={stepType === "HTTP_REQUEST" && curlMode ? curlText : configText}
-                  onChange={(e) =>
-                    stepType === "HTTP_REQUEST" && curlMode
-                      ? setCurlText(e.target.value)
-                      : setConfigText(e.target.value)
-                  }
-                  placeholder={
-                    stepType === "HTTP_REQUEST" && curlMode
-                      ? t("scenarios.curlPlaceholder")
-                      : configPlaceholder
-                  }
-                />
-                {stepType === "HTTP_REQUEST" && curlMode && curlParsed?.ok ? (
-                  <p className="dir-ltr break-all font-mono text-[11px] text-muted-foreground">
-                    {curlParsed.config.method} {curlParsed.config.url}
-                  </p>
-                ) : null}
-                {stepType === "HTTP_REQUEST" && curlMode && curlParsed && !curlParsed.ok ? (
-                  <p className="text-xs text-destructive">
-                    {t(`scenarios.curlErrors.${curlParsed.code}`)}
-                  </p>
-                ) : null}
-                <VariablePicker
-                  producers={producers.filter((producer) => producer.stepId !== editingStepId)}
-                  environmentKeys={analysis?.environmentKeys ?? []}
-                  position={editingStep ? editingStep.orderIndex : Number.POSITIVE_INFINITY}
-                  stepNumber={stepNumberOf}
-                  template={stepType === "HTTP_REQUEST" && curlMode ? curlText : configText}
-                  onInsert={insertVariable}
-                />
-                {stepType === "HTTP_REQUEST" ? (
-                  <ResponseMappingEditor
-                    value={mappings}
-                    onChange={setMappings}
-                    sample={editingSample}
-                    otherProducers={producers.filter((producer) => producer.stepId !== editingStepId)}
-                    environmentKeys={analysis?.environmentKeys ?? []}
-                    stepNumber={stepNumberOf}
-                  />
-                ) : null}
-                </>
-                )}
-                {editingStepId ? (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => {
-                      setEditingStepId(null);
-                      applyTemplate("");
-                    }}
-                  >
-                    {t("common.cancel")}
-                  </Button>
-                ) : null}
-              </CardContent>
-            </Card>
-            ) : null}
-
-            <div className="min-w-0 space-y-2">
-              <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                {t("scenarios.workflow")}
-              </h2>
-              <p className="text-[11px] text-muted-foreground">
-                {t("scenarios.autoBindHint")}
-              </p>
-              {selected.steps.length === 0 ? (
-                <p className="text-sm text-muted-foreground">{t("common.empty")}</p>
-              ) : (
-                <ScenarioFlow
-                  steps={selected.steps}
-                  selectedId={selectedStepId}
-                  onSelect={(id) =>
-                    setSelectedStepId((current) => (current === id ? null : id))
-                  }
-                  statuses={(liveRun ?? selected.runs?.[0])?.stepRuns?.map(
-                    (run) => run.status,
-                  ) ?? []}
-                  formatNumber={n}
-                  typeLabel={(type) => label("stepType", type)}
-                  disabledLabel={t("scenarios.disabled")}
-                  usesLabel={t("scenarios.flow.uses")}
-                  producesLabel={t("scenarios.flow.produces")}
-                  meta={Object.fromEntries(
-                    selected.steps.map((item) => {
-                      const stepNo = (id: string) =>
-                        selected.steps.findIndex((candidate) => candidate.id === id) + 1;
-                      // Design-time links carry their producer ("#1.bikerId");
-                      // runtime-consumed variables come from the latest run.
-                      const uses = [
-                        ...(analysis?.dependencies
-                          .filter((dep) => dep.consumerStepId === item.id)
-                          .map((dep) => `#${n(stepNo(dep.producerStepId))}.${dep.variable}`) ?? []),
-                      ];
-                      const outputs = [
-                        ...new Set(
-                          analysis?.dependencies
-                            .filter((dep) => dep.producerStepId === item.id)
-                            .map((dep) => dep.variable) ?? [],
-                        ),
-                      ];
-                      if (item.type === "EXTRACT_VARIABLE" && typeof item.config.variable === "string") {
-                        outputs.push(item.config.variable);
-                      }
-                      if (item.type === "HTTP_REQUEST") {
-                        outputs.push(...readMappings(item.config).map((row) => row.variable).filter(Boolean));
-                      }
-                      // {{references}} with the earlier step that produces them.
-                      for (const name of findVariableRefs(item.config)) {
-                        const producer = [...producers]
-                          .reverse()
-                          .find((candidate) => candidate.name === name && candidate.orderIndex < item.orderIndex);
-                        uses.push(producer ? `#${n(stepNumberOf(producer))}.${name}` : name);
-                      }
-                      const issue = analysis?.issues.find((problem) => problem.stepId === item.id);
-                      const run = (liveRun ?? selected.runs?.[0])?.stepRuns?.find(
-                        (stepRun) => stepRun.name === item.name,
-                      );
-                      const consumedAtRun = (() => {
-                        const output = run?.output;
-                        if (!output || typeof output !== "object" || !("consumedVars" in output)) return [];
-                        const list = (output as { consumedVars?: unknown }).consumedVars;
-                        return Array.isArray(list)
-                          ? list
-                              .map((entry) => (entry && typeof entry === "object" ? (entry as { variable?: unknown }).variable : null))
-                              .filter((name): name is string => typeof name === "string")
-                          : [];
-                      })();
-                      for (const name of consumedAtRun) {
-                        if (!uses.some((entry) => entry.endsWith(`.${name}`))) uses.push(name);
-                      }
-                      return [item.id, {
-                        uses: [...new Set(uses)],
-                        outputs: [...new Set(outputs)],
-                        durationMs: run?.durationMs,
-                        issue: issue ? `${issue.detail}` : undefined,
-                      }];
-                    }),
-                  )}
-                />
-              )}
-              {(() => {
-                const step = selected.steps.find((item) => item.id === selectedStepId);
-                if (!step) {
-                  return (
-                    <p className="text-xs text-muted-foreground">
-                      {t("scenarios.selectStep")}
-                    </p>
-                  );
+          <div className={cn("grid min-w-0 gap-4", selectedStep && "xl:grid-cols-[minmax(0,1fr)_minmax(0,30rem)]")}>
+            <div className="min-w-0 space-y-3">
+              <ScenarioOverview
+                key={detail.id}
+                scenario={detail}
+                envs={envs}
+                run={run}
+                busy={busy}
+                onRename={(name) => void patchScenario({ name })}
+                onDescribe={(description) => void patchScenario({ description })}
+                onEnvironment={(environmentId) => void patchScenario({ environmentId })}
+                onStopOnFailure={(stopOnFailure) => void patchScenario({ stopOnFailure })}
+                onRun={() => void startRun()}
+                onStop={() =>
+                  void guarded(async () => {
+                    if (run) await api(`/scenarios/runs/${run.id}/cancel`, { method: "POST", body: "{}" });
+                  })
                 }
-                const stepIndex = selected.steps.findIndex((item) => item.id === step.id);
-                const stepRun = (liveRun ?? selected.runs?.[0])?.stepRuns?.[stepIndex];
-                return (
-                  <Card className="min-w-0">
-                    <CardHeader>
-                      <CardTitle>{t("scenarios.stepDetails")}</CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-2">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-sm font-medium">{step.name}</span>
-                        <Badge>{label("stepType", step.type)}</Badge>
-                        {stepRun ? (
-                          <Badge className={statusTone(stepRun.status)}>
-                            {statusLabel(stepRun.status)}
-                          </Badge>
-                        ) : null}
-                      </div>
-                      <div>
-                        <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                          {t("scenarios.request")}
-                        </div>
-                        <pre className="mt-1 max-h-40 max-w-full overflow-auto whitespace-pre-wrap break-all rounded border border-border p-2 font-mono text-[10px] text-muted-foreground dir-ltr">
-                          {JSON.stringify(step.config, null, 2)}
-                        </pre>
-                      </div>
-                      {stepRun?.resolvedInput ? (
-                        <div>
-                          <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                            {t("scenarios.sentRequest")}
-                          </div>
-                          <pre className="mt-1 max-h-32 max-w-full overflow-auto whitespace-pre-wrap break-all rounded border border-border p-2 font-mono text-[10px] text-muted-foreground dir-ltr">
-                            {JSON.stringify(stepRun.resolvedInput, null, 2)}
-                          </pre>
-                        </div>
-                      ) : null}
-                      {step.type === "HTTP_REQUEST" ? (
-                        <div className="grid gap-2 md:grid-cols-2">
-                          <div>
-                            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                              {t("scenarios.template")}
-                            </div>
-                            <p className="mt-1 break-all font-mono text-[11px] dir-ltr">
-                              {String(step.config.method ?? "GET")} {String(step.config.url ?? "")}
-                            </p>
-                          </div>
-                          {stepRun?.resolvedInput && typeof stepRun.resolvedInput === "object" ? (
-                            <div>
-                              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                                {t("scenarios.resolved")}
-                              </div>
-                              <p className="mt-1 break-all font-mono text-[11px] dir-ltr">
-                                {String((stepRun.resolvedInput as { method?: string }).method ?? "")}{" "}
-                                {String((stepRun.resolvedInput as { url?: string }).url ?? "")}
-                              </p>
-                            </div>
-                          ) : null}
-                        </div>
-                      ) : null}
-                      {stepRun ? <FlowTrace output={stepRun.output} extractedVars={stepRun.extractedVars} /> : null}
-                      {stepRun?.output ? (
-                        <div className="space-y-2">
-                          <SmartResponse
-                            analysis={analysis?.responses.find((item) => item.stepId === step.id)?.analysis ?? null}
-                            raw={stepRun.output}
-                            formatNumber={n}
-                            labels={{
-                              smart: t("scenarios.smartView"),
-                              raw: t("scenarios.rawView"),
-                              important: t("scenarios.importantData"),
-                              outputs: t("scenarios.detectedOutputs"),
-                            }}
-                          />
-                          <JsonTree
-                            value={(stepRun.output as { body?: unknown }).body ?? stepRun.output}
-                            extractLabel={t("scenarios.detectedOutputs")}
-                            assertLabel={t("scenarios.accept")}
-                            onExtract={(path) => {
-                              if (step.type === "HTTP_REQUEST") {
-                                // Map into this step's response mapping, then review it in the editor.
-                                const taken = [...readMappings(step.config).map((row) => row.variable), ...producers.map((item) => item.name)];
-                                startEdit(step, { variable: suggestVariable(path, taken), path, from: "body" });
-                                return;
-                              }
-                              const variable = path.split(".").pop()?.replace(/[^A-Za-z0-9_]/g, "") || "value";
-                              void api(`/scenarios/${selected.id}/steps`, {
-                                method: "POST",
-                                body: JSON.stringify({
-                                  name: variable,
-                                  type: "EXTRACT_VARIABLE",
-                                  config: { variable, path: path.replace(/^\$\.?/, "body.") },
-                                }),
-                              }).then(() => refreshSelected(selected.id));
-                            }}
-                            onAssert={(path, fieldValue) => {
-                              void api(`/scenarios/${selected.id}/steps`, {
-                                method: "POST",
-                                body: JSON.stringify({
-                                  name: path,
-                                  type: "ASSERTION",
-                                  config: {
-                                    kind: "equals",
-                                    path: path.replace(/^\$\.?/, "body."),
-                                    expected: fieldValue,
-                                  },
-                                }),
-                              }).then(() => refreshSelected(selected.id));
-                            }}
-                          />
-                        </div>
-                      ) : null}
-                      {stepRun?.error ? (
-                        <p className="text-xs text-destructive">{err(stepRun.error)}</p>
-                      ) : null}
-                      <div className="flex flex-wrap gap-1">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => moveStep(step.id, -1)}
-                        >
-                          ↑
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => moveStep(step.id, 1)}
-                        >
-                          ↓
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => startEdit(step)}
-                        >
-                          {t("common.edit")}
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={async () => {
-                            await api(`/scenarios/steps/${step.id}`, {
-                              method: "PATCH",
-                              body: JSON.stringify({ enabled: !step.enabled }),
-                            });
-                            await refreshSelected(selected.id);
-                          }}
-                        >
-                          {step.enabled ? t("common.disable") : t("common.enable")}
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={async () => {
-                            await api(`/scenarios/steps/${step.id}/duplicate`, {
-                              method: "POST",
-                              body: "{}",
-                            });
-                            await refreshSelected(selected.id);
-                          }}
-                        >
-                          {t("scenarios.dup")}
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="destructive"
-                          onClick={async () => {
-                            if (!window.confirm(t("common.confirmDelete", { name: step.name }))) return;
-                            await api(`/scenarios/steps/${step.id}`, {
-                              method: "DELETE",
-                            });
-                            setSelectedStepId(null);
-                            await refreshSelected(selected.id);
-                          }}
-                        >
-                          {t("common.delete")}
-                        </Button>
-                      </div>
-                    </CardContent>
-                  </Card>
-                );
-              })()}
+                onDuplicate={() =>
+                  void guarded(async () => {
+                    const copy = await api<Scenario>(`/scenarios/${detail.id}/duplicate`, { method: "POST", body: "{}" });
+                    await loadList();
+                    setSelectedId(copy.id);
+                  })
+                }
+                onDelete={() =>
+                  setConfirm({
+                    title: t("builder.overview.delete"),
+                    body: t("common.confirmDelete", { name: detail.name }),
+                    action: async () => {
+                      await api(`/scenarios/${detail.id}`, { method: "DELETE" });
+                      const list = await loadList();
+                      setSelectedId(list[0]?.id ?? null);
+                    },
+                  })
+                }
+              />
+
+              <DetectedBanner
+                suggestions={suggestions}
+                stepNumber={stepNumber}
+                targetLabel={targetLabel}
+                onAccept={(suggestion) => void accept([suggestion])}
+                onAcceptMany={(list) => void accept(list)}
+                onDismiss={dismiss}
+              />
+
+              <section className="space-y-2" aria-labelledby="flow-title">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 id="flow-title" className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    {t("builder.flow.title")}
+                  </h2>
+                  <div className="ms-auto flex flex-wrap gap-1.5">
+                    <Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
+                      <FileUp className="h-3.5 w-3.5" />
+                      {t("builder.flow.importCurl")}
+                    </Button>
+                    <Button size="sm" variant="outline" onClick={() => void addStep("HTTP_REQUEST")}>
+                      <Plus className="h-3.5 w-3.5" />
+                      {t("builder.flow.addRequest")}
+                    </Button>
+                    <Menu
+                      label={t("builder.flow.addOther")}
+                      trigger={<ChevronDown className="h-4 w-4" />}
+                      items={OTHER_TYPES.map((type) => ({ label: label("stepType", type), onSelect: () => void addStep(type) }))}
+                    />
+                  </div>
+                </div>
+
+                {steps.length === 0 ? (
+                  <div className="rounded-md border border-dashed border-border px-4 py-10 text-center">
+                    <p className="text-sm">{t("builder.flow.empty")}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">{t("builder.flow.emptyHint")}</p>
+                    <div className="mt-4 flex justify-center gap-2">
+                      <Button onClick={() => setImportOpen(true)}>
+                        <FileUp className="h-3.5 w-3.5" />
+                        {t("builder.flow.importCurl")}
+                      </Button>
+                      <Button variant="outline" onClick={() => void addStep("HTTP_REQUEST")}>
+                        {t("builder.flow.addRequest")}
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <RequestFlow
+                    steps={steps}
+                    run={run}
+                    reviews={analysis?.mappings ?? []}
+                    selectedId={selectedStepId}
+                    busy={busy}
+                    onSelect={(id) => setSelectedStepId((current) => (current === id ? null : id))}
+                    onRunUntil={(step) => void startRun(step.id)}
+                    onMove={(step, direction) => void moveStep(step, direction)}
+                    onDuplicate={(step) =>
+                      void guarded(async () => {
+                        await api(`/scenarios/steps/${step.id}/duplicate`, { method: "POST", body: "{}" });
+                        await refresh();
+                      })
+                    }
+                    onToggle={(step) => void actions.saveStep(step.id, { enabled: !step.enabled })}
+                    onDelete={deleteStep}
+                  />
+                )}
+              </section>
             </div>
 
-            <div className="space-y-2">
-              <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                {t("scenarios.history")}
-              </h2>
-              {(selected.runs ?? []).map((run) => {
-                const open = expandedRunId === run.id;
-                return (
-                  <Card key={run.id}>
-                    <CardContent className="space-y-2 p-3">
-                      <button
-                        className="flex w-full min-w-0 flex-wrap items-center justify-between gap-2 text-sm"
-                        onClick={() =>
-                          setExpandedRunId(open ? null : run.id)
-                        }
-                      >
-                        <span className="flex items-center gap-2">
-                          <Badge className={statusTone(run.status)}>
-                            {statusLabel(run.status)}
-                          </Badge>
-                          <span className="font-mono text-[10px] text-muted-foreground">
-                            {run.id.slice(0, 10)}
-                          </span>
-                        </span>
-                        <span className="font-mono text-[10px] text-muted-foreground">
-                          {n(run.durationMs ?? 0)}ms · {open ? "▾" : "▸"}
-                        </span>
-                      </button>
-                      {run.error ? (
-                        <p className="text-xs text-destructive">{err(run.error)}</p>
-                      ) : null}
-                      {open ? (
-                        <div className="space-y-2">
-                          {run.stepRuns?.map((sr) => (
-                            <StepRunFacts
-                              key={sr.id}
-                              name={sr.name}
-                              typeLabel={label("stepType", sr.type)}
-                              status={sr.status}
-                              statusLabel={statusLabel(sr.status)}
-                              durationMs={sr.durationMs}
-                              error={sr.error}
-                              resolvedInput={sr.resolvedInput}
-                              output={sr.output}
-                              extractedVars={sr.extractedVars}
-                              formatNumber={n}
-                              formatDate={d}
-                              learnedLabel={t("scenarios.learned")}
-                              rawLabel={t("scenarios.rawLog")}
-                            >
-                              <FlowTrace output={sr.output} extractedVars={sr.extractedVars} />
-                            </StepRunFacts>
-                          ))}
-                          <VariableFacts
-                            title={t("scenarios.finalVars")}
-                            value={run.variablesJson}
-                            formatNumber={n}
-                            formatDate={d}
-                          />
-                        </div>
-                      ) : null}
-                    </CardContent>
-                  </Card>
-                );
-              })}
-            </div>
-          </>
+            {selectedStep ? (
+              <>
+                <div className="fixed inset-0 z-30 bg-black/50 xl:hidden" aria-hidden onClick={() => setSelectedStepId(null)} />
+                <aside
+                  aria-label={selectedStep.name}
+                  className="fixed inset-y-0 end-0 z-40 w-full max-w-xl border-s border-border bg-background shadow-xl xl:sticky xl:top-0 xl:z-auto xl:h-[calc(100dvh-5.5rem)] xl:max-w-none xl:rounded-md xl:border xl:shadow-none"
+                >
+                  <StepPanel
+                    key={selectedStep.id}
+                    step={selectedStep}
+                    steps={steps}
+                    run={run}
+                    analysis={analysis}
+                    connectors={connectors}
+                    suggestions={suggestions.filter((item) => item.consumerStepId === selectedStep.id)}
+                    awaitingInput={awaitingStepId === selectedStep.id}
+                    busy={busy}
+                    actions={actions}
+                    onClose={() => setSelectedStepId(null)}
+                  />
+                </aside>
+              </>
+            ) : null}
+          </div>
         )}
       </div>
-      {importOpen && selected ? (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4">
-          <div
-            role="dialog"
-            aria-modal="true"
-            className="w-full max-w-lg rounded-md border border-border bg-background p-4"
-          >
-            <h2 className="text-sm font-medium">{t("scenarios.importCurl")}</h2>
-            <p className="mt-1 text-xs text-muted-foreground">{t("scenarios.importCurlHint")}</p>
-            <textarea
-              className="mt-3 min-h-40 w-full rounded-md border border-border bg-background p-2 font-mono text-xs dir-ltr"
-              dir="ltr"
-              value={importText}
-              onChange={(event) => setImportText(event.target.value)}
-              placeholder={t("scenarios.curlPlaceholder")}
-            />
-            <div className="mt-3 flex justify-end gap-2">
-              <Button variant="outline" onClick={() => setImportOpen(false)}>
-                {t("common.cancel")}
-              </Button>
-              <Button
-                disabled={!importText.trim()}
-                onClick={() => {
-                  void (async () => {
-                    try {
-                      await api(`/scenarios/${selected.id}/import-curl`, {
-                        method: "POST",
-                        body: JSON.stringify({ text: importText }),
-                      });
-                      setImportText("");
-                      setImportOpen(false);
-                      await refreshSelected(selected.id);
-                    } catch (error) {
-                      setMessage(error instanceof Error ? error.message : "Request failed");
-                    }
-                  })();
-                }}
-              >
-                {t("scenarios.importCurl")}
-              </Button>
-            </div>
-          </div>
-        </div>
+
+      {importOpen && detail ? (
+        <CurlImportDialog
+          scenarioId={detail.id}
+          existingIds={steps.map((step) => step.id)}
+          onClose={() => setImportOpen(false)}
+          onImported={async ({ imported }) => {
+            toast.notify("success", t("builder.import.done", { count: n(imported) }));
+            await Promise.all([refresh(), loadList()]);
+          }}
+        />
       ) : null}
+
+      {picker && detail ? (
+        <ValuePicker
+          request={picker}
+          steps={steps}
+          fieldsOf={(stepId) => analysis?.inputs.find((item) => item.stepId === stepId)?.fields ?? []}
+          runOf={(stepId) => detail.runs.find((item) => !ACTIVE_RUN.has(item.status))?.stepRuns.find((item) => item.scenarioStepId === stepId)}
+          onClose={() => setPicker(null)}
+          onSave={async (stepId, binding, runAfter) => {
+            try {
+              const existing = analysis?.mappings.find((item) => item.stepId === stepId && sameTarget(item.binding.target, binding.target));
+              await saveBinding(stepId, { ...binding, ...(existing?.binding.enabled === false ? { enabled: false } : {}) });
+              await refresh();
+              setSelectedStepId(stepId);
+              if (runAfter) await startRun(stepId);
+            } catch (error) {
+              fail(error);
+              throw error;
+            }
+          }}
+        />
+      ) : null}
+
+      <ConfirmDialog
+        open={Boolean(confirm)}
+        title={confirm?.title ?? ""}
+        body={confirm?.body ?? ""}
+        confirmLabel={t("common.delete")}
+        cancelLabel={t("common.cancel")}
+        busy={busy}
+        onClose={() => setConfirm(null)}
+        onConfirm={() =>
+          void guarded(async () => {
+            const action = confirm?.action;
+            setConfirm(null);
+            await action?.();
+          })
+        }
+      />
     </div>
   );
 }

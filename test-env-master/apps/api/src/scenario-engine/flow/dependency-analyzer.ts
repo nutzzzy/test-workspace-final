@@ -1,4 +1,5 @@
-import { isFormBody, parseForm } from "./request-inputs";
+import type { ExpectedValue } from "./bindings";
+import { isFormBody, parseForm, type InputAddress } from "./request-inputs";
 import { semanticKeyOf, singular } from "./value-registry";
 
 export type FlowHttpStep = {
@@ -31,6 +32,14 @@ export type DependencySuggestion = {
   confidence: "HIGH" | "MEDIUM" | "LOW";
   score: number;
   masked: boolean;
+  /** The exact request input, addressed like saved mappings and recovery address it. */
+  target: InputAddress & { key: string };
+  /** response = the value was found in a real response; request = inferred from the requests only. */
+  evidence: "response" | "request";
+  /** Why it was proposed, for the UI. */
+  reason: "same_value" | "auth_token" | "creates_entity" | "returns_entity" | "auth_user" | "recovered";
+  /** Request-only suggestions: what to look for in the source response at run time. */
+  expect?: ExpectedValue;
 };
 
 const COMMON = new Set([
@@ -95,6 +104,9 @@ export function analyzeDependencies(
             confidence,
             score: Math.round(score * 100) / 100,
             masked: leaf.secret,
+            target: target.address,
+            evidence: "response",
+            reason: "same_value",
           });
         }
       }
@@ -155,7 +167,7 @@ function leaves(body: unknown, status?: number): Leaf[] {
     }));
 }
 
-type Target = { location: DependencyLocation; detail: string; value: string };
+type Target = { location: DependencyLocation; detail: string; value: string; address: InputAddress & { key: string } };
 
 function requestTargets(config: Record<string, unknown>): Target[] {
   const targets: Target[] = [];
@@ -166,22 +178,27 @@ function requestTargets(config: Record<string, unknown>): Target[] {
     if (key.toLowerCase() === "cookie") {
       for (const part of value.split(";")) {
         const eq = part.indexOf("=");
-        if (eq > 0) targets.push({ location: "cookie", detail: part.slice(0, eq).trim(), value: part.slice(eq + 1).trim() });
+        if (eq > 0) {
+          const name = part.slice(0, eq).trim();
+          targets.push({ location: "cookie", detail: name, value: part.slice(eq + 1).trim(), address: { location: "cookie", field: name, key: name } });
+        }
       }
       continue;
     }
-    targets.push({ location: "header", detail: key, value });
+    targets.push({ location: "header", detail: key, value, address: { location: "header", field: key, key } });
   }
   const query = asRecord(config.query);
   for (const [key, value] of Object.entries(query)) {
     if (typeof value === "string" || typeof value === "number") {
-      targets.push({ location: "query", detail: key, value: String(value) });
+      targets.push({ location: "query", detail: key, value: String(value), address: { location: "query", field: key, key } });
     }
   }
   if (isFormBody({ body: config.body, headers: headers as Record<string, string> })) {
-    for (const pair of parseForm(config.body as string)) targets.push({ location: "form", detail: pair.key, value: pair.value });
+    for (const pair of parseForm(config.body as string)) {
+      targets.push({ location: "form", detail: pair.key, value: pair.value, address: { location: "form", field: pair.key, key: pair.key } });
+    }
   } else {
-    collectBody(config.body, "body", targets);
+    collectBody(config.body, [], targets);
   }
   return targets;
 }
@@ -200,11 +217,14 @@ function urlTargets(raw: string): Target[] {
     if (!segment || segment.includes("{{")) return;
     const previous = segments[index - 1] ?? "";
     const name = previous && !/\d/.test(previous) ? `${singular(previous).replace(/[^A-Za-z0-9]/g, "")}Id` : `segment${index}`;
-    targets.push({ location: "path", detail: name, value: decodeSafe(segment) });
+    targets.push({ location: "path", detail: name, value: decodeSafe(segment), address: { location: "path", field: String(index), key: name } });
   });
   for (const pair of query.split("&")) {
     const eq = pair.indexOf("=");
-    if (eq > 0) targets.push({ location: "query", detail: decodeSafe(pair.slice(0, eq)), value: decodeSafe(pair.slice(eq + 1)) });
+    if (eq > 0) {
+      const key = decodeSafe(pair.slice(0, eq));
+      targets.push({ location: "query", detail: key, value: decodeSafe(pair.slice(eq + 1)), address: { location: "query", field: key, key } });
+    }
   }
   return targets;
 }
@@ -217,18 +237,20 @@ function decodeSafe(value: string) {
   }
 }
 
-function collectBody(value: unknown, detail: string, targets: Target[]) {
+function collectBody(value: unknown, path: string[], targets: Target[]) {
   if (typeof value === "string" || typeof value === "number") {
-    targets.push({ location: "body", detail, value: String(value) });
+    const detail = path.reduce((out, part) => (/^\d+$/.test(part) ? `${out}[${part}]` : `${out}.${part}`), "body");
+    const key = [...path].reverse().find((part) => !/^\d+$/.test(part)) ?? "body";
+    targets.push({ location: "body", detail, value: String(value), address: { location: "body", field: path.join("."), key } });
     return;
   }
   if (Array.isArray(value)) {
-    value.forEach((item, index) => collectBody(item, `${detail}[${index}]`, targets));
+    value.forEach((item, index) => collectBody(item, [...path, String(index)], targets));
     return;
   }
   if (value && typeof value === "object") {
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      collectBody(child, `${detail}.${key}`, targets);
+      collectBody(child, [...path, key], targets);
     }
   }
 }

@@ -4,23 +4,52 @@ import {
   NotFoundException,
 } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
-import { validateMappings } from "@qa-workbench/shared";
+import { maskSecrets, validateMappings } from "@qa-workbench/shared";
+import { maskDeep } from "../common/mask.util";
 import { DatabaseConnectorsService } from "../database-connectors/database-connectors.service";
 import { PrismaService } from "../prisma/prisma.service";
-import { applyDependency, type DependencyChange } from "../scenario-engine/flow/apply-dependency";
 import {
   isBinding,
+  isResponseSource,
   readBindings,
   removeBinding,
+  sameTarget,
   upsertBinding,
+  type StepBinding,
 } from "../scenario-engine/flow/bindings";
 import type { InputLocation } from "../scenario-engine/flow/request-inputs";
-import { analyzeDependencies, type FlowHttpStep } from "../scenario-engine/flow/dependency-analyzer";
+import type { FlowHttpStep } from "../scenario-engine/flow/dependency-analyzer";
 import { flowHealth, validateFlow } from "../scenario-engine/flow/flow-validator";
-import { parseCurl, splitCurlCommands } from "../scenario-engine/flow/parse-curl";
+import {
+  bindingFromSuggestion,
+  reviewMappings,
+  suggestDependencies,
+  type RecoveredInput,
+} from "../scenario-engine/flow/mapping-review";
+import { parseCurl, splitCurlCommands, type CurlWarning, type ParsedHttpRequest } from "../scenario-engine/flow/parse-curl";
+import { inputFields } from "../scenario-engine/flow/request-dependencies";
 import { analyzeResponse } from "../scenario-engine/flow/response-analyzer";
 import { variableCatalog } from "../scenario-engine/flow/response-mapping";
-import { ScenarioRunner } from "../scenario-engine/scenario.runner";
+import { ScenarioRunner, type RunOptions } from "../scenario-engine/scenario.runner";
+
+/** Upper bounds for one paste: they keep parsing and analysis cheap. */
+const MAX_IMPORT_TEXT = 200_000;
+const MAX_IMPORT_COMMANDS = 50;
+
+export type ImportItem =
+  | {
+      index: number;
+      ok: true;
+      name: string;
+      method: string;
+      url: string;
+      /** Header names with masked values, query keys and the body kind — for review, not execution. */
+      headers: Record<string, string>;
+      query: string[];
+      body: "none" | "json" | "form" | "text";
+      warnings: Array<CurlWarning | { code: "duplicate_request"; detail: string }>;
+    }
+  | { index: number; ok: false; code: string; preview: string };
 
 @Injectable()
 export class ScenariosService {
@@ -234,8 +263,10 @@ export class ScenariosService {
   }
 
   /** Live async start — returns RUNNING immediately. */
-  start(scenarioId: string) {
-    return this.runner.start(scenarioId);
+  start(scenarioId: string, options: RunOptions = {}) {
+    return this.runner.start(scenarioId, {
+      ...(typeof options.untilStepId === "string" && options.untilStepId ? { untilStepId: options.untilStepId } : {}),
+    });
   }
 
   /** Await full completion (scripts/demo). */
@@ -269,7 +300,32 @@ export class ScenariosService {
     if (step.type !== "HTTP_REQUEST") throw new BadRequestException("Only HTTP steps take dependency mappings");
     if (!isBinding(body)) throw new BadRequestException("A mapping needs a target field and a source");
     const config = asRecord(step.config);
-    const binding = { ...body, origin: body.origin ?? "manual", createdAt: new Date().toISOString() };
+    const binding: StepBinding = {
+      target: { location: body.target.location, field: body.target.field, ...(body.target.key ? { key: String(body.target.key).slice(0, 100) } : {}) },
+      source: body.source,
+      origin: body.origin === "accepted" ? "accepted" : "manual",
+      ...(body.enabled === false ? { enabled: false } : {}),
+      ...(body.confidence ? { confidence: body.confidence } : {}),
+      ...(body.evidence ? { evidence: body.evidence } : {}),
+      ...(body.verifiedAt ? { verifiedAt: body.verifiedAt } : {}),
+      createdAt: typeof body.createdAt === "string" ? body.createdAt : new Date().toISOString(),
+    };
+    if (isResponseSource(binding.source)) {
+      // The source must be an earlier step of the same scenario: a mapping can
+      // never read another scenario's responses or a value not produced yet.
+      const sourceId = binding.source.stepId;
+      const source = sourceId ? await this.prisma.scenarioStep.findUnique({ where: { id: sourceId } }) : null;
+      if (!source || source.scenarioId !== step.scenarioId) {
+        throw new BadRequestException("The mapping source must be a step of this scenario");
+      }
+      if (source.orderIndex >= step.orderIndex) {
+        throw new BadRequestException("The mapping source must run before this step");
+      }
+      binding.source = { ...binding.source, stepId: source.id, stepName: source.name, orderIndex: source.orderIndex };
+      // A changed source is a new mapping until a run confirms it.
+      const previous = readBindings(config).find((item) => sameTarget(item.target, binding.target));
+      if (previous && JSON.stringify(previous.source) !== JSON.stringify(binding.source)) delete binding.verifiedAt;
+    }
     return this.prisma.scenarioStep.update({
       where: { id: stepId },
       data: { config: { ...config, bindings: upsertBinding(readBindings(config), binding) } as Prisma.InputJsonValue },
@@ -290,39 +346,128 @@ export class ScenariosService {
     });
   }
 
-  async importCurl(scenarioId: string, text: string) {
-    await this.get(scenarioId);
-    const commands = splitCurlCommands(text);
-    if (commands.length === 0) {
-      throw new BadRequestException("The cURL command has no URL.");
+  /** Parse pasted cURL commands and propose dependencies, without saving anything. */
+  async previewImport(scenarioId: string, text: unknown) {
+    const plan = await this.planImport(scenarioId, text);
+    return { items: plan.items, dependencies: plan.dependencies };
+  }
+
+  /**
+   * Save the valid commands as steps, in order. Nothing is executed. Only the
+   * suggestions the user ticked (`accept`) become saved mappings; malformed
+   * commands fail the import unless `skipInvalid` is set.
+   */
+  async importCurl(scenarioId: string, input: { text?: unknown; accept?: unknown; skipInvalid?: unknown }) {
+    const plan = await this.planImport(scenarioId, input.text);
+    const invalid = plan.items.find((item) => !item.ok);
+    if (invalid && !invalid.ok && input.skipInvalid !== true) {
+      throw new BadRequestException(`cURL ${invalid.code}`);
     }
-    for (const command of commands) {
+    if (plan.valid.length === 0) throw new BadRequestException("No valid cURL command to import");
+    const accept = new Set(Array.isArray(input.accept) ? input.accept.filter((id): id is string => typeof id === "string") : []);
+
+    const ids = new Map<string, string>();
+    await this.prisma.$transaction(async (tx) => {
+      for (const item of plan.valid) {
+        const created = await tx.scenarioStep.create({
+          data: {
+            scenarioId,
+            name: item.name,
+            type: "HTTP_REQUEST",
+            orderIndex: item.orderIndex,
+            config: item.config as Prisma.InputJsonValue,
+          },
+        });
+        ids.set(item.tempId, created.id);
+      }
+      const bindings = new Map<string, StepBinding[]>();
+      for (const suggestion of plan.dependencies) {
+        if (!accept.has(suggestion.id)) continue;
+        const consumerId = ids.get(suggestion.consumerStepId) ?? suggestion.consumerStepId;
+        const producer = plan.flowSteps.find((step) => step.id === suggestion.producerStepId);
+        if (!producer || !ids.has(suggestion.consumerStepId)) continue;
+        const binding = bindingFromSuggestion(suggestion, { ...producer, id: ids.get(producer.id) ?? producer.id });
+        bindings.set(consumerId, upsertBinding(bindings.get(consumerId) ?? [], binding));
+      }
+      for (const [stepId, list] of bindings) {
+        const item = plan.valid.find((candidate) => ids.get(candidate.tempId) === stepId)!;
+        await tx.scenarioStep.update({
+          where: { id: stepId },
+          data: { config: { ...item.config, bindings: list } as unknown as Prisma.InputJsonValue },
+        });
+      }
+    });
+    return {
+      scenario: await this.get(scenarioId),
+      imported: plan.valid.length,
+      skipped: plan.items.length - plan.valid.length,
+      mapped: plan.dependencies.filter((item) => accept.has(item.id)).length,
+    };
+  }
+
+  private async planImport(scenarioId: string, text: unknown) {
+    const scenario = await this.get(scenarioId);
+    if (typeof text !== "string" || !text.trim()) throw new BadRequestException("Paste at least one cURL command");
+    if (text.length > MAX_IMPORT_TEXT) throw new BadRequestException("The pasted text is too long");
+    const commands = splitCurlCommands(text);
+    if (commands.length === 0) throw new BadRequestException("No cURL command found");
+    if (commands.length > MAX_IMPORT_COMMANDS) throw new BadRequestException("Import at most 50 requests at a time");
+
+    let orderIndex = (scenario.steps.reduce((max, step) => Math.max(max, step.orderIndex), -1)) + 1;
+    const seen = new Set(scenario.steps.map((step) => requestIdentity(asRecord(step.config))));
+    const valid: Array<{ tempId: string; name: string; orderIndex: number; config: Record<string, unknown> }> = [];
+    const items: ImportItem[] = commands.map((command, index) => {
       const parsed = parseCurl(command);
       if (!parsed.ok) {
-        throw new BadRequestException(`cURL ${parsed.code}`);
+        return { index, ok: false, code: parsed.code, preview: maskSecrets(command.replace(/\s+/g, " ")).slice(0, 120) };
       }
-      let pathname = parsed.config.url;
-      try {
-        pathname = new URL(parsed.config.url).pathname || parsed.config.url;
-      } catch {
-        // {{base_url}}/v1/items: name the step after the path after the variable
-        pathname = parsed.config.url.replace(/^\{\{[^}]+\}\}/, "") || parsed.config.url;
-      }
-      pathname = pathname.replace(/%7B%7B([A-Za-z0-9_.-]+)%7D%7D/gi, "{{$1}}");
-      await this.addStep(scenarioId, {
-        name: `${parsed.config.method} ${pathname}`,
-        type: "HTTP_REQUEST",
-        config: { ...parsed.config, originalCurl: command },
-      });
-    }
-    return this.get(scenarioId);
+      const config: Record<string, unknown> = { ...parsed.config, originalCurl: command };
+      const identity = requestIdentity(config);
+      const warnings: Extract<ImportItem, { ok: true }>["warnings"] = [...parsed.warnings];
+      if (seen.has(identity)) warnings.push({ code: "duplicate_request", detail: `${parsed.config.method} ${parsed.config.url}` });
+      seen.add(identity);
+      const name = stepNameOf(parsed.config);
+      valid.push({ tempId: `import:${index}`, name, orderIndex: orderIndex++, config });
+      return {
+        index,
+        ok: true,
+        name,
+        method: parsed.config.method,
+        url: parsed.config.url,
+        headers: maskDeep(parsed.config.headers) as Record<string, string>,
+        query: Object.keys(parsed.config.query),
+        body: bodyKind(parsed.config),
+        warnings,
+      };
+    });
+
+    const flowSteps: FlowHttpStep[] = [
+      ...scenario.steps.map(toFlowStep),
+      ...valid.map((item) => ({ id: item.tempId, name: item.name, type: "HTTP_REQUEST", orderIndex: item.orderIndex, config: item.config })),
+    ];
+    const env = await this.publicEnvironment(scenario.environmentId);
+    const dependencies = suggestDependencies(flowSteps, samplesFromRun(scenario.runs[0]), env).filter((item) =>
+      item.consumerStepId.startsWith("import:"),
+    );
+    return { items, valid, flowSteps, dependencies };
+  }
+
+  /** Non-secret environment values (only used to place URL path segments the way they are sent). */
+  private async publicEnvironment(environmentId: string | null) {
+    if (!environmentId) return {};
+    const rows = await this.prisma.environmentVariable.findMany({
+      where: { environmentId, type: { not: "SECRET" } },
+      select: { key: true, value: true },
+    });
+    return Object.fromEntries(rows.map((row) => [row.key, row.value]));
   }
 
   async analyzeFlow(scenarioId: string) {
     const scenario = await this.get(scenarioId);
     const steps = scenario.steps.map(toFlowStep);
     const samples = samplesFromRun(scenario.runs[0]);
-    const dependencies = analyzeDependencies(steps, samples);
+    const env = await this.publicEnvironment(scenario.environmentId);
+    const dependencies = suggestDependencies(steps, samples, env, recoveredInputs(scenario.runs[0]));
     const envKeys = scenario.environmentId
       ? (
           await this.prisma.environmentVariable.findMany({
@@ -366,58 +511,52 @@ export class ScenariosService {
           }),
         };
       });
+    const mappings = reviewMappings(flowSteps, samples, env);
     return {
       dependencies,
+      mappings,
+      inputs: flowSteps
+        .filter((step) => step.type === "HTTP_REQUEST")
+        .map((step) => ({ stepId: step.id, fields: inputFields(step.config, env) })),
       issues,
       variables: variableCatalog(flowSteps),
       environmentKeys: envKeys,
       health: flowHealth({
         steps: flowSteps,
-        dependencies: dependencies.filter((item) => item.confidence === "HIGH").length,
+        dependencies: mappings.filter((item) => item.status === "ok" || item.status === "unverified").length,
         issues,
       }),
       responses,
     };
   }
 
-  async acceptDependency(scenarioId: string, change: DependencyChange) {
+  /**
+   * Save a detected dependency as a mapping on its consumer step. The
+   * suggestion is looked up again on the server (never trusted from the
+   * client). A manual mapping on the same field is kept unless `replace`.
+   */
+  async acceptDependency(scenarioId: string, body: { id?: unknown; replace?: unknown }) {
     const scenario = await this.get(scenarioId);
-    const sample = samplesFromRun(scenario.runs[0]).find(
-      (item) => item.stepId === change.producerStepId,
+    const steps = scenario.steps.map(toFlowStep);
+    const env = await this.publicEnvironment(scenario.environmentId);
+    const suggestion = suggestDependencies(steps, samplesFromRun(scenario.runs[0]), env, recoveredInputs(scenario.runs[0])).find(
+      (item) => item.id === body.id,
     );
-    if (!sample) {
-      throw new BadRequestException("Run the source request before accepting this dependency");
+    if (!suggestion) throw new BadRequestException("This suggestion is no longer available");
+    const producer = steps.find((step) => step.id === suggestion.producerStepId);
+    const consumer = scenario.steps.find((step) => step.id === suggestion.consumerStepId);
+    if (!producer || !consumer) throw new NotFoundException("Step not found");
+    const config = asRecord(consumer.config);
+    const current = readBindings(config);
+    const manual = current.find((item) => item.origin !== "accepted" && sameTarget(item.target, suggestion.target));
+    if (manual && body.replace !== true) {
+      throw new BadRequestException("A manual mapping already exists for this field");
     }
-    const planned = applyDependency(
-      scenario.steps.map(toFlowStep),
-      change,
-      sample.body,
-    );
-    await this.prisma.$transaction(async (tx) => {
-      const extract = planned.steps.find((step) => step.id.startsWith("extract-"));
-      if (planned.insertedExtract && extract) {
-        await tx.scenarioStep.create({
-          data: {
-            scenarioId,
-            name: extract.name,
-            type: "EXTRACT_VARIABLE",
-            orderIndex: extract.orderIndex,
-            config: extract.config as Prisma.InputJsonValue,
-          },
-        });
-      }
-      for (const step of planned.steps) {
-        if (step.id.startsWith("extract-")) continue;
-        await tx.scenarioStep.update({
-          where: { id: step.id },
-          data: {
-            orderIndex: step.orderIndex,
-            ...(step.id === change.consumerStepId
-              ? { config: step.config as Prisma.InputJsonValue }
-              : {}),
-          },
-        });
-      }
+    await this.prisma.scenarioStep.update({
+      where: { id: consumer.id },
+      data: {
+        config: { ...config, bindings: upsertBinding(current, bindingFromSuggestion(suggestion, producer)) } as unknown as Prisma.InputJsonValue,
+      },
     });
     return this.analyzeFlow(scenarioId);
   }
@@ -490,4 +629,68 @@ function samplesFromRun(
       },
     ];
   });
+}
+
+/**
+ * Fields automatic recovery fixed in a run, with the earlier response value
+ * that fixed them — offered as suggestions so the fix can be kept.
+ */
+function recoveredInputs(
+  run: { stepRuns: Array<{ scenarioStepId: string | null; output: unknown }> } | undefined,
+): RecoveredInput[] {
+  if (!run) return [];
+  return run.stepRuns.flatMap((stepRun) => {
+    const recovery = asRecord(asRecord(stepRun.output).recovery);
+    if (!stepRun.scenarioStepId || recovery.outcome !== "RECOVERED" || !Array.isArray(recovery.attempts)) return [];
+    const winner = recovery.attempts.map(asRecord).find((attempt) => attempt.expectationMet === true && attempt.manual !== true);
+    const candidate = asRecord(winner?.candidate);
+    const changes = Array.isArray(candidate.changes) ? candidate.changes.map(asRecord) : [candidate];
+    return changes.flatMap((change): RecoveredInput[] => {
+      const source = asRecord(change.source);
+      if (typeof source.stepId !== "string" || typeof source.path !== "string") return [];
+      if (typeof change.location !== "string" || typeof change.field !== "string") return [];
+      return [
+        {
+          consumerStepId: stepRun.scenarioStepId!,
+          producerStepId: source.stepId,
+          target: {
+            location: change.location as InputLocation,
+            field: change.field,
+            key: typeof change.fieldName === "string" ? change.fieldName : change.field,
+          },
+          path: source.path,
+        },
+      ];
+    });
+  });
+}
+
+/** Same method, URL and query: the same request imported twice. */
+function requestIdentity(config: Record<string, unknown>) {
+  const query = asRecord(config.query);
+  const sorted = Object.keys(query)
+    .sort()
+    .map((key) => `${key}=${String(query[key])}`)
+    .join("&");
+  return `${String(config.method ?? "GET").toUpperCase()} ${String(config.url ?? "")}?${sorted}`;
+}
+
+function stepNameOf(config: ParsedHttpRequest) {
+  let pathname = config.url;
+  try {
+    pathname = new URL(config.url).pathname || config.url;
+  } catch {
+    // {{base_url}}/v1/items: name the step after the path after the variable
+    pathname = config.url.replace(/^\{\{[^}]+\}\}/, "") || config.url;
+  }
+  pathname = pathname.replace(/%7B%7B([A-Za-z0-9_.-]+)%7D%7D/gi, "{{$1}}");
+  return `${config.method} ${pathname}`;
+}
+
+function bodyKind(config: ParsedHttpRequest): "none" | "json" | "form" | "text" {
+  const { body } = config;
+  if (body === undefined || body === null || (typeof body === "object" && Object.keys(body).length === 0)) return "none";
+  if (typeof body === "object") return "json";
+  const type = Object.entries(config.headers).find(([key]) => key.toLowerCase() === "content-type")?.[1] ?? "";
+  return type.includes("x-www-form-urlencoded") || /^[^=&\s{}]+=/.test(String(body)) ? "form" : "text";
 }

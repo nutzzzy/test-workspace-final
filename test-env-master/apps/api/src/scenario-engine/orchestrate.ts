@@ -1,7 +1,7 @@
 import { AssertionExecutor } from "./executors/assertion.executor";
 import { ExtractVariableExecutor } from "./executors/extract-variable.executor";
 import { expectedStatuses as expectedStatusOf, HttpRequestExecutor } from "./executors/http-request.executor";
-import { applyBindings, readBindings, upsertBinding, type StepBinding } from "./flow/bindings";
+import { applyBindings, readBindings, upsertBinding, verifyBindings, type StepBinding } from "./flow/bindings";
 import {
   buildManualOptions,
   resolveManualChanges,
@@ -211,10 +211,24 @@ async function runHttpStep(
   options.onProgress?.({ ...live, state: "RUNNING" });
 
   const prepared = http.prepare(config, context);
-  const bindings = readBindings(config);
+  let bindings = readBindings(config);
   const bound = applyBindings({ ...prepared.request, method: prepared.request.method ?? "GET" }, bindings, context.registry);
   const request = { ...prepared.request, ...bound.request };
   const consumed = [...prepared.consumed, ...bound.consumed];
+  if (bound.missing.length > 0) {
+    // A mapped value is missing: sending the request would use stale or
+    // placeholder data, so the step is blocked instead.
+    return {
+      result: {
+        status: "FAILED",
+        error: bound.warnings.join("; "),
+        blocked: bound.missing,
+        resolvedInput: context.redact({ method: request.method ?? "GET", url: request.url }),
+        ...(consumed.length ? { consumedVars: consumed } : {}),
+      },
+      pausedMs: 0,
+    };
+  }
   context.pendingPaths.clear();
   // A step that does not succeed must not leave values behind for later steps.
   const before = context.snapshot();
@@ -258,7 +272,7 @@ async function runHttpStep(
     const resolution = await options.awaitInput({
       ...live,
       result: {
-        ...finish(result, state, recovery, checks, manual, bound.warnings, []),
+        ...finish(result, state, recovery, checks, manual, []),
         name: step.name,
         type: step.type,
         orderIndex: step.orderIndex,
@@ -311,10 +325,16 @@ async function runHttpStep(
         });
       }
       await options.onSaveBindings(step.id, next);
+      bindings = next;
       savedMapping = true;
     }
   }
   if (savedMapping && recovery) recovery.savedMapping = true;
+  // Mappings that just worked are verified; inferred ones are pinned to the path they matched.
+  if ((state === "PASSED" || state === "RECOVERED") && step.id && options.onSaveBindings) {
+    const verified = verifyBindings(bindings, bound.resolvedPaths);
+    if (verified) await options.onSaveBindings(step.id, verified);
+  }
 
   // Response mapping runs only on success, before anything is published to later steps.
   let extractions: ExtractionOutcome[] | undefined;
@@ -369,7 +389,7 @@ async function runHttpStep(
   }
   context.pendingPaths.clear();
 
-  const finished = finish(result, state, recovery, checks, state === "NEEDS_INPUT" ? manual ?? buildManualOptions(request, recovery, context.registry, context.secretSet()) : undefined, bound.warnings, produced, context);
+  const finished = finish(result, state, recovery, checks, state === "NEEDS_INPUT" ? manual ?? buildManualOptions(request, recovery, context.registry, context.secretSet()) : undefined, produced, context);
   return {
     result: extractions ? { ...finished, extractions } : finished,
     pausedMs,
@@ -383,7 +403,6 @@ function finish(
   recovery: RecoveryTrace | undefined,
   checks: AssertionCheck[],
   manual: ManualRecoveryOptions | undefined,
-  warnings: string[],
   produced: RegistryEntry[],
   context?: ExecutionContext,
 ): StepExecutionResult {
@@ -397,7 +416,6 @@ function finish(
     ...(recovery ? { recovery } : {}),
     ...(checks.length ? { assertions: checks } : {}),
     ...(manual ? { manual } : {}),
-    ...(warnings.length ? { bindingWarnings: warnings } : {}),
     ...(produced.length
       ? {
           values: produced.slice(0, 80).map((entry) => viewEntry(entry, secrets)),

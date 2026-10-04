@@ -22,8 +22,8 @@ export type StepExecutionResult = {
   assertions?: AssertionCheck[];
   /** Manual Recovery options for a NEEDS_INPUT step (secret values masked). */
   manual?: ManualRecoveryOptions;
-  /** Saved mappings that had no value in this run. */
-  bindingWarnings?: string[];
+  /** The step was not sent because these saved mappings had no value. */
+  blocked?: MissingBinding[];
   /** Response mappings (`config.extract`) of this step and what each produced (no values). */
   extractions?: ExtractionOutcome[];
   /** Registry values this step produced, and the few worth showing first. */
@@ -33,6 +33,7 @@ export type StepExecutionResult = {
 
 import { isSecretKey, maskDeep } from "../common/mask.util";
 import type { FlowHistoryEntry, RecoveryTrace } from "./flow/recovery";
+import type { MissingBinding } from "./flow/bindings";
 import type { ManualRecoveryOptions } from "./flow/manual-recovery";
 import type { ExtractionOutcome } from "./flow/response-mapping";
 import type { AssertionCheck } from "./flow/recover-step";

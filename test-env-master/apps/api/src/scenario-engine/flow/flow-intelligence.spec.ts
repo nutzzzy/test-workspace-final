@@ -1,5 +1,5 @@
-import { applyDependency } from "./apply-dependency";
 import { analyzeDependencies } from "./dependency-analyzer";
+import { bindingFromSuggestion } from "./mapping-review";
 import { validateFlow } from "./flow-validator";
 import { parseCurl, splitCurlCommands } from "./parse-curl";
 import { analyzeResponse } from "./response-analyzer";
@@ -75,13 +75,16 @@ curl -X GET 'https://api.example.test/orders/123'
     expect(suggestions.filter((item) => item.variable === "accessToken").length).toBeGreaterThanOrEqual(2);
     expect(suggestions.some((item) => item.variable === "userId" && item.consumerStepId === "3" && item.location === "body")).toBe(true);
     expect(suggestions.some((item) => item.sourcePath === "$.result.reference" && item.consumerStepId === "4")).toBe(true);
-    const applied = applyDependency(
-      steps,
+    const binding = bindingFromSuggestion(
       suggestions.find((item) => item.variable === "accessToken" && item.consumerStepId === "2")!,
-      { data: { accessToken: "TOKEN-ABC", userId: 582 } },
+      steps[0]!,
     );
-    const profile = applied.steps.find((step) => step.id === "2");
-    expect((profile?.config.headers as { Authorization: string }).Authorization).toBe("Bearer {{accessToken}}");
+    expect(binding).toMatchObject({
+      target: { location: "header", field: "Authorization" },
+      source: { stepId: "1", path: "response.body.data.accessToken" },
+      origin: "accepted",
+      evidence: "response",
+    });
   });
 
   it("detects an opaque reference inside a later path", () => {
@@ -116,23 +119,20 @@ curl -X GET 'https://api.example.test/orders/123'
     expect(body?.consumerStepId).toBe("c");
   });
 
-  it("rewrites the consumer and inserts one extraction", () => {
-    const [token] = analyzeDependencies([login, profile], [
+  it("accepting a dependency saves a hidden mapping and leaves the request template untouched", () => {
+    const suggestions = analyzeDependencies([login, profile], [
       { stepId: "s1", body: { data: { accessToken: "TOKEN-ABC", userId: 582 } } },
-    ]).filter((item) => item.location === "header");
-    const applied = applyDependency(
-      [login, profile],
-      token,
-      { data: { accessToken: "TOKEN-ABC", userId: 582 } },
-    );
-    expect(applied.insertedExtract).toBe(true);
-    const extract = applied.steps.find((step) => step.type === "EXTRACT_VARIABLE");
-    expect(extract?.config).toMatchObject({ variable: "accessToken", path: "body.data.accessToken" });
-    const next = applied.steps.find((step) => step.id === "s2");
-    expect((next?.config.headers as { Authorization: string }).Authorization).toBe("Bearer {{accessToken}}");
-    const again = applyDependency(applied.steps, token, { data: { accessToken: "TOKEN-ABC" } });
-    expect(again.insertedExtract).toBe(false);
-    expect(again.steps.filter((step) => step.type === "EXTRACT_VARIABLE")).toHaveLength(1);
+    ]);
+    const token = suggestions.find((item) => item.location === "header")!;
+    const path = suggestions.find((item) => item.location === "path")!;
+    expect(bindingFromSuggestion(token, login).target).toEqual({ location: "header", field: "Authorization", key: "Authorization" });
+    // URL path segments are addressed by position, exactly as the runner sets them.
+    expect(bindingFromSuggestion(path, login)).toMatchObject({
+      target: { location: "path", field: "2" },
+      source: { path: "response.body.data.userId" },
+    });
+    expect(profile.config.headers.Authorization).toBe("Bearer TOKEN-ABC");
+    expect(JSON.stringify([login, profile])).not.toContain("{{");
   });
 
   it("reports a missing producer, a broken path, a duplicate extraction, and a backward reference", () => {

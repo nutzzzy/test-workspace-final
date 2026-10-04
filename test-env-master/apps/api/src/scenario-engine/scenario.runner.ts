@@ -39,6 +39,11 @@ type Waiting = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+export type RunOptions = {
+  /** Run the scenario up to and including this step only. */
+  untilStepId?: string;
+};
+
 const RANK_SCHEMA = z.object({ candidateIds: z.array(z.string()).max(10) });
 
 @Injectable()
@@ -178,8 +183,8 @@ export class ScenarioRunner implements OnModuleInit {
    * Starts a run asynchronously and returns immediately (RUNNING)
    * so the UI can poll + cancel (live execution).
    */
-  async start(scenarioId: string) {
-    const prepared = await this.prepareRun(scenarioId);
+  async start(scenarioId: string, options: RunOptions = {}) {
+    const prepared = await this.prepareRun(scenarioId, options);
     void this.executePrepared(prepared, { interactive: true }).catch((error) => {
       this.logger.error(
         `Scenario run ${prepared.runId} crashed`,
@@ -190,18 +195,26 @@ export class ScenarioRunner implements OnModuleInit {
   }
 
   /** Synchronous full run — useful for scripts / demos that await completion. */
-  async run(scenarioId: string) {
-    const prepared = await this.prepareRun(scenarioId);
+  async run(scenarioId: string, options: RunOptions = {}) {
+    const prepared = await this.prepareRun(scenarioId, options);
     await this.executePrepared(prepared, { interactive: false });
     return this.getRun(prepared.runId);
   }
 
-  private async prepareRun(scenarioId: string) {
-    const scenario = await this.prisma.scenario.findUnique({
+  private async prepareRun(scenarioId: string, options: RunOptions) {
+    const found = await this.prisma.scenario.findUnique({
       where: { id: scenarioId },
       include: { steps: { orderBy: { orderIndex: "asc" } } },
     });
-    if (!scenario) throw new NotFoundException("Scenario not found");
+    if (!found) throw new NotFoundException("Scenario not found");
+    let scenario = found;
+    if (options.untilStepId) {
+      // Run one step with everything before it, in a fresh context: a step
+      // never reads values left over from an earlier run.
+      const target = found.steps.find((step) => step.id === options.untilStepId);
+      if (!target) throw new NotFoundException("Step not found");
+      scenario = { ...found, steps: found.steps.filter((step) => step.orderIndex <= target.orderIndex) };
+    }
 
     const envVars = scenario.environmentId
       ? await this.environments.getResolvedVariables(scenario.environmentId)
@@ -408,7 +421,7 @@ function persistedOutput(
   context: ExecutionContext,
 ): Prisma.InputJsonValue | undefined {
   const flow: Record<string, unknown> = {};
-  for (const key of ["consumedVars", "recovery", "assertions", "manual", "bindingWarnings", "values", "important", "extractions"] as const) {
+  for (const key of ["consumedVars", "recovery", "assertions", "manual", "blocked", "values", "important", "extractions"] as const) {
     if (stepResult[key] !== undefined) flow[key] = stepResult[key];
   }
   if (Object.keys(flow).length === 0) {

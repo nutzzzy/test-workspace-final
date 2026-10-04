@@ -142,9 +142,16 @@ export class ScenariosController {
     return this.scenariosService.reorderSteps(id, body.stepIds);
   }
 
+  /** Parse pasted cURL commands and propose dependencies; nothing is saved. */
+  @Post(":id/import-curl/preview")
+  previewImport(@Param("id") id: string, @Body() body: { text?: unknown }) {
+    return this.scenariosService.previewImport(id, body?.text);
+  }
+
+  /** Save the commands as steps and the dependencies the user accepted (by suggestion id). */
   @Post(":id/import-curl")
-  importCurl(@Param("id") id: string, @Body() body: { text?: string }) {
-    return this.scenariosService.importCurl(id, body.text ?? "");
+  importCurl(@Param("id") id: string, @Body() body: { text?: unknown; accept?: unknown; skipInvalid?: unknown }) {
+    return this.scenariosService.importCurl(id, body ?? {});
   }
 
   @Post(":id/analyze-flow")
@@ -152,25 +159,16 @@ export class ScenariosController {
     return this.scenariosService.analyzeFlow(id);
   }
 
+  /** Save a detected dependency (by suggestion id) as a mapping on its consumer step. */
   @Post(":id/dependencies/accept")
-  acceptDependency(
-    @Param("id") id: string,
-    @Body()
-    body: {
-      producerStepId: string;
-      consumerStepId: string;
-      sourcePath: string;
-      variable: string;
-      location: "url" | "path" | "header" | "query" | "body" | "form" | "cookie";
-      locationDetail: string;
-    },
-  ) {
-    return this.scenariosService.acceptDependency(id, body);
+  acceptDependency(@Param("id") id: string, @Body() body: { id?: unknown; replace?: unknown }) {
+    return this.scenariosService.acceptDependency(id, body ?? {});
   }
 
+  /** Start a run; `untilStepId` runs only the steps up to and including that one. */
   @Post(":id/run")
-  start(@Param("id") id: string) {
-    return this.scenariosService.start(id);
+  start(@Param("id") id: string, @Body() body: { untilStepId?: string }) {
+    return this.scenariosService.start(id, { untilStepId: body?.untilStepId });
   }
 
   @Post(":id/run/sync")

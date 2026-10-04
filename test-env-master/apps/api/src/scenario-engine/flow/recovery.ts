@@ -80,7 +80,7 @@ export type RecoveryAttempt = {
   failures: string[];
   error?: string;
   /** What was sent (redacted when persisted). */
-  request?: { method: string; url: string };
+  request?: { method: string; url: string; headers?: Record<string, string>; body?: unknown };
   durationMs?: number;
   /** Error message read from the response body. */
   message?: string;
@@ -147,6 +147,12 @@ export type RecoverySettings = {
   idempotent: boolean;
   /** Ask the configured model to rank LOW candidates when nothing stronger exists. */
   aiAssist: boolean;
+  /**
+   * Let automatic retries of a mutating request (POST/PUT/PATCH) change its
+   * JSON body or form fields. Off by default: business data is never altered
+   * just to obtain a passing status.
+   */
+  allowDataChanges: boolean;
 };
 
 /** Absolute ceiling for automatic retries of one step; a ceiling, not a target. */
@@ -169,7 +175,17 @@ export function recoverySettings(config: Record<string, unknown>): RecoverySetti
     allowMediumExplicit: raw.allowMedium === true,
     idempotent: raw.idempotent === true,
     aiAssist: raw.aiAssist === true,
+    allowDataChanges: raw.allowDataChanges === true,
   };
+}
+
+export const READ_ONLY_METHODS = ["GET", "HEAD", "OPTIONS"];
+
+/** The candidate rewrites request data (JSON body or form fields), not just identifiers or credentials. */
+export function changesRequestData(candidate: RecoveryCandidate) {
+  return (candidate.changes?.length ? candidate.changes : [candidate]).some(
+    (change) => change.location === "body" || change.location === "form",
+  );
 }
 
 /**
@@ -180,7 +196,7 @@ export function recoverySettings(config: Record<string, unknown>): RecoverySetti
 export function isRetrySafe(method: string, idempotent: boolean, headers?: Record<string, string>): boolean {
   const verb = method.toUpperCase();
   if (verb === "DELETE") return false;
-  if (["GET", "HEAD", "OPTIONS"].includes(verb)) return true;
+  if (READ_ONLY_METHODS.includes(verb)) return true;
   if (idempotent) return true;
   const key = headerKey(headers, "idempotency-key") ?? headerKey(headers, "x-idempotency-key");
   return Boolean(key && String(headers?.[key] ?? "").trim());

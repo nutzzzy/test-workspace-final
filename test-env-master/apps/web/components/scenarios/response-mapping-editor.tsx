@@ -2,7 +2,7 @@
 
 import { validateMappings, type ResponseMapping, type ResponseMappingSource } from "@qa-workbench/shared";
 import { Button } from "@/components/ui/button";
-import { JsonTree } from "@/components/scenarios/json-tree";
+import { ResponseExplorer } from "@/components/scenarios/response-explorer";
 import { useI18n } from "@/lib/i18n";
 
 export type VariableProducer = {
@@ -173,34 +173,17 @@ export function ResponseMappingEditor({
       <details className="text-xs">
         <summary className="cursor-pointer text-muted-foreground">{t("scenarios.mapping.pickFromResponse")}</summary>
         {sample && (sample.body !== undefined || sample.headers) ? (
-          <div className="mt-1 max-h-64 space-y-2 overflow-auto rounded border border-border p-1">
-            {sample.body !== undefined ? (
-              <JsonTree
-                value={sample.body}
-                extractLabel={t("scenarios.mapping.map")}
-                assertLabel=""
-                onExtract={(path) => add({ path, variable: suggestVariable(path, taken), from: "body" })}
-              />
-            ) : null}
-            {sample.headers && Object.keys(sample.headers).length > 0 ? (
-              <div className="space-y-0.5 ps-2">
-                <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                  {t("scenarios.mapping.headers")}
-                </div>
-                {Object.keys(sample.headers).map((name) => (
-                  <div key={name} className="flex flex-wrap items-center gap-2 font-mono text-[11px] dir-ltr">
-                    <span className="text-muted-foreground">{name}</span>
-                    <button
-                      type="button"
-                      className="text-[10px] text-primary"
-                      onClick={() => add({ path: name, variable: suggestVariable(`.${name}`, taken), from: "header" })}
-                    >
-                      {t("scenarios.mapping.map")}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            ) : null}
+          <div className="mt-1">
+            <ResponseExplorer
+              body={sample.body}
+              headers={sample.headers}
+              compact
+              onSelect={(pick) => {
+                const header = pick.path.startsWith("response.headers.");
+                const path = header ? pick.path.slice("response.headers.".length) : pick.label;
+                add({ path, variable: suggestVariable(header ? `.${path}` : pick.label, taken), from: header ? "header" : "body" });
+              }}
+            />
           </div>
         ) : (
           <p className="mt-1 text-[11px] text-muted-foreground">{t("scenarios.mapping.noSample")}</p>

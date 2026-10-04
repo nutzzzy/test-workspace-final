@@ -7,7 +7,9 @@ import {
 import type { ExecutionContext, StepExecutionResult } from "../types";
 import {
   applyCandidate,
+  changesRequestData,
   isRetrySafe,
+  READ_ONLY_METHODS,
   likelyField,
   planRecoveryCandidates,
   recoverySettings,
@@ -103,6 +105,16 @@ function sentUrl(request: ResolvedHttpRequest) {
   }
 }
 
+/** The exact request of an attempt, for the attempt history (redacted before it is stored). */
+function attemptRequest(method: string, request: ResolvedHttpRequest) {
+  return {
+    method,
+    url: sentUrl(request),
+    ...(request.headers && Object.keys(request.headers).length ? { headers: request.headers } : {}),
+    ...(request.body !== undefined && method !== "GET" && method !== "HEAD" ? { body: request.body } : {}),
+  };
+}
+
 function trace(
   partial: Pick<RecoveryTrace, "outcome" | "originalStatus" | "failures" | "maxAttempts"> & Partial<RecoveryTrace>,
 ): RecoveryTrace {
@@ -180,8 +192,11 @@ export async function recoverHttpStep(input: {
   let candidates = planRecoveryCandidates(spec, context.registry, { previousMappings: input.previousMappings });
   const safe = isRetrySafe(method, settings.idempotent, request.headers);
   const mediumAllowed = safe ? settings.allowMedium : settings.allowMediumExplicit;
-  const allowed = (candidate: RecoveryCandidate) =>
+  const confident = (candidate: RecoveryCandidate) =>
     candidate.confidence === "HIGH" || (mediumAllowed && candidate.confidence === "MEDIUM");
+  // Even a repeatable mutation keeps its business data unless the user allowed changing it.
+  const dataLocked = !READ_ONLY_METHODS.includes(method) && !settings.allowDataChanges;
+  const allowed = (candidate: RecoveryCandidate) => confident(candidate) && !(dataLocked && changesRequestData(candidate));
 
   // Optional semantic help: only when deterministic evidence is insufficient.
   if (settings.aiAssist && input.ranker && safe && !candidates.some(allowed) && candidates.length > 0) {
@@ -214,14 +229,15 @@ export async function recoverHttpStep(input: {
   }
   const runnable = candidates.filter(allowed);
   if (runnable.length === 0) {
+    const dataOnly = candidates.some((candidate) => confident(candidate) && changesRequestData(candidate));
     return {
       result: failed,
       recovery: trace({
         ...base,
         outcome: "SUGGESTED",
         suggestions: candidates,
-        blockedReason: "CONFIDENCE",
-        stoppedBecause: "LOW_CONFIDENCE_ONLY",
+        blockedReason: dataOnly ? "UNSAFE_METHOD" : "CONFIDENCE",
+        stoppedBecause: dataOnly ? "UNSAFE_ONLY" : "LOW_CONFIDENCE_ONLY",
         likelyField: likely,
       }),
       state: unresolved(),
@@ -282,7 +298,7 @@ export async function recoverHttpStep(input: {
       status: response?.status ?? null,
       expectationMet: met,
       failures: verdict.failures,
-      request: { method, url: sentUrl(retry) },
+      request: attemptRequest(method, retry),
       durationMs: response?.durationMs,
       message: response ? responseMessage(response.body) : undefined,
       ...(result.error ? { error: result.error } : {}),
@@ -425,7 +441,7 @@ export async function manualRetry(input: {
       status: response?.status ?? null,
       expectationMet: met,
       failures: verdict.failures,
-      request: { method, url: sentUrl(retry) },
+      request: attemptRequest(method, retry),
       durationMs: response?.durationMs,
       message: response ? responseMessage(response.body) : undefined,
       ...(result.error ? { error: result.error } : {}),

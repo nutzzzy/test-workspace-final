@@ -93,7 +93,45 @@ const EXACT: Record<string, string> = {
   "Invalid suite": "errors.invalidInput",
   "JSON body is not valid JSON after variable substitution": "errors.invalidJsonBody",
   "No HTTP response available for response mapping": "errors.noMappingResponse",
+  "Paste at least one cURL command": "errors.curlEmpty",
+  "The pasted text is too long": "errors.curlTooLong",
+  "No cURL command found": "errors.curlNone",
+  "Import at most 50 requests at a time": "errors.curlTooMany",
+  "No valid cURL command to import": "errors.curlNoneValid",
+  "This suggestion is no longer available": "errors.suggestionGone",
+  "A manual mapping already exists for this field": "errors.manualMappingExists",
+  "The mapping source must be a step of this scenario": "errors.mappingSourceScenario",
+  "The mapping source must run before this step": "errors.mappingSourceOrder",
+  "A mapping needs a target field and a source": "errors.mappingInvalid",
+  "Only HTTP steps take dependency mappings": "errors.mappingHttpOnly",
+  "This run is not waiting for input": "errors.notWaiting",
+  "Choose a target field and a value": "errors.chooseTargetValue",
 };
+
+const CURL_CODES = new Set(["missing_url", "unclosed_quote", "missing_value", "file_body", "bad_url"]);
+
+/** "Step 2 (Login)" in the active language. */
+function stepLabel(text: string, t: Translate) {
+  const match = /^Step (\d+) \((.*)\)$/.exec(text);
+  return match ? t("scenarios.flow.stepRef", { n: match[1]!, name: match[2]! }) : text;
+}
+
+/** A step not sent because a saved mapping had no value (several are joined with "; "). */
+function localizeBlocked(text: string, t: Translate): string | null {
+  if (!text.startsWith("Blocked: ")) return null;
+  return text
+    .split("; ")
+    .map((part) => {
+      let match = /^Blocked: (.+) has no successful response in this run \(needed for (.+)\)$/.exec(part);
+      if (match) return t("errors.blockedNotRun", { step: stepLabel(match[1]!, t), target: match[2]! });
+      match = /^Blocked: (.+) returned several values that could be (.+) \(needed for (.+)\)$/.exec(part);
+      if (match) return t("errors.blockedAmbiguous", { step: stepLabel(match[1]!, t), path: match[2]!, target: match[3]! });
+      match = /^Blocked: (.+) did not provide (.+) for (.+)$/.exec(part);
+      if (match) return t("errors.blockedMissing", { step: stepLabel(match[1]!, t), path: match[2]!, target: match[3]! });
+      return part;
+    })
+    .join(" ");
+}
 
 const EXTRACTION_REASONS: Record<string, string> = {
   "not found in the response": "errors.extractionReasons.missing",
@@ -145,6 +183,10 @@ export function localizeUserMessage(raw: string, t: Translate): string {
   if (exact) return t(exact);
   const variable = localizeVariableMessage(text, t);
   if (variable) return variable;
+  const blocked = localizeBlocked(text, t);
+  if (blocked) return blocked;
+  const curl = /^cURL (\w+)$/.exec(text);
+  if (curl && CURL_CODES.has(curl[1]!)) return t(`scenarios.curlErrors.${curl[1]}`);
 
   const prefixed: Array<[RegExp, string, string]> = [
     [/^Unknown StepType:\s*(.+)$/, "errors.unknownStep", "value"],

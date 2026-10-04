@@ -57,6 +57,11 @@ describe("i18n parity", () => {
         "Extraction failed for {{orderId}} (body $.data.order.id): not found in the response",
         "Invalid response mapping {{x}}: invalid_path (recursive descent (..) is not supported)",
         "JSON body is not valid JSON after variable substitution",
+        "Blocked: Step 1 (Login) has no successful response in this run (needed for header.Authorization)",
+        "Blocked: Step 1 (Login) returned several values that could be token (needed for header.Authorization)",
+        "Blocked: Step 2 (Get user) did not provide response.body.id for path.userId",
+        "cURL unclosed_quote",
+        "A manual mapping already exists for this field",
       ]) {
         const text = localizeUserMessage(raw, t);
         if (text.includes("MISSING:")) unresolved.push(text);

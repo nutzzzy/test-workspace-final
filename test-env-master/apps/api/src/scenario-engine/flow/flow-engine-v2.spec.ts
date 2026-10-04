@@ -5,7 +5,7 @@ import { orchestrateSteps, type OrchestrationOptions, type PendingInput } from "
 import { StepExecutorRegistry } from "../step-executor.registry";
 import { ExecutionContext, type OrchestrationStep, type OrchestrationStepResult } from "../types";
 import { analyzeDependencies } from "./dependency-analyzer";
-import { applyDependency } from "./apply-dependency";
+import { bindingFromSuggestion } from "./mapping-review";
 import type { StepBinding } from "./bindings";
 import type { ManualResolution } from "./manual-recovery";
 import * as recovery from "./recovery";
@@ -191,7 +191,7 @@ describe("dependencies in every input location", () => {
     expect(results[1]!.consumedVars?.map((item) => item.location)).toEqual(expect.arrayContaining(["form.orderId", "form.token"]));
   });
 
-  it("design time: a literal id in an imported URL is proposed as /trip/{{tripId}}", () => {
+  it("design time: a literal id in an imported URL is proposed as a mapping, never a {{variable}}", () => {
     const steps = [
       { id: "a", name: "Create trip", orderIndex: 0, type: "HTTP_REQUEST", config: { method: "POST", url: `${BASE}/trips` } },
       { id: "b", name: "Get trip", orderIndex: 1, type: "HTTP_REQUEST", config: { method: "GET", url: `${BASE}/trip/8912?userId=4411` } },
@@ -202,10 +202,12 @@ describe("dependencies in every input location", () => {
     expect(path).toMatchObject({ sourcePath: "$.data.trip.id", variable: "tripId", locationDetail: "tripId" });
     const query = suggestions.find((item) => item.location === "query")!;
     expect(query).toMatchObject({ locationDetail: "userId", variable: "userId" });
-    const applied = applyDependency(steps, path, body);
-    expect(applied.steps.find((step) => step.id === "b")!.config.url).toBe(`${BASE}/trip/{{tripId}}?userId=4411`);
-    const both = applyDependency(applied.steps, query, body);
-    expect(both.steps.find((step) => step.id === "b")!.config.url).toBe(`${BASE}/trip/{{tripId}}?userId={{userId}}`);
+    expect(bindingFromSuggestion(path, steps[0]!)).toMatchObject({
+      target: { location: "path", field: "2" },
+      source: { stepId: "a", path: "response.body.data.trip.id" },
+    });
+    expect(bindingFromSuggestion(query, steps[0]!).target).toMatchObject({ location: "query", field: "userId" });
+    expect(steps[1]!.config.url).toBe(`${BASE}/trip/8912?userId=4411`);
   });
 
   it("lists and sets inputs uniformly across locations", () => {
@@ -393,7 +395,7 @@ describe("automatic recovery", () => {
     });
     const { results } = await run([
       http("p", { method: "GET", url: `${BASE}/p` }),
-      http("f", { method: "POST", url: `${BASE}/f`, body: "orderId=1234", headers: { "Content-Type": "application/x-www-form-urlencoded" }, recovery: { idempotent: true } }),
+      http("f", { method: "POST", url: `${BASE}/f`, body: "orderId=1234", headers: { "Content-Type": "application/x-www-form-urlencoded" }, recovery: { idempotent: true, allowDataChanges: true } }),
     ]);
     expect(results[1]!.status).toBe("RECOVERED");
     expect(calls.at(-1)!.raw).toBe("orderId=9812");
@@ -433,7 +435,14 @@ describe("mutating request safety", () => {
     );
     const { results } = await run([
       http("p", { method: "GET", url: `${BASE}/p` }),
-      http("m", { method: "POST", url: `${BASE}/m`, headers: { "Idempotency-Key": "k-1" }, body: { bikerId: 125 } }),
+      http("m", {
+        method: "POST",
+        url: `${BASE}/m`,
+        headers: { "Idempotency-Key": "k-1" },
+        body: { bikerId: 125 },
+        // Changing business data in the body always needs explicit consent.
+        recovery: { allowDataChanges: true },
+      }),
     ]);
     expect(results[1]!.status).toBe("RECOVERED");
     expect(calledPath(calls, "/m")).toHaveLength(2);
