@@ -31,6 +31,7 @@ import {
   type DeepAnalysis,
   type DeepStep,
 } from "./deep-analysis";
+import { explainNoEdgeCases } from "./edge-explanation";
 import { analyzeRequirementGaps, dedupeQuestions, type AnalysisQuestion } from "./requirement-questions";
 import {
   designAcceptanceCriteria,
@@ -778,6 +779,26 @@ export class AnalysisService {
         job.finishedAt = new Date().toISOString();
       });
     return this.deepStatus(issue.id, locale);
+  }
+
+  /**
+   * Why this requirement has no edge cases, from the current analysis of its
+   * text (rule-based plus any stored AI analysis). Read-only: no model call,
+   * nothing is written.
+   */
+  async explainEdgeCases(jiraIssueId: string, localeInput?: unknown) {
+    const locale = normalizeLocale(localeInput);
+    const issue = await this.loadIssue(jiraIssueId);
+    const input = this.inputOf(issue, locale);
+    const deep = await this.deepFor(issue.id, requirementHash(input), locale);
+    const base = runQaPipeline(input);
+    const result = deep ? mergeDeepAnalysis(base, deep, input) : base;
+    const ai = await this.ai.analysisStatus();
+    return {
+      // The current design would produce edge cases: the list is empty only because it was not (re)generated.
+      wouldGenerate: result.edgeCases.length,
+      ...explainNoEdgeCases({ result, deep, aiReady: ai.ready, locale }),
+    };
   }
 
   async cancelDeepAnalysis(jiraIssueId: string) {

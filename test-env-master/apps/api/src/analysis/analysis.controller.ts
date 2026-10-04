@@ -94,6 +94,12 @@ export class AnalysisController {
     return this.analysisService.deepStatus(jiraIssueId, locale);
   }
 
+  /** Why the edge-case list is empty for this requirement (read-only). */
+  @Get(":jiraIssueId/edge-cases/explanation")
+  edgeExplanation(@Param("jiraIssueId") jiraIssueId: string, @Query("locale") locale?: string) {
+    return this.analysisService.explainEdgeCases(jiraIssueId, locale);
+  }
+
   @Post(":jiraIssueId/deep/cancel")
   cancelDeep(@Param("jiraIssueId") jiraIssueId: string) {
     return this.analysisService.cancelDeepAnalysis(jiraIssueId);

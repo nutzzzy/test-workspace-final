@@ -10,6 +10,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ProgressBanner } from "@/components/ui/progress";
 import { useToast } from "@/components/ui/toast";
 import { DeepAnalysisPanel, type DeepStatus } from "@/components/workspace/deep-analysis-panel";
+import { EdgeCasesEmpty } from "@/components/workspace/edge-cases-empty";
 import { useAsyncProgress } from "@/hooks/use-async-progress";
 import { useI18n } from "@/lib/i18n";
 import { BidiText } from "@/components/bidi-text";
@@ -1100,6 +1101,13 @@ export default function WorkspaceDetailPage() {
           <Button disabled={busy} onClick={() => generate("edge-cases")}>
             {t("workspace.generateEdgeCases")}
           </Button>
+          {issue.edgeCases.length === 0 ? (
+            <EdgeCasesEmpty
+              issueId={issue.id}
+              generated={Boolean(issue.requirementAnalysis) || issue.testCases.length > 0}
+              refreshKey={`${issue.testCases.length}:${deep?.runs?.[locale]?.createdAt ?? ""}`}
+            />
+          ) : null}
           {issue.edgeCases.map((e) => (
             <Card key={e.id}>
               <CardContent className="p-3">

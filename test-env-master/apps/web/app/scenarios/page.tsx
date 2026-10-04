@@ -22,6 +22,7 @@ import {
   type Suggestion,
 } from "@/components/scenarios/builder-types";
 import { CurlImportDialog } from "@/components/scenarios/curl-import-dialog";
+import { DatabaseStepDialog } from "@/components/scenarios/database-step-dialog";
 import type { ConnectorChoice } from "@/components/scenarios/database-step-form";
 import type { ManualChoice } from "@/components/scenarios/manual-recovery";
 import { RequestFlow } from "@/components/scenarios/request-flow";
@@ -37,7 +38,6 @@ const TEMPLATES: Record<string, Record<string, unknown>> = {
   SET_VARIABLE: { variable: "name", value: "" },
   EXTRACT_VARIABLE: { variable: "name", path: "body.data.id" },
   CONDITION: { left: "{{status}}", op: "equals", right: "OK" },
-  DATABASE_ACTION: { connectorId: "", operation: "SELECT", query: "" },
 };
 const OTHER_TYPES = ["ASSERTION", "DELAY", "DATABASE_ACTION", "SET_VARIABLE", "EXTRACT_VARIABLE", "CONDITION"];
 const POLL_MS = 500;
@@ -72,6 +72,7 @@ export default function ScenariosPage() {
   const [liveRun, setLiveRun] = useState<ScenarioRun | null>(null);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
+  const [dbStepOpen, setDbStepOpen] = useState(false);
   const [picker, setPicker] = useState<PickerRequest | null>(null);
   const [confirm, setConfirm] = useState<{ title: string; body: string; action: () => Promise<void> } | null>(null);
   const [dismissed, setDismissed] = useState<string[]>([]);
@@ -259,20 +260,26 @@ export default function ScenariosPage() {
       await refresh();
     });
 
-  const addStep = (type: string) =>
-    guarded(async () => {
-      if (!detail) return;
-      const created = await api<Step>(`/scenarios/${detail.id}/steps`, {
-        method: "POST",
-        body: JSON.stringify({
-          name: type === "HTTP_REQUEST" ? t("builder.flow.newRequestName") : label("stepType", type),
-          type,
-          config: TEMPLATES[type] ?? {},
-        }),
-      });
-      await refresh();
-      setSelectedStepId(created.id);
+  const createStep = async (type: string, name: string, config: Record<string, unknown>) => {
+    if (!detail) return;
+    const created = await api<Step>(`/scenarios/${detail.id}/steps`, {
+      method: "POST",
+      body: JSON.stringify({ name, type, config }),
     });
+    await refresh();
+    setSelectedStepId(created.id);
+  };
+
+  const addStep = (type: string) => {
+    // A database step needs a connector and a valid query before the API accepts it.
+    if (type === "DATABASE_ACTION") {
+      setDbStepOpen(true);
+      return;
+    }
+    void guarded(() =>
+      createStep(type, type === "HTTP_REQUEST" ? t("builder.flow.newRequestName") : label("stepType", type), TEMPLATES[type] ?? {}),
+    );
+  };
 
   const moveStep = (step: Step, direction: -1 | 1) =>
     guarded(async () => {
@@ -576,6 +583,14 @@ export default function ScenariosPage() {
             toast.notify("success", t("builder.import.done", { count: n(imported) }));
             await Promise.all([refresh(), loadList()]);
           }}
+        />
+      ) : null}
+
+      {dbStepOpen && detail ? (
+        <DatabaseStepDialog
+          connectors={connectors}
+          onClose={() => setDbStepOpen(false)}
+          onCreate={(name, config) => createStep("DATABASE_ACTION", name, config)}
         />
       ) : null}
 

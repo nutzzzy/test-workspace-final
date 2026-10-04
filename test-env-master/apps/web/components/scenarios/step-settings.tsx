@@ -191,7 +191,8 @@ export function StepSettings({
         ...(mappings.length ? { extract: mappings } : {}),
       };
     } else if (step.type === "DATABASE_ACTION") {
-      config = { ...databaseStepConfig(db), continueOnFailure: continueOnFailure || undefined };
+      // The database form has its own "continue on failure" control.
+      config = databaseStepConfig(db);
     } else {
       config = { ...config, continueOnFailure: continueOnFailure || undefined };
     }
@@ -223,10 +224,12 @@ export function StepSettings({
           <input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />
           {t("builder.settings.enabled")}
         </label>
-        <label className="flex items-center gap-2 text-xs">
-          <input type="checkbox" checked={continueOnFailure} onChange={(event) => setContinueOnFailure(event.target.checked)} />
-          {t("builder.settings.continueOnFailure")}
-        </label>
+        {step.type !== "DATABASE_ACTION" ? (
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={continueOnFailure} onChange={(event) => setContinueOnFailure(event.target.checked)} />
+            {t("builder.settings.continueOnFailure")}
+          </label>
+        ) : null}
         {http ? (
           <label className="block max-w-48 space-y-1">
             <span className="text-[11px] text-muted-foreground">{t("builder.settings.timeout")}</span>

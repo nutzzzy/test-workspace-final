@@ -1143,6 +1143,15 @@ export const en = {
       done: "Imported {count} requests. Nothing was executed.",
     },
   },
+  dbStep: {
+    title: "Add a database step",
+    hint: "Choose the connector and write one query. The step is saved once the query is valid.",
+    create: "Add step",
+    chooseConnector: "Choose a connector to continue.",
+    noConnectors: "No database connector is set up yet. Add one under Settings → Database Connectors first.",
+    noActiveConnectors: "Every database connector is inactive. Activate one under Settings → Database Connectors.",
+    openSettings: "Open Settings",
+  },
   aiSettings: {
     hint: "The model helps the Test Workspace analyse requirements in depth. Local models (Ollama, LM Studio) are free and private; hosted free tiers need an API key and receive the requirement text.",
     service: "Service",
@@ -1177,6 +1186,13 @@ export const en = {
       external_not_allowed: "Allow sending requirement text to this external service to use it.",
       missing_api_key: "Add the service's API key to use it.",
     },
+  },
+  edgeEmpty: {
+    notGenerated: "Edge cases have not been generated yet. Run the analysis or use “Generate edge cases”.",
+    title: "Why there are no edge cases",
+    howTo: "To get edge cases",
+    stale: "The current analysis would produce {count} edge cases — they are just not generated yet. Use “Generate edge cases”.",
+    unavailable: "The reason could not be loaded.",
   },
   deepAnalysis: {
     title: "Requirement analysis",
@@ -2448,6 +2464,15 @@ export const fa: Dictionary = {
       done: "{count} درخواست وارد شد. چیزی اجرا نشد.",
     },
   },
+  dbStep: {
+    title: "افزودن مرحلهٔ دیتابیس",
+    hint: "اتصال‌دهنده را انتخاب کنید و یک کوئری بنویسید. مرحله وقتی ذخیره می‌شود که کوئری معتبر باشد.",
+    create: "افزودن مرحله",
+    chooseConnector: "برای ادامه یک اتصال‌دهنده انتخاب کنید.",
+    noConnectors: "هنوز هیچ اتصال‌دهندهٔ دیتابیسی تعریف نشده است. ابتدا از تنظیمات ← اتصال‌دهنده‌های دیتابیس یکی اضافه کنید.",
+    noActiveConnectors: "همهٔ اتصال‌دهنده‌های دیتابیس غیرفعال‌اند. از تنظیمات ← اتصال‌دهنده‌های دیتابیس یکی را فعال کنید.",
+    openSettings: "رفتن به تنظیمات",
+  },
   aiSettings: {
     hint: "مدل زبانی به فضای تست کمک می‌کند نیازمندی‌ها را عمیق تحلیل کند. مدل‌های محلی (Ollama، LM Studio) رایگان و خصوصی‌اند؛ سرویس‌های آنلاین رایگان کلید API لازم دارند و متن نیازمندی را دریافت می‌کنند.",
     service: "سرویس",
@@ -2482,6 +2507,13 @@ export const fa: Dictionary = {
       external_not_allowed: "برای استفاده، اجازهٔ ارسال متن نیازمندی به این سرویس بیرونی را بدهید.",
       missing_api_key: "برای استفاده، کلید API سرویس را وارد کنید.",
     },
+  },
+  edgeEmpty: {
+    notGenerated: "حالت‌های مرزی هنوز تولید نشده‌اند. تحلیل را اجرا کنید یا «تولید حالات مرزی» را بزنید.",
+    title: "چرا هیچ حالت مرزی‌ای وجود ندارد",
+    howTo: "برای داشتن حالت‌های مرزی",
+    stale: "تحلیل فعلی {count} حالت مرزی تولید می‌کند — فقط هنوز تولید نشده‌اند. «تولید حالات مرزی» را بزنید.",
+    unavailable: "دلیل بارگذاری نشد.",
   },
   deepAnalysis: {
     title: "تحلیل نیازمندی",
