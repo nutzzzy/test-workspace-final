@@ -1,6 +1,7 @@
 import { existsSync } from "fs";
 import type { Browser, Frame, Locator, Page } from "playwright-core";
 import { healMain } from "./recorder-script";
+import { hasNumbers, looseTextPattern } from "./replay-smarts";
 import type { LocatorCandidate, UiTarget } from "./ui-types";
 
 /**
@@ -92,6 +93,18 @@ export async function locate(scope: Page | Frame, target: UiTarget, timeoutMs: n
         const learnedBefore = target.learned ?? 0;
         return { locator: visible, candidateIndex: index, healed: index !== learnedBefore, how: describeCandidate(candidate) };
       }
+    }
+    // Text with numbers that change between runs (a rating count, a balance): the same words, any number.
+    for (const [index, candidate] of target.candidates.entries()) {
+      const text = candidate.kind === "role" ? candidate.name : candidate.kind === "text" ? candidate.value : undefined;
+      if (!text || !hasNumbers(text)) continue;
+      const pattern = looseTextPattern(text);
+      const locator =
+        candidate.kind === "role"
+          ? scope.getByRole(candidate.value as Parameters<Page["getByRole"]>[0], { name: pattern })
+          : scope.getByText(pattern);
+      const visible = await visibleOne(locator);
+      if (visible) return { locator: visible, candidateIndex: index, healed: true, how: `${describeCandidate(candidate)} (numbers may differ)` };
     }
     if (Date.now() >= healFrom && !tried) {
       tried = true;

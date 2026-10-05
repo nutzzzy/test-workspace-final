@@ -9,7 +9,7 @@ import { describeAction, FingerprintSchema, LocatorCandidateSchema, SECRET_PLACE
 
 /** What the page script sends for one user action (untrusted: the recorded page could send anything). */
 const EventSchema = z.object({
-  kind: z.enum(["click", "fill", "select", "check", "uncheck", "press", "assertText", "__stop"]),
+  kind: z.enum(["click", "fill", "select", "check", "uncheck", "press", "assertText", "__stop", "__activity"]),
   value: z.string().max(10_000).optional(),
   optionLabel: z.string().max(300).optional(),
   secret: z.boolean().optional(),
@@ -177,6 +177,10 @@ export class UiRecorderService implements OnModuleDestroy {
     const event = parsed.data;
     if (event.kind === "__stop") {
       void this.stop(session.id).catch(() => undefined);
+      return;
+    }
+    if (event.kind === "__activity") {
+      session.lastActionAt = Date.now();
       return;
     }
     session.lastActionAt = Date.now();

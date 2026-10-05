@@ -127,6 +127,38 @@ beforeAll(async () => {
           document.getElementById("t").textContent = "token:" + (localStorage.getItem("token") || "none");
         </script>`);
       }
+      // One-time code that submits by itself on its last digit (a client-side route change).
+      if (url.pathname === "/otp") {
+        return html(`<label>Digit 1 <input name="d1"></label><label>Digit 2 <input name="d2"></label><script>
+          document.querySelector('[name=d2]').addEventListener("input", () => {
+            history.pushState({}, "", "/home");
+            document.body.innerHTML = "<h1>Signed in home</h1>";
+          });
+        </script>`);
+      }
+      // A click that leads, a moment later, to a cart with a new code every time.
+      if (url.pathname === "/shop") {
+        return html(`<p>Pizza place (4,712+)</p><button onclick="setTimeout(() => location.href = '/basket/' + Math.random().toString(36).slice(2, 5) + '7' + Math.floor(Math.random() * 90 + 10) + '/?code=x' + Date.now(), 1200)">Pizza place (4,712+)</button>`);
+      }
+      if (/^\/basket\/[a-z0-9]+\/$/.test(url.pathname)) {
+        return html(`<h1>Basket ${url.pathname.split("/")[2]}</h1>`);
+      }
+      // Payment options: a row selects on click, except its wide "details" button in the middle.
+      if (url.pathname === "/pay") {
+        const preselected = url.searchParams.get("pre") === "1";
+        return html(`<div id="opts">
+          <div data-testid="wallet" data-is-selected="${preselected}" style="display:flex;width:600px;height:60px;border:1px solid">
+            <span style="width:40px">W</span><button id="details" style="width:520px" onclick="event.stopPropagation()">Wallet details 1,000</button>
+          </div>
+          <div data-testid="bank" data-is-selected="${!preselected}" style="height:60px">Bank</div></div>
+          <button id="pay">Pay</button><p id="r"></p><script>
+          for (const row of document.querySelectorAll("[data-testid]")) row.addEventListener("click", () => {
+            for (const other of document.querySelectorAll("[data-testid]")) other.dataset.isSelected = String(other === row);
+          });
+          document.getElementById("pay").onclick = () => (document.getElementById("r").textContent =
+            "Paid with " + document.querySelector('[data-is-selected="true"]').dataset.testid);
+        </script>`);
+      }
       if (url.pathname === "/api/orders") {
         return req.headers.authorization === "Bearer tok-ui-123456789" ? json(200, { orders: [] }) : json(401, { message: "invalid token" });
       }
@@ -458,5 +490,84 @@ describeUi("choosing which earlier steps sign the UI step in", () => {
     const page = context.registry.entries().filter((entry) => entry.stepId === "ui");
     expect(page.find((entry) => entry.path === "response.cookies.uid")?.text).toBe("user-2");
     expect(page.find((entry) => entry.path === "response.body.localStorage.token")?.text).toBe("tok-user-2-000000");
+  });
+});
+
+describeUi("replaying what changes between runs", () => {
+  const ui = (startUrl: string, actions: UiAction[]): OrchestrationStep => ({
+    id: "ui",
+    name: "ui",
+    type: "UI_FLOW",
+    enabled: true,
+    orderIndex: 0,
+    config: sealUiConfig({ startUrl, actions, actionTimeoutMs: 6000 }, null, encrypt),
+  });
+  const field = (name: string) => ({ candidates: [{ kind: "css" as const, value: `input[name="${name}"]` }], fingerprint: { tag: "input" } });
+
+  it("types the last digit before the page change it causes, even when recorded after it", async () => {
+    const { results } = await run([
+      ui(`${base}/otp`, [
+        { id: "1", kind: "fill", value: "1", target: field("d1") },
+        { id: "nav", kind: "navigate", url: `${base}/home` },
+        { id: "2", kind: "fill", value: "2", target: field("d2") },
+        { id: "check", kind: "assertText", value: "Signed in home" },
+      ]),
+    ]);
+    expect(results[0]).toMatchObject({ status: "PASSED" });
+  });
+
+  it("follows the app to a page whose code changes every run instead of opening the old one", async () => {
+    const { results } = await run([
+      ui(`${base}/shop`, [
+        {
+          id: "buy",
+          kind: "click",
+          target: { candidates: [{ kind: "role", value: "button", name: "Pizza place (4,600+)" }], fingerprint: { tag: "button" } },
+        },
+        { id: "nav", kind: "navigate", url: `${base}/basket/ab73x9/?code=x1700000000000` },
+        { id: "check", kind: "assertText", value: "Basket" },
+      ]),
+    ]);
+    expect(results[0]).toMatchObject({ status: "PASSED" });
+    const output = results[0]!.output as { url: string; actions: UiActionResult[] };
+    // A fresh cart (not the recorded one), and the button found although its count changed.
+    expect(output.url).not.toContain("ab73x9");
+    expect(output.actions[0]!.how).toContain("numbers may differ");
+  });
+});
+
+describeUi("choosing an option", () => {
+  const steps = (query: string): OrchestrationStep[] => [
+    {
+      id: "ui",
+      name: "pay",
+      type: "UI_FLOW",
+      enabled: true,
+      orderIndex: 0,
+      config: sealUiConfig(
+        {
+          startUrl: `${base}/pay${query}`,
+          actionTimeoutMs: 4000,
+          actions: [
+            { id: "w", kind: "click", target: { candidates: [{ kind: "testid", value: '[data-testid="wallet"]' }], fingerprint: { tag: "div" } } },
+            { id: "p", kind: "click", target: { candidates: [{ kind: "css", value: "#pay" }], fingerprint: { tag: "button" } } },
+            { id: "c", kind: "assertText", value: "Paid with wallet" },
+          ],
+        },
+        null,
+        encrypt,
+      ),
+    },
+  ];
+
+  it("makes sure the option is selected, even when the click lands on its inner button", async () => {
+    const { results } = await run(steps(""));
+    expect(results[0]).toMatchObject({ status: "PASSED" });
+  });
+
+  it("does not click an option that is already selected (which could change it)", async () => {
+    const { results } = await run(steps("?pre=1"));
+    expect(results[0]).toMatchObject({ status: "PASSED" });
+    expect((results[0]!.output as { actions: UiActionResult[] }).actions[0]!.how).toContain("already selected");
   });
 });

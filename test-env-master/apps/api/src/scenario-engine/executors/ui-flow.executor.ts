@@ -1,9 +1,10 @@
-import type { Browser, BrowserContext, Frame, Page } from "playwright-core";
+import type { Browser, BrowserContext, Frame, Locator, Page } from "playwright-core";
 import { lookup } from "../auto-bind";
 import type { ExecutionContext, StepExecutionResult, StepExecutor } from "../types";
 import { pageErrorsMain } from "../ui/recorder-script";
 import { describeCandidate, launchBrowser, locate, type Located } from "../ui/ui-browser";
 import { applySeed, describeSeed, learnTokenPlace, seedFromContext, type StorageSeed } from "../ui/browser-session";
+import { hasDynamicParts, sameRoute } from "../ui/replay-smarts";
 import { describeAction, readUiConfig, type LocatorCandidate, type UiAction, type UiFlowConfig } from "../ui/ui-types";
 
 /** One replayed action, as shown in the step result. */
@@ -30,6 +31,8 @@ export type UiProduced = { url: string; body: Record<string, unknown>; cookies: 
 type Session = { browser: Browser; context: BrowserContext; page: Page };
 
 export const SESSION_KEY = "ui-session";
+/** Actions that type into or choose in a field. */
+const FIELD_KINDS = new Set<UiAction["kind"]>(["fill", "select", "check", "uncheck", "press"]);
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_SCREENSHOT_BYTES = 450_000;
 
@@ -77,14 +80,28 @@ export class UiFlowExecutor implements StepExecutor {
       // Errors already on the page before the final submit are not caused by it.
       const submit = lastSubmit(flow.actions);
       let errorsBefore = new Set<string>();
-      for (const action of flow.actions) {
+      // The order can adapt to the page (see below); each action still runs once.
+      const order = [...flow.actions];
+      for (let position = 0; position < order.length; position += 1) {
         if (context.isCancelled()) return { status: "CANCELLED", error: "Cancelled during UI step" };
+        // Typing that makes the app move on by itself (a one-time code that submits on its last digit)
+        // is recorded after the page change it caused: do it first while its field is still on this page.
+        const next = order[position + 1];
+        if (order[position]!.kind === "navigate" && next?.target && FIELD_KINDS.has(next.kind) && !sameRoute(page.url(), order[position]!.url ?? "")) {
+          const here = await locate(await frameFor(page, next.frameUrl, 1000), next.target, 2_000, () => context.isCancelled()).catch(() => null);
+          if (here) [order[position], order[position + 1]] = [next, order[position]!];
+        }
+        const action = order[position]!;
         const started = Date.now();
         const label = action.label || describeAction(action);
         try {
           page = await pageFor(session, action.tab ?? 0, timeout);
           if (action === submit) errorsBefore = new Set(await page.evaluate(pageErrorsMain).catch(() => [] as string[]));
-          const located = await this.perform(page, action, context, timeout);
+          const located = await this.perform(page, action, context, timeout, {
+            previous: order[position - 1],
+            // Pages the next actions were recorded on: the app may skip ahead to one of them.
+            upcoming: order.slice(position + 1, position + 6).map((item) => item.url).filter((url): url is string => Boolean(url)),
+          });
           if (located && (located.healed || located.healedCandidate)) {
             learned.push({ actionId: action.id, candidateIndex: located.candidateIndex, healedCandidate: located.healedCandidate });
           }
@@ -98,6 +115,19 @@ export class UiFlowExecutor implements StepExecutor {
             ...(action.optional ? { optional: true } : {}),
           });
         } catch (error) {
+          // The app already went where this click leads (the page the next action was recorded on): nothing left to click.
+          const after = order[position + 1];
+          if (
+            action.kind === "click" &&
+            /Element not found/.test(String(error)) &&
+            after?.url &&
+            action.url &&
+            !sameRoute(action.url, after.url) &&
+            sameRoute(page.url(), after.url)
+          ) {
+            results.push({ id: action.id, kind: action.kind, label, status: "PASSED", durationMs: Date.now() - started, how: "the app was already on the page this click leads to" });
+            continue;
+          }
           const message = context.isCancelled() ? "Cancelled" : error instanceof Error ? firstLine(error.message) : "Action failed";
           results.push({ id: action.id, kind: action.kind, label, status: "FAILED", durationMs: Date.now() - started, error: message, ...(action.optional ? { optional: true } : {}) });
           if (context.isCancelled()) return { status: "CANCELLED", error: "Cancelled during UI step" };
@@ -176,7 +206,13 @@ export class UiFlowExecutor implements StepExecutor {
     return session;
   }
 
-  private async perform(page: Page, action: UiAction, context: ExecutionContext, timeout: number): Promise<Located | null> {
+  private async perform(
+    page: Page,
+    action: UiAction,
+    context: ExecutionContext,
+    timeout: number,
+    around: { previous?: UiAction; upcoming: string[] } = { upcoming: [] },
+  ): Promise<Located | null> {
     const scope = await frameFor(page, action.frameUrl, timeout);
     const value = () => {
       if (action.secret) {
@@ -194,12 +230,33 @@ export class UiFlowExecutor implements StepExecutor {
 
     switch (action.kind) {
       case "navigate": {
-        await page.goto(fill(action.url ?? action.value ?? "", context), { waitUntil: "domcontentloaded", timeout: Math.max(timeout, 30_000) });
+        const target = fill(action.url ?? action.value ?? "", context);
+        // A page change right after a click, Enter or typing is the app's own doing (a redirect, a
+        // payment return), often with a code that differs every run: follow the app there. It may
+        // also skip ahead to the page of a later action. A URL typed by the user is opened directly.
+        const caused = Boolean(around.previous && around.previous.kind !== "assertText" && around.previous.kind !== "assertUrl" && around.previous.kind !== "waitForText");
+        const routes = [target, ...around.upcoming];
+        const arrived = () => routes.some((route) => sameRoute(page.url(), route));
+        const deadline = Date.now() + (caused ? (hasDynamicParts(target) ? Math.max(timeout, 30_000) : Math.min(timeout, 6_000)) : 0);
+        while (!arrived() && Date.now() < deadline && !context.isCancelled()) await page.waitForTimeout(250);
+        if (arrived()) {
+          await settle(page);
+          return null;
+        }
+        // Opening the recorded URL would show another run's record (an old order, an old basket).
+        if (caused && hasDynamicParts(target)) {
+          throw new Error(`The app did not go on to ${routeOf(target)} (it is on ${page.url()})`);
+        }
+        await page.goto(target, { waitUntil: "domcontentloaded", timeout: Math.max(timeout, 30_000) });
         await settle(page);
         return null;
       }
       case "click": {
         const located = await find();
+        // A choice (radio, payment method, tab…) is clicked to select it: nothing to do when it already
+        // is, and it must be selected afterwards — a click on its inner "details" button does not count.
+        const before = await selection(located.locator);
+        if (before === true) return { ...located, how: `${located.how} (already selected)` };
         try {
           await located.locator.click({ timeout });
         } catch (error) {
@@ -208,6 +265,14 @@ export class UiFlowExecutor implements StepExecutor {
           await located.locator.click({ timeout, force: true });
         }
         await settle(page);
+        if (before === false && (await selection(located.locator)) === false) {
+          // Its own radio button, then its start edge (away from inner buttons on the far side).
+          const radio = located.locator.locator('input[type="radio"], [role="radio"]').first();
+          if ((await radio.count().catch(() => 0)) > 0) await radio.click({ timeout, force: true }).catch(() => undefined);
+          else await located.locator.click({ timeout, position: { x: 8, y: 8 } }).catch(() => undefined);
+          await settle(page);
+          if ((await selection(located.locator)) === false) throw new Error("Clicked, but the option did not become selected");
+        }
         return located;
       }
       case "fill": {
@@ -441,4 +506,43 @@ export async function uiSessionState(context: ExecutionContext) {
   const session = context.resources.get(SESSION_KEY) as Session | undefined;
   if (!session || !session.browser.isConnected()) return undefined;
   return session.context.storageState().catch(() => undefined);
+}
+
+/** host/path of a URL with its codes shown as "…", for messages. */
+function routeOf(url: string) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.host}/${parsed.pathname.split("/").filter(Boolean).map((part) => (/\d/.test(part) && part.length >= 5 ? "…" : part)).join("/")}`;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Selected state of a single-choice option: aria-checked / aria-selected,
+ * a data-(is-)selected attribute, or its own radio button. Null for elements
+ * without one (plain buttons, links, checkboxes — whose click may mean "off").
+ */
+async function selection(locator: Locator): Promise<boolean | null> {
+  return locator
+    .evaluate((element) => {
+      const read = (node: Element) => {
+        const role = node.getAttribute("role");
+        if (role === "radio" || role === "option" || role === "tab") {
+          const value = node.getAttribute("aria-checked") ?? node.getAttribute("aria-selected");
+          if (value !== null) return value === "true";
+        }
+        for (const name of ["data-is-selected", "data-selected", "aria-selected"]) {
+          const value = node.getAttribute(name);
+          if (value === "true" || value === "false") return value === "true";
+        }
+        if (node instanceof HTMLInputElement && node.type === "radio") return node.checked;
+        return null;
+      };
+      const own = read(element);
+      if (own !== null) return own;
+      const radios = element.querySelectorAll('input[type="radio"], [role="radio"]');
+      return radios.length === 1 ? read(radios[0]!) : null;
+    })
+    .catch(() => null);
 }

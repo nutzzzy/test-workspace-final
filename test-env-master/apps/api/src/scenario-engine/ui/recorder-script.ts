@@ -203,6 +203,7 @@ export function recorderMain() {
 
   // Typing is collected per field and sent once.
   let pending: { element: Element; value: string } | null = null;
+  let lastPing = 0;
   const valueOf = (element: Element) =>
     (element as HTMLElement).isContentEditable ? clean((element as HTMLElement).innerText, 10_000) : (element as HTMLInputElement).value;
   const flush = () => {
@@ -220,6 +221,12 @@ export function recorderMain() {
       const field = (element as HTMLElement).isContentEditable ? editableRoot(element) : element;
       if (pending && pending.element !== field) flush();
       pending = { element: field, value: valueOf(field) };
+      // Typing is activity: a page change it causes (auto-submit) is not a separate "open URL".
+      const now = Date.now();
+      if (now - lastPing > 300) {
+        lastPing = now;
+        send({ kind: "__activity" });
+      }
     },
     true,
   );
@@ -414,11 +421,14 @@ export function pageErrorsMain(): string[] {
     ".error-message, .error, .errors, .alert-danger, .alert-error, .invalid-feedback, .text-danger, .form-error, .field-error, .toast-error, .ant-form-item-explain-error, .MuiFormHelperText-root.Mui-error",
   ];
   const out = new Set<string>();
+  const title = clean(document.title);
   for (const element of document.querySelectorAll(selectors.join(","))) {
+    // Route announcers (Next.js, Gatsby, …) read the page title out loud: not an error.
+    if (element.closest("next-route-announcer, #__next-route-announcer__, #gatsby-announcer")) continue;
     const rect = element.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) continue;
     const text = clean((element as HTMLElement).innerText);
-    if (text) out.add(text);
+    if (text && text !== title) out.add(text);
     if (out.size >= 5) break;
   }
   return [...out];
