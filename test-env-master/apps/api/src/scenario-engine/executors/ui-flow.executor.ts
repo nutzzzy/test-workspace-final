@@ -165,7 +165,9 @@ export class UiFlowExecutor implements StepExecutor {
       viewport: flow.viewport ?? { width: 1366, height: 860 },
       ignoreHTTPSErrors: false,
     });
+    browserContext.on("page", track);
     const page = await browserContext.newPage();
+    track(page);
     const session = { browser, context: browserContext, page };
     context.resources.set(SESSION_KEY, session);
     context.onDispose(async () => {
@@ -328,9 +330,45 @@ function fill(template: string, context: ExecutionContext): string {
   });
 }
 
-async function settle(page: Page) {
+/** Requests each page has in flight and when the last one ended (Playwright's "networkidle" does not reset after load). */
+const traffic = new WeakMap<Page, { inFlight: Set<unknown>; lastChange: number }>();
+
+function track(page: Page) {
+  if (traffic.has(page)) return;
+  const state = { inFlight: new Set<unknown>(), lastChange: Date.now() };
+  traffic.set(page, state);
+  const done = (request: unknown) => {
+    state.inFlight.delete(request);
+    state.lastChange = Date.now();
+  };
+  page.on("request", (request) => {
+    // Long-lived connections never finish and would hold every wait to the cap.
+    if (["websocket", "eventsource"].includes(request.resourceType())) return;
+    state.inFlight.add(request);
+    state.lastChange = Date.now();
+  });
+  page.on("requestfinished", done);
+  page.on("requestfailed", done);
+  page.on("framenavigated", () => (state.lastChange = Date.now()));
+}
+
+/**
+ * After an action: the page has loaded, and the requests it sent because of
+ * the action (a form's fetch, a redirect) are finished — quiet for a moment —
+ * so what the page shows afterwards (a message, a stored token) is there.
+ */
+async function settle(page: Page, { quietMs = 500, maxMs = 10_000 } = {}) {
+  track(page);
   await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => undefined);
-  await page.waitForLoadState("networkidle", { timeout: 2_500 }).catch(() => undefined);
+  const state = traffic.get(page)!;
+  const deadline = Date.now() + maxMs;
+  // Give a click's handler a moment to start its request.
+  await page.waitForTimeout(100).catch(() => undefined);
+  while (Date.now() < deadline && !page.isClosed()) {
+    if (state.inFlight.size === 0 && Date.now() - state.lastChange >= quietMs) break;
+    await page.waitForTimeout(100).catch(() => undefined);
+  }
+  await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => undefined);
 }
 
 async function pageFor(session: Session, tab: number, timeout: number): Promise<Page> {

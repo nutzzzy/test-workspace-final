@@ -236,7 +236,7 @@ export class HttpRequestExecutor implements StepExecutor {
         durationMs,
       };
       const learned = captureResponse(body, context, url.origin);
-      context.exchanges.push({ url: url.toString(), headers: { ...(headers ?? {}) }, status: response.status, setCookies: cookies });
+      context.exchanges.push({ stepId: context.currentStepId, url: url.toString(), headers: { ...(headers ?? {}) }, status: response.status, setCookies: cookies });
       if (context.exchanges.length > 200) context.exchanges.shift();
 
       const statusMismatch = expected && !expected.includes(response.status);

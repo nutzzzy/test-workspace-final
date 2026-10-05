@@ -97,7 +97,7 @@ export class ScenariosService {
    * with what they obtained: an earlier UI step's session, the cookies and
    * credential headers of earlier requests, and the storage entries the step names.
    */
-  async startRecording(scenarioId: string, body: { startUrl?: unknown; stepId?: unknown; signedIn?: unknown }) {
+  async startRecording(scenarioId: string, body: { startUrl?: unknown; stepId?: unknown; signedIn?: unknown; fromSteps?: unknown }) {
     const scenario = await this.get(scenarioId);
     const stepId = typeof body.stepId === "string" ? body.stepId : null;
     const step = stepId ? scenario.steps.find((item) => item.id === stepId && item.type === "UI_FLOW") : undefined;
@@ -110,9 +110,14 @@ export class ScenariosService {
       prepared = await this.runner.runBefore(scenarioId, before);
     }
     try {
-      const session = step ? readUiConfig(asRecord(step.config)) : null;
-      const seed = prepared ? seedFromContext(prepared.context, startUrl, session?.ok ? session.value.session : undefined) : undefined;
-      const storageState = prepared ? await uiSessionState(prepared.context) : undefined;
+      const saved = step ? readUiConfig(asRecord(step.config)) : null;
+      // The dialog's choice wins over the step's saved one: a list, or null for every earlier step.
+      const chosen = Array.isArray(body.fromSteps) ? body.fromSteps.filter((id): id is string => typeof id === "string") : body.fromSteps === null ? null : undefined;
+      const session = { ...(saved?.ok ? saved.value.session : {}), ...(chosen !== undefined ? { fromSteps: chosen ?? undefined } : {}) };
+      const seed = prepared ? seedFromContext(prepared.context, startUrl, session) : undefined;
+      // An earlier UI step's browser session counts only when that step is among the chosen ones.
+      const uiChosen = !session.fromSteps || earlier.some((item) => item.type === "UI_FLOW" && session.fromSteps!.includes(item.id));
+      const storageState = prepared && uiChosen ? await uiSessionState(prepared.context) : undefined;
       const { page: _page, ...view } = await this.recorder.start({ scenarioId, stepId, startUrl: body.startUrl }, { seed, storageState });
       return {
         ...view,

@@ -317,6 +317,7 @@ export function StepPanel({
           <UiActionsTab
             key={`${step.id}:${JSON.stringify(step.config).length}`}
             step={step}
+            steps={steps}
             earlierValues={(run?.stepRuns ?? [])
               .filter((item) => item.orderIndex < step.orderIndex)
               .flatMap((item) => ((outputOf(item) as { values?: EarlierValue[] } | null)?.values ?? []))

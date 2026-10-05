@@ -51,6 +51,8 @@ import type { StorageSeed } from "./ui/browser-session";
 import { ValueRegistry, type RegistryView } from "./flow/value-registry";
 
 export type HttpExchange = {
+  /** The step that sent it (to choose which steps' session a UI step uses). */
+  stepId?: string;
   url: string;
   headers: Record<string, string>;
   status: number;
@@ -78,6 +80,8 @@ export class ExecutionContext {
    * in memory only, so a later UI step can open its browser signed in.
    */
   readonly exchanges: HttpExchange[] = [];
+  /** The step being executed now. */
+  currentStepId: string | undefined;
   /** Things a run keeps between steps (the UI steps' browser session), closed by dispose(). */
   readonly resources = new Map<string, unknown>();
   private readonly disposers: Array<() => Promise<void> | void> = [];

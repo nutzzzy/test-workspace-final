@@ -32,6 +32,8 @@ export type StorageSeed = z.infer<typeof StorageSeedSchema>;
 export const SessionConfigSchema = z.object({
   /** Carry cookies and credential headers of earlier requests (default on). */
   fromEarlierSteps: z.boolean().optional(),
+  /** Only these earlier steps supply the session (cookies, headers, latest token); all when absent. */
+  fromSteps: z.array(z.string().max(100)).max(100).optional(),
   storage: z.array(StorageSeedSchema).max(20).optional(),
 });
 export type SessionConfig = z.infer<typeof SessionConfigSchema>;
@@ -75,10 +77,11 @@ function cookiePairs(header: string) {
     });
 }
 
-/** The latest token an earlier step received (accessToken, token, jwt, …; never a refresh token). */
-function latestToken(context: ExecutionContext): string | undefined {
+/** The latest token an earlier step (of the chosen ones) received (accessToken, token, jwt, …; never a refresh token). */
+function latestToken(context: ExecutionContext, from?: ReadonlySet<string>): string | undefined {
   const entries = context.registry
     .entries()
+    .filter((entry) => !from || (entry.stepId !== undefined && from.has(entry.stepId)))
     .filter((entry) => entry.kind === "body" && isTokenKey(entry.key) && !/refresh/i.test(entry.key) && entry.text.length >= 8);
   return entries.sort((a, b) => b.sequence - a.sequence)[0]?.text;
 }
@@ -94,6 +97,8 @@ function fillTemplate(template: string, context: ExecutionContext) {
 /** What the browser needs to start signed in, from what this run did so far. */
 export function seedFromContext(context: ExecutionContext, startUrl: string, config: SessionConfig | undefined): SessionSeed {
   const seed: SessionSeed = { cookies: [], headers: [], storage: [], missing: [] };
+  // Chosen steps only (an empty choice carries nothing); every earlier step when no choice was made.
+  const from = config?.fromSteps ? new Set(config.fromSteps) : undefined;
   if (config?.fromEarlierSteps !== false) {
     const cookies = new Map<string, BrowserCookie>();
     const headers = new Map<string, Record<string, string>>();
@@ -101,6 +106,7 @@ export function seedFromContext(context: ExecutionContext, startUrl: string, con
     for (const exchange of context.exchanges) {
       const origin = originOf(exchange.url);
       if (!origin || exchange.status >= 400) continue;
+      if (from && (!exchange.stepId || !from.has(exchange.stepId))) continue;
       for (const [name, value] of Object.entries(exchange.headers)) {
         if (name.toLowerCase() === "cookie") {
           for (const pair of cookiePairs(value)) cookies.set(`${origin}|${pair.name}`, { ...pair, url: origin });
@@ -117,7 +123,7 @@ export function seedFromContext(context: ExecutionContext, startUrl: string, con
   }
 
   const pageOrigin = originOf(startUrl);
-  const token = latestToken(context);
+  const token = latestToken(context, from);
   if (token) seed.token = token;
   // No key named yet: put the token where single-page apps usually look for it.
   if (config?.fromEarlierSteps !== false && !(config?.storage?.length) && token && pageOrigin) {
@@ -133,7 +139,7 @@ export function seedFromContext(context: ExecutionContext, startUrl: string, con
     } else if (item.value) {
       value = fillTemplate(item.value, context);
     } else {
-      value = latestToken(context);
+      value = latestToken(context, from);
     }
     if (value === undefined || !pageOrigin) {
       seed.missing.push(`${item.area}.${item.key}`);

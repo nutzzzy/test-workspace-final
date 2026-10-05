@@ -127,6 +127,7 @@ export function UiRecordDialog({
   scenarioId,
   step,
   earlierSteps,
+  steps,
   onClose,
   onSaved,
 }: {
@@ -134,6 +135,8 @@ export function UiRecordDialog({
   step?: Step | null;
   /** Steps that run before this one (they can sign the browser in). */
   earlierSteps: number;
+  /** All steps of the precondition, for choosing which supply the session. */
+  steps: Step[];
   onClose: () => void;
   onSaved: (step: Step) => void | Promise<void>;
 }) {
@@ -144,6 +147,9 @@ export function UiRecordDialog({
   const [startUrl, setStartUrl] = useState(String(step?.config.startUrl ?? ""));
   const [mode, setMode] = useState<"append" | "replace">("append");
   const [signedIn, setSignedIn] = useState(true);
+  const sources = sessionSources(steps, step ? step.orderIndex : null);
+  const savedFrom = ((step?.config.session ?? {}) as { fromSteps?: string[] }).fromSteps;
+  const [fromSteps, setFromSteps] = useState<string[] | null>(savedFrom?.length ? savedFrom : null);
   const [recording, setRecording] = useState<Recording | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -185,7 +191,12 @@ export function UiRecordDialog({
       setRecording(
         await api<Recording>(`/scenarios/${scenarioId}/ui-recordings`, {
           method: "POST",
-          body: JSON.stringify({ startUrl: url, signedIn: earlierSteps > 0 && signedIn, ...(step ? { stepId: step.id } : {}) }),
+          body: JSON.stringify({
+            startUrl: url,
+            signedIn: earlierSteps > 0 && signedIn,
+            fromSteps,
+            ...(step ? { stepId: step.id } : {}),
+          }),
         }),
       );
     });
@@ -286,6 +297,9 @@ export function UiRecordDialog({
                 </span>
               </label>
             ) : null}
+            {earlierSteps > 0 && signedIn && sources.length > 1 ? (
+              <SourceChooser sources={sources} steps={steps} value={fromSteps} onChange={setFromSteps} />
+            ) : null}
             <ul className="list-disc space-y-0.5 ps-4 text-[11px] text-muted-foreground">
               <li>{t("uiStep.tip1")}</li>
               <li>{t("uiStep.tip2")}</li>
@@ -325,6 +339,55 @@ export function UiRecordDialog({
         ) : null}
       </div>
     </Dialog>
+  );
+}
+
+/** Earlier steps that can supply the session: HTTP calls (e.g. imported cURL) and UI steps. */
+export const sessionSources = (steps: Step[], before: number | null) =>
+  steps.filter((item) => (item.type === "HTTP_REQUEST" || item.type === "UI_FLOW") && (before === null || item.orderIndex < before));
+
+/** Choose which earlier steps the browser takes cookies, headers and the token from. */
+function SourceChooser({ sources, steps, value, onChange }: { sources: Step[]; steps: Step[]; value: string[] | null; onChange: (next: string[] | null) => void }) {
+  const { t, n } = useI18n();
+  const number = (step: Step) => steps.findIndex((item) => item.id === step.id) + 1;
+  return (
+    <fieldset className="space-y-1.5">
+      <legend className="text-xs">{t("uiStep.sourcesTitle")}</legend>
+      <label className="flex items-center gap-1.5 text-xs">
+        <input type="radio" checked={value === null} onChange={() => onChange(null)} />
+        {t("uiStep.sourcesAll")}
+      </label>
+      <label className="flex items-center gap-1.5 text-xs">
+        <input type="radio" checked={value !== null} onChange={() => onChange(sources.slice(-1).map((item) => item.id))} />
+        {t("uiStep.sourcesOnly")}
+      </label>
+      {value !== null ? (
+        <ul className="max-h-44 space-y-0.5 overflow-auto ps-5">
+          {sources.map((item) => {
+            const method = typeof item.config.method === "string" ? item.config.method.toUpperCase() : "";
+            const where = String(item.type === "UI_FLOW" ? (item.config.startUrl ?? "") : (item.config.url ?? ""));
+            return (
+              <li key={item.id}>
+                <label className="flex min-w-0 items-center gap-1.5 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={value.includes(item.id)}
+                    onChange={(event) => onChange(event.target.checked ? [...value, item.id] : value.filter((id) => id !== item.id))}
+                  />
+                  <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{n(number(item))}</span>
+                  <span className="shrink-0 font-mono text-[10px] font-semibold text-primary">{item.type === "UI_FLOW" ? "UI" : method}</span>
+                  <span className="min-w-0 truncate">{item.name}</span>
+                  <span className="hidden min-w-0 truncate font-mono text-[10px] text-muted-foreground sm:inline" dir="ltr">
+                    {where}
+                  </span>
+                </label>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+      {value !== null && value.length === 0 ? <p className="ps-5 text-[11px] text-warning">{t("uiStep.sourcesNone")}</p> : null}
+    </fieldset>
   );
 }
 
@@ -389,11 +452,13 @@ export function SignedInSummary({ signedIn }: { signedIn: SignedIn }) {
 /** The Actions tab of a UI step: what it does, editable; record more. */
 export function UiActionsTab({
   step,
+  steps,
   earlierValues,
   onSave,
   onRecordMore,
 }: {
   step: Step;
+  steps: Step[];
   /** Values earlier steps produced in the last run, to put into page storage. */
   earlierValues: EarlierValue[];
   onSave: (config: Record<string, unknown>) => Promise<void>;
@@ -405,9 +470,11 @@ export function UiActionsTab({
   const [timeout, setTimeoutValue] = useState(String(step.config.actionTimeoutMs ?? 15000));
   const [newSession, setNewSession] = useState(step.config.newSession === true);
   const [failOnPageError, setFailOnPageError] = useState(step.config.failOnPageError !== false);
-  const savedSession = (step.config.session ?? {}) as { fromEarlierSteps?: boolean; storage?: StorageSeed[] };
+  const savedSession = (step.config.session ?? {}) as { fromEarlierSteps?: boolean; fromSteps?: string[]; storage?: StorageSeed[] };
   const [fromEarlier, setFromEarlier] = useState(savedSession.fromEarlierSteps !== false);
   const [storage, setStorage] = useState<StorageSeed[]>(savedSession.storage ?? []);
+  const [fromSteps, setFromSteps] = useState<string[] | null>(savedSession.fromSteps?.length ? savedSession.fromSteps : null);
+  const sources = sessionSources(steps, step.orderIndex);
   const patchSeed = (index: number, value: Partial<StorageSeed>) => {
     setStorage(storage.map((item, at) => (at === index ? { ...item, ...value } : item)));
     setDirty(true);
@@ -441,9 +508,13 @@ export function UiActionsTab({
         newSession: newSession || undefined,
         failOnPageError: failOnPageError ? undefined : false,
         session:
-          fromEarlier && storage.length === 0
+          fromEarlier && storage.length === 0 && !fromSteps
             ? undefined
-            : { ...(fromEarlier ? {} : { fromEarlierSteps: false }), ...(storage.length ? { storage: storage.filter((item) => item.key.trim()) } : {}) },
+            : {
+                ...(fromEarlier ? {} : { fromEarlierSteps: false }),
+                ...(fromSteps ? { fromSteps } : {}),
+                ...(storage.length ? { storage: storage.filter((item) => item.key.trim()) } : {}),
+              },
       });
       setDirty(false);
     } finally {
@@ -545,7 +616,7 @@ export function UiActionsTab({
         ))}
       </div>
 
-      <details className="rounded-md border border-border" open={storage.length > 0 || !fromEarlier}>
+      <details className="rounded-md border border-border" open={storage.length > 0 || !fromEarlier || fromSteps !== null}>
         <summary className="cursor-pointer px-3 py-2 text-xs font-medium">{t("uiStep.signIn")}</summary>
         <div className="space-y-3 px-3 pb-3">
           <label className="flex items-start gap-2 text-xs">
@@ -563,6 +634,19 @@ export function UiActionsTab({
               <span className="block text-[11px] text-muted-foreground">{t("uiStep.fromEarlierHint")}</span>
             </span>
           </label>
+          {sources.length > 0 ? (
+            <SourceChooser
+              sources={sources}
+              steps={steps}
+              value={fromSteps}
+              onChange={(next) => {
+                setFromSteps(next);
+                setDirty(true);
+              }}
+            />
+          ) : (
+            <p className="text-[11px] text-muted-foreground">{t("uiStep.sourcesEmpty")}</p>
+          )}
           <div className="space-y-1.5">
             <p className="text-xs">{t("uiStep.storageTitle")}</p>
             <p className="text-[11px] text-muted-foreground">{t("uiStep.storageHint")}</p>

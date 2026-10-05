@@ -115,6 +115,18 @@ beforeAll(async () => {
             .then((r) => r.json()).then((d) => (document.getElementById("p").textContent = d.name ? "Profile: " + d.name : "Signed out"));
         </script>`);
       }
+      // Two users: each login gives its own token and session cookie.
+      if (url.pathname === "/api/login-as") {
+        const user = url.searchParams.get("u") ?? "0";
+        res.writeHead(200, { "content-type": "application/json", "set-cookie": `uid=user-${user}; Path=/` });
+        return res.end(JSON.stringify({ accessToken: `tok-user-${user}-000000` }));
+      }
+      if (url.pathname === "/whoami") {
+        const cookie = /uid=(user-\d)/.exec(req.headers.cookie ?? "")?.[1] ?? "nobody";
+        return html(`<p id="c">cookie:${cookie}</p><p id="t"></p><script>
+          document.getElementById("t").textContent = "token:" + (localStorage.getItem("token") || "none");
+        </script>`);
+      }
       if (url.pathname === "/api/orders") {
         return req.headers.authorization === "Bearer tok-ui-123456789" ? json(200, { orders: [] }) : json(401, { message: "invalid token" });
       }
@@ -399,5 +411,52 @@ describeUi("UI steps open signed in with what earlier (cURL) steps obtained", ()
     expect(await started.page.textContent("h1")).toBe("Hello QA");
     await recorder.discard(started.id);
     await context.dispose();
+  });
+});
+
+describeUi("choosing which earlier steps sign the UI step in", () => {
+  const loginAs = (user: number, orderIndex: number): OrchestrationStep => ({
+    id: `login-${user}`,
+    name: `login as ${user}`,
+    type: "HTTP_REQUEST",
+    enabled: true,
+    orderIndex,
+    config: { method: "POST", url: `${base}/api/login-as?u=${user}`, body: {} },
+  });
+  const whoami = (session?: Record<string, unknown>): OrchestrationStep => ({
+    id: "ui",
+    name: "who am I",
+    type: "UI_FLOW",
+    enabled: true,
+    orderIndex: 2,
+    config: sealUiConfig(
+      { startUrl: `${base}/whoami`, actions: [{ id: "a", kind: "waitForText", value: "token:" }], actionTimeoutMs: 5000, newSession: true, ...(session ? { session } : {}) },
+      null,
+      encrypt,
+    ),
+  });
+  const shown = (result: OrchestrationStepResult) => (result.output as { body: { localStorage: Record<string, string> } }).body;
+
+  it("by default the latest step's user (all earlier steps, newest wins)", async () => {
+    const { results } = await run([loginAs(1, 0), loginAs(2, 1), whoami()]);
+    expect(results[2]).toMatchObject({ status: "PASSED" });
+    expect(shown(results[2]!).localStorage.token).toBe("tok-user-2-000000");
+    expect((results[2]!.output as { signedIn: { cookies: string[] } }).signedIn.cookies).toEqual([expect.stringMatching(/^uid /)]);
+  });
+
+  it("only the chosen step's cookies and token", async () => {
+    const { results, context } = await run([loginAs(1, 0), loginAs(2, 1), whoami({ fromSteps: ["login-1"] })]);
+    expect(results[2]).toMatchObject({ status: "PASSED" });
+    // The page saw user 1: its cookie and its token, not user 2's.
+    const page = context.registry.entries().filter((entry) => entry.stepId === "ui");
+    expect(page.find((entry) => entry.path === "response.cookies.uid")?.text).toBe("user-1");
+    expect(page.find((entry) => entry.path === "response.body.localStorage.token")?.text).toBe("tok-user-1-000000");
+  });
+
+  it("the other one when that one is chosen", async () => {
+    const { context } = await run([loginAs(1, 0), loginAs(2, 1), whoami({ fromSteps: ["login-2"] })]);
+    const page = context.registry.entries().filter((entry) => entry.stepId === "ui");
+    expect(page.find((entry) => entry.path === "response.cookies.uid")?.text).toBe("user-2");
+    expect(page.find((entry) => entry.path === "response.body.localStorage.token")?.text).toBe("tok-user-2-000000");
   });
 });

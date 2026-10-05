@@ -112,6 +112,7 @@ export async function orchestrateSteps(
     }
 
     const started = Date.now();
+    context.currentStepId = step.id;
     let pausedMs = 0;
     let result: StepExecutionResult;
     try {
