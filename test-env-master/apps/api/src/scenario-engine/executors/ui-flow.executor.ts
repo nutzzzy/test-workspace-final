@@ -3,6 +3,7 @@ import { lookup } from "../auto-bind";
 import type { ExecutionContext, StepExecutionResult, StepExecutor } from "../types";
 import { pageErrorsMain } from "../ui/recorder-script";
 import { describeCandidate, launchBrowser, locate, type Located } from "../ui/ui-browser";
+import { applySeed, describeSeed, learnTokenPlace, seedFromContext, type StorageSeed } from "../ui/browser-session";
 import { describeAction, readUiConfig, type LocatorCandidate, type UiAction, type UiFlowConfig } from "../ui/ui-types";
 
 /** One replayed action, as shown in the step result. */
@@ -28,7 +29,7 @@ export type UiProduced = { url: string; body: Record<string, unknown>; cookies: 
 
 type Session = { browser: Browser; context: BrowserContext; page: Page };
 
-const SESSION_KEY = "ui-session";
+export const SESSION_KEY = "ui-session";
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_SCREENSHOT_BYTES = 450_000;
 
@@ -60,9 +61,16 @@ export class UiFlowExecutor implements StepExecutor {
 
     let failure: string | undefined;
     let page = session.page;
+    let signedIn: ReturnType<typeof describeSeed> | undefined;
+    let seeded: { token?: string; guessed?: string[] } = {};
     try {
       // Recording started at the start URL, so replay does too (the session's cookies are kept).
       const startUrl = fill(flow.startUrl, context);
+      // Signed in as the earlier steps were: their cookies, credential headers and the storage entries the step names.
+      const seed = seedFromContext(context, startUrl, flow.session);
+      await applySeed(session.context, seed);
+      signedIn = describeSeed(seed);
+      seeded = { token: seed.token, guessed: seed.guessed };
       await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: Math.max(timeout, 30_000) });
       await settle(page);
 
@@ -111,6 +119,8 @@ export class UiFlowExecutor implements StepExecutor {
         failure = `The page shows an error: ${newErrors[0]}`;
       }
       const produced = await this.produced(session, page);
+      // The app's own place for the token, once it shows: used instead of guessing next time.
+      const tokenPlace = flow.session?.storage?.length ? null : learnTokenPlace(produced.body as never, seeded.token, seeded.guessed);
       const screenshot = await shot(page);
       return {
         status: failure ? "FAILED" : "PASSED",
@@ -121,6 +131,7 @@ export class UiFlowExecutor implements StepExecutor {
           url: page.url(),
           title: await page.title().catch(() => ""),
           actions: results,
+          ...(signedIn && (signedIn.cookies.length || signedIn.headers.length || signedIn.storage.length || signedIn.missing) ? { signedIn } : {}),
           ...(pageErrors.length ? { pageErrors } : {}),
           ...(screenshot ? { screenshot } : {}),
           // Shown like a response: later steps map values from it.
@@ -129,6 +140,7 @@ export class UiFlowExecutor implements StepExecutor {
         },
         uiProduced: produced,
         uiLearned: learned,
+        ...(tokenPlace && !failure ? { uiLearnedStorage: tokenPlace } : {}),
       };
     } catch (error) {
       const message = error instanceof Error ? firstLine(error.message) : "UI step failed";
@@ -385,3 +397,10 @@ function firstLine(message: string) {
 }
 
 export { describeCandidate };
+
+/** Cookies and storage of the run's UI browser, to hand a session over to a recording. */
+export async function uiSessionState(context: ExecutionContext) {
+  const session = context.resources.get(SESSION_KEY) as Session | undefined;
+  if (!session || !session.browser.isConnected()) return undefined;
+  return session.context.storageState().catch(() => undefined);
+}

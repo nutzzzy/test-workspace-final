@@ -3,6 +3,7 @@ import { BadRequestException, Injectable, Logger, NotFoundException, type OnModu
 import type { Browser, BrowserContext, Frame, Page } from "playwright-core";
 import { z } from "zod";
 import { launchBrowser } from "./ui-browser";
+import { applySeed, type SessionSeed } from "./browser-session";
 import { recorderMain } from "./recorder-script";
 import { describeAction, FingerprintSchema, LocatorCandidateSchema, SECRET_PLACEHOLDER, type UiAction } from "./ui-types";
 
@@ -53,7 +54,10 @@ export class UiRecorderService implements OnModuleDestroy {
   private readonly sessions = new Map<string, Session>();
 
   /** `headless` is for tests: the page is then driven by the test instead of a person. */
-  async start(input: { scenarioId: string; stepId?: string | null; startUrl: unknown }, options: { headless?: boolean } = {}) {
+  async start(
+    input: { scenarioId: string; stepId?: string | null; startUrl: unknown },
+    options: { headless?: boolean; seed?: SessionSeed; storageState?: Awaited<ReturnType<BrowserContext["storageState"]>> } = {},
+  ) {
     const startUrl = typeof input.startUrl === "string" ? input.startUrl.trim() : "";
     if (!/^https?:\/\//i.test(startUrl)) throw new BadRequestException("Enter the start URL (http:// or https://)");
     const active = [...this.sessions.values()].filter((session) => session.state === "recording");
@@ -65,7 +69,9 @@ export class UiRecorderService implements OnModuleDestroy {
     } catch (error) {
       throw new BadRequestException(error instanceof Error ? error.message : "Could not open the browser");
     }
-    const context = await browser.newContext({ viewport: null });
+    // Signed in as the steps before it left things: an earlier UI step's session, and the earlier requests' cookies and headers.
+    const context = await browser.newContext({ viewport: null, ...(options.storageState ? { storageState: options.storageState } : {}) });
+    if (options.seed) await applySeed(context, options.seed);
     const session: Session = {
       id: randomUUID(),
       scenarioId: input.scenarioId,

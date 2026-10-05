@@ -2,6 +2,7 @@ import { AssertionExecutor } from "./executors/assertion.executor";
 import { ExtractVariableExecutor } from "./executors/extract-variable.executor";
 import { expectedStatuses as expectedStatusOf, HttpRequestExecutor } from "./executors/http-request.executor";
 import { UiFlowExecutor, type UiLearning } from "./executors/ui-flow.executor";
+import type { StorageSeed } from "./ui/browser-session";
 import { applyBindings, readBindings, upsertBinding, verifyBindings, type StepBinding } from "./flow/bindings";
 import {
   buildManualOptions,
@@ -63,8 +64,10 @@ export type OrchestrationOptions = {
   onSaveBindings?: (stepId: string, bindings: StepBinding[]) => Promise<void>;
   /** Optional model ranking of LOW candidates (`recovery.aiAssist`). */
   ranker?: SemanticRanker;
+  /** Leave the run's resources (UI browser) open; the caller disposes the context. */
+  keepResources?: boolean;
   /** Remember locators of a UI step that worked better than the saved ones. */
-  onLearnUi?: (stepId: string, learned: UiLearning[]) => Promise<void>;
+  onLearnUi?: (stepId: string, learned: UiLearning[], storage?: StorageSeed) => Promise<void>;
 };
 
 /** A user may try several values; this bounds a single step's manual loop. */
@@ -163,7 +166,7 @@ export async function orchestrateSteps(
     finalStatus = "CANCELLED";
   }
   // Browsers of UI steps live as long as the run.
-  await context.dispose();
+  if (!options.keepResources) await context.dispose();
 
   return { status: finalStatus, error: runError, stepResults };
 }
@@ -179,8 +182,10 @@ async function afterUiStep(
   context: ExecutionContext,
   options: OrchestrationOptions,
 ): Promise<StepExecutionResult> {
-  const { uiProduced, uiLearned, ...rest } = result;
-  if (uiLearned?.length && step.id && options.onLearnUi) await options.onLearnUi(step.id, uiLearned).catch(() => undefined);
+  const { uiProduced, uiLearned, uiLearnedStorage, ...rest } = result;
+  if ((uiLearned?.length || uiLearnedStorage) && step.id && options.onLearnUi) {
+    await options.onLearnUi(step.id, uiLearned ?? [], uiLearnedStorage).catch(() => undefined);
+  }
   if (rest.status !== "PASSED" || !uiProduced) return rest;
   let path = "";
   try {

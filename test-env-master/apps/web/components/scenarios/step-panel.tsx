@@ -21,7 +21,7 @@ import type { ConnectorChoice } from "@/components/scenarios/database-step-form"
 import { ManualRecovery, type ManualChoice } from "@/components/scenarios/manual-recovery";
 import { MappingPanel } from "@/components/scenarios/mapping-panel";
 import { ResponseErrorCard } from "@/components/scenarios/response-error";
-import { UiActionsTab, UiResultTab, type UiOutput } from "@/components/scenarios/ui-step";
+import { UiActionsTab, UiResultTab, type EarlierValue, type UiOutput } from "@/components/scenarios/ui-step";
 import { RequestEditor, RequestView } from "@/components/scenarios/request-tab";
 import { ResponseExplorer } from "@/components/scenarios/response-explorer";
 import { AssertionsTab, StepSettings } from "@/components/scenarios/step-settings";
@@ -317,6 +317,10 @@ export function StepPanel({
           <UiActionsTab
             key={`${step.id}:${JSON.stringify(step.config).length}`}
             step={step}
+            earlierValues={(run?.stepRuns ?? [])
+              .filter((item) => item.orderIndex < step.orderIndex)
+              .flatMap((item) => ((outputOf(item) as { values?: EarlierValue[] } | null)?.values ?? []))
+              .slice(0, 200)}
             onSave={(config) => actions.saveStep(step.id, { config })}
             onRecordMore={() => actions.recordUi(step)}
           />

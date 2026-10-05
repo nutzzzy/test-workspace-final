@@ -622,6 +622,7 @@ export default function ScenariosPage() {
         <UiRecordDialog
           scenarioId={detail.id}
           step={uiRecord.step}
+          earlierSteps={steps.filter((item) => item.enabled && item.type !== "ASSERTION" && (!uiRecord.step || item.orderIndex < uiRecord.step.orderIndex)).length}
           onClose={() => setUiRecord(null)}
           onSaved={async (saved) => {
             toast.notify("success", t("uiStep.saved"));

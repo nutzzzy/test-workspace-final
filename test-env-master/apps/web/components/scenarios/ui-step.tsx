@@ -62,8 +62,11 @@ export type UiOutput = StepOutput & {
   actions?: UiActionResult[];
   pageErrors?: string[];
   screenshot?: string;
+  signedIn?: SignedIn;
   values?: Array<{ path: string; key: string; display: string; secret?: boolean }>;
 };
+
+type SignedIn = { cookies: string[]; headers: string[]; storage: string[]; guessed?: string[]; missing?: string[] };
 
 type Recording = {
   id: string;
@@ -71,7 +74,21 @@ type Recording = {
   error: string | null;
   startUrl: string;
   actions: Array<{ id: string; kind: UiAction["kind"]; label: string; secret?: boolean }>;
+  /** The earlier steps that ran so the browser opened signed in. */
+  prepared?: { status: string; steps: Array<{ name: string; status: string; error?: string }>; signedIn: SignedIn | null } | null;
 };
+
+/** A storage entry the step puts into the page before it loads (where the app keeps its token). */
+export type StorageSeed = {
+  area: "localStorage" | "sessionStorage";
+  key: string;
+  value?: string;
+  source?: { stepId?: string; stepName?: string; orderIndex: number; path: string };
+  jsonTemplate?: string;
+};
+
+/** A value an earlier step produced in its last run (masked when secret). */
+export type EarlierValue = { stepId?: string; stepName: string; orderIndex: number; path: string; key: string; display: string };
 
 const SECRET = "••••••";
 const input = "h-8 w-full min-w-0 rounded-md border border-border bg-background px-2 text-xs";
@@ -109,11 +126,14 @@ export function uiActions(config: Record<string, unknown>): UiAction[] {
 export function UiRecordDialog({
   scenarioId,
   step,
+  earlierSteps,
   onClose,
   onSaved,
 }: {
   scenarioId: string;
   step?: Step | null;
+  /** Steps that run before this one (they can sign the browser in). */
+  earlierSteps: number;
   onClose: () => void;
   onSaved: (step: Step) => void | Promise<void>;
 }) {
@@ -123,6 +143,7 @@ export function UiRecordDialog({
   const [name, setName] = useState("");
   const [startUrl, setStartUrl] = useState(String(step?.config.startUrl ?? ""));
   const [mode, setMode] = useState<"append" | "replace">("append");
+  const [signedIn, setSignedIn] = useState(true);
   const [recording, setRecording] = useState<Recording | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -164,7 +185,7 @@ export function UiRecordDialog({
       setRecording(
         await api<Recording>(`/scenarios/${scenarioId}/ui-recordings`, {
           method: "POST",
-          body: JSON.stringify({ startUrl: url, ...(step ? { stepId: step.id } : {}) }),
+          body: JSON.stringify({ startUrl: url, signedIn: earlierSteps > 0 && signedIn, ...(step ? { stepId: step.id } : {}) }),
         }),
       );
     });
@@ -256,6 +277,15 @@ export function UiRecordDialog({
                 </label>
               </fieldset>
             )}
+            {earlierSteps > 0 ? (
+              <label className="flex items-start gap-2 rounded-md border border-border p-2 text-xs">
+                <input type="checkbox" className="mt-0.5" checked={signedIn} onChange={(event) => setSignedIn(event.target.checked)} />
+                <span>
+                  {t("uiStep.signedInRecord", { count: n(earlierSteps) })}
+                  <span className="block text-[11px] text-muted-foreground">{t("uiStep.signedInRecordHint")}</span>
+                </span>
+              </label>
+            ) : null}
             <ul className="list-disc space-y-0.5 ps-4 text-[11px] text-muted-foreground">
               <li>{t("uiStep.tip1")}</li>
               <li>{t("uiStep.tip2")}</li>
@@ -269,6 +299,7 @@ export function UiRecordDialog({
               {active ? t("uiStep.recording") : t("uiStep.stopped", { count: n(count) })}
             </p>
             {recording.error ? <p className="text-xs text-warning">{err(recording.error)}</p> : null}
+            {recording.prepared ? <PreparedNote prepared={recording.prepared} /> : null}
             {count === 0 ? (
               <p className="rounded-md border border-dashed border-border px-3 py-6 text-center text-xs text-muted-foreground">{t("uiStep.waiting")}</p>
             ) : (
@@ -297,13 +328,74 @@ export function UiRecordDialog({
   );
 }
 
+/** Which earlier steps ran for a signed-in recording, and what the browser got from them. */
+function PreparedNote({ prepared }: { prepared: NonNullable<Recording["prepared"]> }) {
+  const { t, n, err, label } = useI18n();
+  const failed = prepared.steps.find((item) => item.status !== "PASSED" && item.status !== "SKIPPED");
+  return (
+    <div className={cn("space-y-1 rounded-md border px-2 py-1.5 text-[11px]", failed ? "border-warning/50 bg-warning/5" : "border-primary/40 bg-primary/5")}>
+      <p>{t("uiStep.preparedSteps", { count: n(prepared.steps.length) })}</p>
+      {failed ? (
+        <p className="text-warning">
+          {t("uiStep.preparedFailed", { name: failed.name, status: label("status", failed.status) })}
+          {failed.error ? ` — ${err(failed.error)}` : ""}
+        </p>
+      ) : null}
+      {prepared.signedIn ? <SignedInSummary signedIn={prepared.signedIn} /> : null}
+    </div>
+  );
+}
+
+/** Names (never values) of the cookies, headers and storage entries the browser started with. */
+export function SignedInSummary({ signedIn }: { signedIn: SignedIn }) {
+  const { t } = useI18n();
+  const empty = !signedIn.cookies.length && !signedIn.headers.length && !signedIn.storage.length && !signedIn.guessed?.length;
+  return (
+    <div className="space-y-0.5">
+      {empty ? <p className="text-muted-foreground">{t("uiStep.signedInNothing")}</p> : null}
+      {signedIn.cookies.length ? (
+        <p>
+          <span className="text-muted-foreground">{t("uiStep.signedInCookies")}: </span>
+          <span className="font-mono" dir="ltr">{signedIn.cookies.join(", ")}</span>
+        </p>
+      ) : null}
+      {signedIn.headers.length ? (
+        <p>
+          <span className="text-muted-foreground">{t("uiStep.signedInHeaders")}: </span>
+          <span className="font-mono" dir="ltr">{signedIn.headers.join(", ")}</span>
+        </p>
+      ) : null}
+      {signedIn.storage.length ? (
+        <p>
+          <span className="text-muted-foreground">{t("uiStep.signedInStorage")}: </span>
+          <span className="font-mono" dir="ltr">{signedIn.storage.join(", ")}</span>
+        </p>
+      ) : null}
+      {signedIn.guessed?.length ? (
+        <p>
+          <span className="text-muted-foreground">{t("uiStep.signedInGuessed")}: </span>
+          <span className="font-mono" dir="ltr">{signedIn.guessed.map((item) => item.replace(/^localStorage\./, "")).join(", ")}</span>
+        </p>
+      ) : null}
+      {signedIn.missing?.length ? (
+        <p className="text-warning">
+          {t("uiStep.signedInMissing")}: <span className="font-mono" dir="ltr">{signedIn.missing.join(", ")}</span>
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 /** The Actions tab of a UI step: what it does, editable; record more. */
 export function UiActionsTab({
   step,
+  earlierValues,
   onSave,
   onRecordMore,
 }: {
   step: Step;
+  /** Values earlier steps produced in the last run, to put into page storage. */
+  earlierValues: EarlierValue[];
   onSave: (config: Record<string, unknown>) => Promise<void>;
   onRecordMore: () => void;
 }) {
@@ -313,6 +405,13 @@ export function UiActionsTab({
   const [timeout, setTimeoutValue] = useState(String(step.config.actionTimeoutMs ?? 15000));
   const [newSession, setNewSession] = useState(step.config.newSession === true);
   const [failOnPageError, setFailOnPageError] = useState(step.config.failOnPageError !== false);
+  const savedSession = (step.config.session ?? {}) as { fromEarlierSteps?: boolean; storage?: StorageSeed[] };
+  const [fromEarlier, setFromEarlier] = useState(savedSession.fromEarlierSteps !== false);
+  const [storage, setStorage] = useState<StorageSeed[]>(savedSession.storage ?? []);
+  const patchSeed = (index: number, value: Partial<StorageSeed>) => {
+    setStorage(storage.map((item, at) => (at === index ? { ...item, ...value } : item)));
+    setDirty(true);
+  };
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -341,6 +440,10 @@ export function UiActionsTab({
         actionTimeoutMs: Number.isInteger(timeoutMs) && timeoutMs >= 1000 ? timeoutMs : 15000,
         newSession: newSession || undefined,
         failOnPageError: failOnPageError ? undefined : false,
+        session:
+          fromEarlier && storage.length === 0
+            ? undefined
+            : { ...(fromEarlier ? {} : { fromEarlierSteps: false }), ...(storage.length ? { storage: storage.filter((item) => item.key.trim()) } : {}) },
       });
       setDirty(false);
     } finally {
@@ -442,6 +545,112 @@ export function UiActionsTab({
         ))}
       </div>
 
+      <details className="rounded-md border border-border" open={storage.length > 0 || !fromEarlier}>
+        <summary className="cursor-pointer px-3 py-2 text-xs font-medium">{t("uiStep.signIn")}</summary>
+        <div className="space-y-3 px-3 pb-3">
+          <label className="flex items-start gap-2 text-xs">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={fromEarlier}
+              onChange={(event) => {
+                setFromEarlier(event.target.checked);
+                setDirty(true);
+              }}
+            />
+            <span>
+              {t("uiStep.fromEarlier")}
+              <span className="block text-[11px] text-muted-foreground">{t("uiStep.fromEarlierHint")}</span>
+            </span>
+          </label>
+          <div className="space-y-1.5">
+            <p className="text-xs">{t("uiStep.storageTitle")}</p>
+            <p className="text-[11px] text-muted-foreground">{t("uiStep.storageHint")}</p>
+            {storage.map((item, index) => {
+              const mode = item.source ? "earlier" : item.value ? "text" : "auto";
+              return (
+                <div key={index} className="space-y-1.5 rounded-md border border-border p-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <select
+                      className={cn(input, "h-7 w-36")}
+                      aria-label={t("uiStep.storageArea")}
+                      value={item.area}
+                      onChange={(event) => patchSeed(index, { area: event.target.value as StorageSeed["area"] })}
+                    >
+                      <option value="localStorage">localStorage</option>
+                      <option value="sessionStorage">sessionStorage</option>
+                    </select>
+                    <input
+                      className={cn(input, "h-7 w-40 flex-1 font-mono")}
+                      dir="ltr"
+                      placeholder="auth_token"
+                      aria-label={t("uiStep.storageKey")}
+                      value={item.key}
+                      onChange={(event) => patchSeed(index, { key: event.target.value })}
+                    />
+                    <IconButton label={t("builder.flow.delete")} danger onClick={() => { setStorage(storage.filter((_, at) => at !== index)); setDirty(true); }}>
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </IconButton>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <select
+                      className={cn(input, "h-7 w-48")}
+                      aria-label={t("uiStep.storageValue")}
+                      value={mode === "earlier" ? `earlier:${item.source!.orderIndex}:${item.source!.path}` : mode}
+                      onChange={(event) => {
+                        const choice = event.target.value;
+                        if (choice === "auto") patchSeed(index, { source: undefined, value: undefined });
+                        else if (choice === "text") patchSeed(index, { source: undefined, value: item.value || "{{accessToken}}" });
+                        else {
+                          const picked = earlierValues.find((value) => `earlier:${value.orderIndex}:${value.path}` === choice);
+                          if (picked) patchSeed(index, { value: undefined, source: { stepId: picked.stepId, stepName: picked.stepName, orderIndex: picked.orderIndex, path: picked.path } });
+                        }
+                      }}
+                    >
+                      <option value="auto">{t("uiStep.valueAuto")}</option>
+                      <option value="text">{t("uiStep.valueText")}</option>
+                      {earlierValues.map((value) => (
+                        <option key={`${value.orderIndex}:${value.path}`} value={`earlier:${value.orderIndex}:${value.path}`}>
+                          {t("builder.flow.step", { n: n(value.orderIndex + 1) })} · {value.path.replace(/^response\.body\./, "")} · {value.display}
+                        </option>
+                      ))}
+                    </select>
+                    {mode === "text" ? (
+                      <input
+                        className={cn(input, "h-7 min-w-40 flex-1 font-mono")}
+                        dir="ltr"
+                        aria-label={t("uiStep.value")}
+                        value={item.value ?? ""}
+                        onChange={(event) => patchSeed(index, { value: event.target.value })}
+                      />
+                    ) : null}
+                  </div>
+                  <input
+                    className={cn(input, "h-7 font-mono")}
+                    dir="ltr"
+                    placeholder={t("uiStep.jsonTemplateHint")}
+                    aria-label={t("uiStep.jsonTemplate")}
+                    value={item.jsonTemplate ?? ""}
+                    onChange={(event) => patchSeed(index, { jsonTemplate: event.target.value || undefined })}
+                  />
+                </div>
+              );
+            })}
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                setStorage([...storage, { area: "localStorage", key: "" }]);
+                setDirty(true);
+              }}
+            >
+              <Plus className="h-3.5 w-3.5" />
+              {t("uiStep.storageAdd")}
+            </Button>
+          </div>
+        </div>
+      </details>
+
       <details className="rounded-md border border-border">
         <summary className="cursor-pointer px-3 py-2 text-xs font-medium">{t("uiStep.options")}</summary>
         <div className="space-y-2 px-3 pb-3">
@@ -538,6 +747,12 @@ export function UiResultTab({ output, error }: { output: UiOutput | null; error?
           </span>
           {output.title ? <span className="text-muted-foreground"> · {output.title}</span> : null}
         </p>
+      ) : null}
+      {output.signedIn ? (
+        <div className="rounded-md border border-border px-2 py-1.5 text-[11px]">
+          <p className="mb-0.5 font-medium">{t("uiStep.signedInTitle")}</p>
+          <SignedInSummary signedIn={output.signedIn} />
+        </div>
       ) : null}
       {healed > 0 ? (
         <p className="flex items-start gap-1.5 rounded-md border border-primary/40 bg-primary/5 px-2 py-1.5 text-[11px]">

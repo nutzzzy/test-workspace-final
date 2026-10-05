@@ -11,7 +11,9 @@ import { PrismaService } from "../prisma/prisma.service";
 import { ConfigService } from "@nestjs/config";
 import { encryptSecret, resolveEncryptionKey } from "../common/crypto.util";
 import { UiRecorderService } from "../scenario-engine/ui/ui-recorder.service";
-import { publicUiConfig, sealUiConfig } from "../scenario-engine/ui/ui-types";
+import { publicUiConfig, readUiConfig, sealUiConfig } from "../scenario-engine/ui/ui-types";
+import { describeSeed, seedFromContext } from "../scenario-engine/ui/browser-session";
+import { uiSessionState } from "../scenario-engine/executors/ui-flow.executor";
 import {
   isBinding,
   isResponseSource,
@@ -89,12 +91,36 @@ export class ScenariosService {
 
   // ── UI recording ──────────────────────────────────────────────────────
 
-  async startRecording(scenarioId: string, body: { startUrl?: unknown; stepId?: unknown }) {
+  /**
+   * Open the recording browser. With `signedIn` (default), the steps before
+   * the UI step run first — in memory, no run is saved — and the browser opens
+   * with what they obtained: an earlier UI step's session, the cookies and
+   * credential headers of earlier requests, and the storage entries the step names.
+   */
+  async startRecording(scenarioId: string, body: { startUrl?: unknown; stepId?: unknown; signedIn?: unknown }) {
     const scenario = await this.get(scenarioId);
     const stepId = typeof body.stepId === "string" ? body.stepId : null;
-    if (stepId && !scenario.steps.some((step) => step.id === stepId && step.type === "UI_FLOW")) throw new NotFoundException("Step not found");
-    const { page: _page, ...view } = await this.recorder.start({ scenarioId, stepId, startUrl: body.startUrl });
-    return view;
+    const step = stepId ? scenario.steps.find((item) => item.id === stepId && item.type === "UI_FLOW") : undefined;
+    if (stepId && !step) throw new NotFoundException("Step not found");
+    const before = step ? step.orderIndex : Number.MAX_SAFE_INTEGER;
+    const earlier = scenario.steps.filter((item) => item.enabled && item.orderIndex < before && item.type !== "ASSERTION");
+    const startUrl = typeof body.startUrl === "string" ? body.startUrl.trim() : "";
+    let prepared: Awaited<ReturnType<ScenarioRunner["runBefore"]>> | null = null;
+    if (body.signedIn !== false && earlier.length > 0 && /^https?:\/\//i.test(startUrl)) {
+      prepared = await this.runner.runBefore(scenarioId, before);
+    }
+    try {
+      const session = step ? readUiConfig(asRecord(step.config)) : null;
+      const seed = prepared ? seedFromContext(prepared.context, startUrl, session?.ok ? session.value.session : undefined) : undefined;
+      const storageState = prepared ? await uiSessionState(prepared.context) : undefined;
+      const { page: _page, ...view } = await this.recorder.start({ scenarioId, stepId, startUrl: body.startUrl }, { seed, storageState });
+      return {
+        ...view,
+        prepared: prepared ? { status: prepared.status, steps: prepared.ran, signedIn: seed ? describeSeed(seed) : null } : null,
+      };
+    } finally {
+      await prepared?.context.dispose();
+    }
   }
 
   recordingStatus(id: string) {

@@ -35,6 +35,8 @@ export type StepExecutionResult = {
   uiProduced?: UiProduced;
   /** UI step: locators that worked better than the remembered ones. */
   uiLearned?: UiLearning[];
+  /** UI step: where the app keeps its token (learned when it was found there). */
+  uiLearnedStorage?: StorageSeed;
 };
 
 import { isSecretKey, maskDeep } from "../common/mask.util";
@@ -45,7 +47,15 @@ import type { ExtractionOutcome } from "./flow/response-mapping";
 import type { AssertionCheck } from "./flow/recover-step";
 import type { ResponseError } from "./flow/body-error";
 import type { UiLearning, UiProduced } from "./executors/ui-flow.executor";
+import type { StorageSeed } from "./ui/browser-session";
 import { ValueRegistry, type RegistryView } from "./flow/value-registry";
+
+export type HttpExchange = {
+  url: string;
+  headers: Record<string, string>;
+  status: number;
+  setCookies: Record<string, string>;
+};
 
 export class ExecutionContext {
   private readonly variables = new Map<string, string>();
@@ -63,6 +73,11 @@ export class ExecutionContext {
   private varTypes = new Map<string, "number" | "boolean" | "json">();
   private cancelled = false;
   private readonly abortHandlers = new Set<() => void>();
+  /**
+   * HTTP requests this run sent (URL, headers, status, cookies received) —
+   * in memory only, so a later UI step can open its browser signed in.
+   */
+  readonly exchanges: HttpExchange[] = [];
   /** Things a run keeps between steps (the UI steps' browser session), closed by dispose(). */
   readonly resources = new Map<string, unknown>();
   private readonly disposers: Array<() => Promise<void> | void> = [];

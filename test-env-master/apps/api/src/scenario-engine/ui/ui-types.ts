@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SessionConfigSchema, type SessionConfig } from "./browser-session";
 
 /**
  * A UI step (UI_FLOW): actions recorded in a real browser and replayed in a
@@ -77,6 +78,8 @@ export type UiFlowConfig = {
   newSession?: boolean;
   /** Fail when an error message appears on the page after the last action. */
   failOnPageError?: boolean;
+  /** Start signed in with what earlier steps obtained (cookies, credential headers, storage). */
+  session?: SessionConfig;
 };
 
 const text = (max: number) => z.string().max(max);
@@ -129,6 +132,7 @@ export const UiFlowConfigSchema = z
     viewport: z.object({ width: z.number().int().min(320).max(3840), height: z.number().int().min(240).max(2160) }).optional(),
     newSession: z.boolean().optional(),
     failOnPageError: z.boolean().optional(),
+    session: SessionConfigSchema.optional(),
   })
   .passthrough();
 

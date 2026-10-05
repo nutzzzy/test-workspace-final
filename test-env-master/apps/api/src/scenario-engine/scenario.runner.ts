@@ -22,6 +22,7 @@ import { SetVariableExecutor } from "./executors/set-variable.executor";
 import { UiFlowExecutor, type UiLearning } from "./executors/ui-flow.executor";
 import { decryptSecret, resolveEncryptionKey } from "../common/crypto.util";
 import type { UiAction } from "./ui/ui-types";
+import type { StorageSeed } from "./ui/browser-session";
 import type { StepBinding } from "./flow/bindings";
 import { parseResolution, type ManualResolution } from "./flow/manual-recovery";
 import type { SemanticRanker } from "./flow/recover-step";
@@ -198,6 +199,39 @@ export class ScenarioRunner implements OnModuleInit {
     return this.getRun(prepared.runId);
   }
 
+  /**
+   * Run the steps before `beforeOrderIndex` in memory — no run is saved — so
+   * a UI recording can open signed in with what they obtained. The caller
+   * disposes the returned context (it may hold the UI steps' browser).
+   */
+  async runBefore(scenarioId: string, beforeOrderIndex: number) {
+    const found = await this.prisma.scenario.findUnique({
+      where: { id: scenarioId },
+      include: { steps: { orderBy: { orderIndex: "asc" } } },
+    });
+    if (!found) throw new NotFoundException("Scenario not found");
+    const envVars = found.environmentId ? await this.environments.getResolvedVariables(found.environmentId) : {};
+    const secretKeys = found.environmentId ? await this.environments.getSecretKeys(found.environmentId) : [];
+    const context = new ExecutionContext(envVars, { secretKeys });
+    const steps = found.steps.filter((step) => step.orderIndex < beforeOrderIndex);
+    const ran: Array<{ name: string; status: string; error?: string }> = [];
+    const result = await orchestrateSteps(
+      steps.map((step) => ({
+        id: step.id,
+        name: step.name,
+        type: step.type,
+        orderIndex: step.orderIndex,
+        enabled: step.enabled,
+        config: (step.config ?? {}) as Record<string, unknown>,
+      })),
+      this.registry,
+      context,
+      // The browser of earlier UI steps must outlive these steps: the recording takes over its session.
+      { stopOnFailure: true, keepResources: true, onStepComplete: (step) => void ran.push({ name: step.name, status: step.status, ...(step.error ? { error: step.error } : {}) }) },
+    ).catch((error: unknown) => ({ status: "FAILED" as const, error: error instanceof Error ? error.message : String(error), stepResults: [] }));
+    return { context, ran, status: result.status };
+  }
+
   /** Synchronous full run — useful for scripts / demos that await completion. */
   async run(scenarioId: string, options: RunOptions = {}) {
     const prepared = await this.prepareRun(scenarioId, options);
@@ -342,7 +376,7 @@ export class ScenarioRunner implements OnModuleInit {
     };
 
     /** A replay found an element another way: remember it, so the next run tries that first. */
-    const onLearnUi = async (stepId: string, learned: UiLearning[]) => {
+    const onLearnUi = async (stepId: string, learned: UiLearning[], storage?: StorageSeed) => {
       const current = await this.prisma.scenarioStep.findUnique({ where: { id: stepId } });
       if (!current) return;
       const config = (current.config ?? {}) as Record<string, unknown>;
@@ -356,9 +390,12 @@ export class ScenarioRunner implements OnModuleInit {
         }
         return { ...action, target: { ...action.target, learned: lesson.candidateIndex } };
       });
+      // Where the app keeps its token: named on the step, so it is no longer guessed.
+      const session = (config.session ?? {}) as { storage?: unknown[] };
+      const learnedSession = storage && !session.storage?.length ? { session: { ...session, storage: [storage] } } : {};
       await this.prisma.scenarioStep.update({
         where: { id: stepId },
-        data: { config: { ...config, actions: next } as unknown as Prisma.InputJsonValue },
+        data: { config: { ...config, actions: next, ...learnedSession } as unknown as Prisma.InputJsonValue },
       });
     };
 

@@ -10,6 +10,7 @@ import { ExecutionContext, type OrchestrationStep, type OrchestrationStepResult 
 import { browserPath } from "./ui-browser";
 import { UiRecorderService } from "./ui-recorder.service";
 import { publicUiConfig, sealUiConfig, SECRET_PLACEHOLDER, type UiAction } from "./ui-types";
+import { seedFromContext } from "./browser-session";
 
 /**
  * Real browser, real pages: a small app with a login form, a dashboard and an
@@ -77,6 +78,42 @@ beforeAll(async () => {
         const body = JSON.parse(raw || "{}");
         if (body.password !== "s3cret!" || body.role !== "qa" || body.remember !== true) return json(401, { message: "Wrong email or password" });
         return json(200, { token: "tok-ui-123456789", userId: 4242 });
+      }
+      // Sign-in by API (what a cURL step does): a token in the body and a session cookie.
+      if (url.pathname === "/api/session-login") {
+        res.writeHead(200, { "content-type": "application/json", "set-cookie": "sid=sess-777; Path=/; HttpOnly" });
+        return res.end(JSON.stringify({ data: { accessToken: "tok-api-555555555" } }));
+      }
+      if (url.pathname === "/api/profile") {
+        return req.headers.authorization === "Bearer tok-api-555555555" ? json(200, { name: "QA" }) : json(401, { message: "invalid token" });
+      }
+      // A server-rendered page behind the session cookie.
+      if (url.pathname === "/account") {
+        return html(/sid=sess-777/.test(req.headers.cookie ?? "") ? "<h1>Hello QA</h1>" : "<h1>Please sign in</h1>");
+      }
+      // A single-page app that keeps its token in localStorage.
+      if (url.pathname === "/spa") {
+        return html(`<p id="p">loading</p><script>
+          const token = localStorage.getItem("auth_token");
+          fetch("/api/profile", { headers: token ? { Authorization: "Bearer " + token } : {} })
+            .then((r) => r.json()).then((d) => (document.getElementById("p").textContent = d.name ? "Profile: " + d.name : "Signed out"));
+        </script>`);
+      }
+      // A page whose API calls carry no credential of their own (the browser adds it).
+      if (url.pathname === "/spa2") {
+        return html(`<p id="p">loading</p><script>
+          fetch("/api/profile").then((r) => r.json()).then((d) => (document.getElementById("p").textContent = d.name ? "Profile: " + d.name : "Signed out"));
+        </script>`);
+      }
+      // An app that reads the token from a common key and then keeps it in its own JSON entry.
+      if (url.pathname === "/spa3") {
+        return html(`<p id="p">loading</p><script>
+          const token = localStorage.getItem("token");
+          if (token) localStorage.setItem("app.session", JSON.stringify({ user: { name: "QA" }, auth: { jwt: token } }));
+          const session = JSON.parse(localStorage.getItem("app.session") || "{}");
+          fetch("/api/profile", { headers: session.auth ? { Authorization: "Bearer " + session.auth.jwt } : {} })
+            .then((r) => r.json()).then((d) => (document.getElementById("p").textContent = d.name ? "Profile: " + d.name : "Signed out"));
+        </script>`);
       }
       if (url.pathname === "/api/orders") {
         return req.headers.authorization === "Bearer tok-ui-123456789" ? json(200, { orders: [] }) : json(401, { message: "invalid token" });
@@ -251,5 +288,116 @@ describeUi("UI steps: record in a browser, replay in the background", () => {
     const sealed = sealUiConfig({ startUrl: recorded.startUrl, actions, actionTimeoutMs: 1500 }, null, encrypt);
     const { results } = await run([uiStep(sealed)]);
     expect(results[0]!.status).toBe("PASSED");
+  });
+});
+
+describeUi("UI steps open signed in with what earlier (cURL) steps obtained", () => {
+  const apiLogin: OrchestrationStep = {
+    id: "login",
+    name: "POST /api/session-login",
+    type: "HTTP_REQUEST",
+    enabled: true,
+    orderIndex: 0,
+    config: { method: "POST", url: "", body: { user: "qa" } },
+  };
+  const profile: OrchestrationStep = {
+    id: "profile",
+    name: "GET /api/profile",
+    type: "HTTP_REQUEST",
+    enabled: true,
+    orderIndex: 1,
+    config: {
+      method: "GET",
+      url: "",
+      headers: { Authorization: "Bearer old" },
+      bindings: [
+        {
+          target: { location: "header", field: "Authorization", key: "Authorization" },
+          source: { stepId: "login", stepName: "login", orderIndex: 0, path: "response.body.data.accessToken" },
+          origin: "manual",
+        },
+      ],
+    },
+  };
+  const check = (id: string, orderIndex: number, path: string, text: string, extra: Record<string, unknown> = {}): OrchestrationStep => ({
+    id,
+    name: `UI ${path}`,
+    type: "UI_FLOW",
+    enabled: true,
+    orderIndex,
+    config: sealUiConfig({ startUrl: `${base}${path}`, actions: [{ id: "a", kind: "assertText", value: text }], actionTimeoutMs: 5000, newSession: true, ...extra }, null, encrypt),
+  });
+  const withBase = () => [
+    { ...apiLogin, config: { ...apiLogin.config, url: `${base}/api/session-login` } },
+    { ...profile, config: { ...profile.config, url: `${base}/api/profile` } },
+  ];
+
+  it("a server page behind the session cookie the API login received", async () => {
+    const { results } = await run([...withBase(), check("ui", 2, "/account", "Hello QA")]);
+    expect(results.map((item) => item.status)).toEqual(["PASSED", "PASSED", "PASSED"]);
+    expect((results[2]!.output as { signedIn: { cookies: string[] } }).signedIn.cookies[0]).toMatch(/^sid \(127\.0\.0\.1:\d+\)$/);
+  });
+
+  it("a single-page app that reads the token from localStorage (the latest token, under the app's key)", async () => {
+    const { results } = await run([
+      ...withBase(),
+      check("ui", 2, "/spa", "Profile: QA", { session: { fromEarlierSteps: false, storage: [{ area: "localStorage", key: "auth_token" }] } }),
+    ]);
+    expect(results[2]).toMatchObject({ status: "PASSED" });
+    expect((results[2]!.output as { signedIn: { storage: string[] } }).signedIn.storage).toEqual(["localStorage.auth_token"]);
+  });
+
+  it("with no key named, the token goes where apps usually look (here auth_token)", async () => {
+    const { results } = await run([...withBase(), check("ui", 2, "/spa", "Profile: QA")]);
+    expect(results[2]).toMatchObject({ status: "PASSED" });
+    expect((results[2]!.output as { signedIn: { guessed: string[] } }).signedIn.guessed).toContain("localStorage.auth_token");
+  });
+
+  it("learns where the app keeps the token, so it is not guessed next time", async () => {
+    const learned: Array<{ stepId: string; learned: unknown }> = [];
+    const results: OrchestrationStepResult[] = [];
+    let storage: unknown;
+    await orchestrateSteps([...withBase(), check("ui", 2, "/spa3", "Profile: QA")], registry(), new ExecutionContext(), {
+      stopOnFailure: true,
+      onStepComplete: (result) => void results.push(result),
+      onLearnUi: async (stepId, items, place) => {
+        learned.push({ stepId, learned: items });
+        storage = place;
+      },
+    });
+    expect(results[2]).toMatchObject({ status: "PASSED" });
+    expect(storage).toEqual({ area: "localStorage", key: "app.session", jsonTemplate: '{"user":{"name":"QA"},"auth":{"jwt":"{{value}}"}}' });
+    // Next run with the learned entry: exactly the app's own key, nothing guessed.
+    const next = check("ui", 2, "/spa3", "Profile: QA", { session: { storage: [storage] } });
+    const again = await run([...withBase(), next]);
+    expect(again.results[2]).toMatchObject({ status: "PASSED" });
+    const signedIn = (again.results[2]!.output as { signedIn: { storage: string[]; guessed?: string[] } }).signedIn;
+    expect(signedIn.storage).toEqual(["localStorage.app.session"]);
+    expect(signedIn.guessed).toBeUndefined();
+  });
+
+  it("the page's API calls get the Authorization header the earlier request sent", async () => {
+    const { results } = await run([...withBase(), check("ui", 2, "/spa2", "Profile: QA")]);
+    expect(results[2]).toMatchObject({ status: "PASSED" });
+    expect((results[2]!.output as { signedIn: { headers: string[] } }).signedIn.headers[0]).toMatch(/^Authorization → 127\.0\.0\.1:\d+$/);
+  });
+
+  it("without the earlier steps' session the same page is signed out", async () => {
+    const { results } = await run([check("ui", 0, "/account", "Hello QA", { actionTimeoutMs: 1500 })]);
+    expect(results[0]!.status).toBe("FAILED");
+  });
+
+  it("the recording browser opens signed in too", async () => {
+    const context = new ExecutionContext();
+    await orchestrateSteps(withBase(), registry(), context, { stopOnFailure: true, keepResources: true });
+    const recorder = new UiRecorderService();
+    const started = await recorder.start(
+      { scenarioId: "s", startUrl: `${base}/account` },
+      { headless: true, seed: seedFromContext(context, `${base}/account`, undefined) },
+    );
+    await started.page.waitForLoadState("domcontentloaded");
+    expect(await started.page.textContent("h1")).toBe("Hello QA");
+    await recorder.discard(started.id);
+    await context.dispose();
   });
 });
