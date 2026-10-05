@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, FileUp, Plus, Search } from "lucide-react";
+import { ChevronDown, FileUp, Plus, Search, Wand2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
@@ -260,6 +260,23 @@ export default function ScenariosPage() {
       await refresh();
     });
 
+  /** Find which earlier response every unmapped field should use, and save the clear ones. */
+  const autoMap = (stepId?: string) =>
+    guarded(async () => {
+      if (!detail) return;
+      const result = await api<{ added: number; ambiguous: number; weak: number; usedResponses: boolean }>(`/scenarios/${detail.id}/dependencies/auto`, {
+        method: "POST",
+        body: JSON.stringify(stepId ? { stepId } : {}),
+      });
+      const parts = [
+        result.added > 0 ? t("builder.autoMap.added", { count: n(result.added) }) : t("builder.autoMap.none"),
+        result.ambiguous + result.weak > 0 ? t("builder.autoMap.left", { count: n(result.ambiguous + result.weak) }) : "",
+        result.usedResponses ? "" : t("builder.autoMap.runFirst"),
+      ].filter(Boolean);
+      toast.notify(result.added > 0 ? "success" : "info", parts.join(" "));
+      await refresh();
+    });
+
   const createStep = async (type: string, name: string, config: Record<string, unknown>) => {
     if (!detail) return;
     const created = await api<Step>(`/scenarios/${detail.id}/steps`, {
@@ -327,6 +344,7 @@ export default function ScenariosPage() {
       }),
     accept: (suggestion) => void accept([suggestion]),
     dismiss,
+    autoMap: (stepId) => void autoMap(stepId),
     addAssertion: (step, path, value) =>
       guarded(async () => {
         if (!detail) return;
@@ -494,6 +512,12 @@ export default function ScenariosPage() {
                     {t("builder.flow.title")}
                   </h2>
                   <div className="ms-auto flex flex-wrap gap-1.5">
+                    {steps.filter((step) => step.type === "HTTP_REQUEST").length > 1 ? (
+                      <Button size="sm" variant="outline" title={t("builder.autoMap.hint")} onClick={() => void autoMap()}>
+                        <Wand2 className="h-3.5 w-3.5" />
+                        {t("builder.autoMap.button")}
+                      </Button>
+                    ) : null}
                     <Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
                       <FileUp className="h-3.5 w-3.5" />
                       {t("builder.flow.importCurl")}

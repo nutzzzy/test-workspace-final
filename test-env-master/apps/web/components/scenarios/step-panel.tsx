@@ -20,6 +20,7 @@ import {
 import type { ConnectorChoice } from "@/components/scenarios/database-step-form";
 import { ManualRecovery, type ManualChoice } from "@/components/scenarios/manual-recovery";
 import { MappingPanel } from "@/components/scenarios/mapping-panel";
+import { ResponseErrorCard } from "@/components/scenarios/response-error";
 import { RequestEditor, RequestView } from "@/components/scenarios/request-tab";
 import { ResponseExplorer } from "@/components/scenarios/response-explorer";
 import { AssertionsTab, StepSettings } from "@/components/scenarios/step-settings";
@@ -41,6 +42,8 @@ export type StepActions = {
   deleteStep: (step: Step) => void;
   resolve: (choice: ManualChoice) => Promise<void>;
   skipInput: () => Promise<void>;
+  /** Detect and save the clear mappings of this step's unmapped fields. */
+  autoMap: (stepId?: string) => void;
 };
 
 /** Focused details of one step: request, response, mappings, assertions, attempts, advanced settings. */
@@ -211,6 +214,12 @@ export function StepPanel({
           )
         ) : null}
 
+        {output?.responseError && (tab === "response" || tab === "mapping") ? (
+          <div className="mb-3">
+            <ResponseErrorCard error={output.responseError} stepId={step.id} fields={fields} onPick={actions.pick} />
+          </div>
+        ) : null}
+
         {tab === "response" ? (
           !stepRun ? (
             <p className="rounded-md border border-dashed border-border px-3 py-6 text-center text-xs text-muted-foreground">
@@ -270,6 +279,7 @@ export function StepPanel({
             onRemove={(binding) => actions.removeBinding(step.id, binding)}
             onAccept={actions.accept}
             onDismiss={actions.dismiss}
+            onAutoMap={() => actions.autoMap(step.id)}
           />
         ) : null}
 
@@ -283,6 +293,12 @@ export function StepPanel({
               const config = { ...step.config };
               if (statuses.length === 0) delete config.expectedStatus;
               else config.expectedStatus = statuses.length === 1 ? statuses[0] : statuses;
+              await actions.saveStep(step.id, { config });
+            }}
+            onSaveBodyCheck={async (enabled) => {
+              const config = { ...step.config };
+              if (enabled) delete config.checkResponseBody;
+              else config.checkResponseBody = false;
               await actions.saveStep(step.id, { config });
             }}
             onDeleteAssertion={actions.deleteStep}

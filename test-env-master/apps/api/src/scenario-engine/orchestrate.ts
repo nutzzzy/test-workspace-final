@@ -259,6 +259,7 @@ async function runHttpStep(
       }),
   });
   let { result, recovery, state, checks } = outcome;
+  const { responseError } = outcome;
   if (state === "RECOVERED" && outcome.learned) options.learnedMappings.push(...outcome.learned);
 
   let pausedMs = 0;
@@ -390,8 +391,10 @@ async function runHttpStep(
   context.pendingPaths.clear();
 
   const finished = finish(result, state, recovery, checks, state === "NEEDS_INPUT" ? manual ?? buildManualOptions(request, recovery, context.registry, context.secretSet()) : undefined, produced, context);
+  // What the response said was wrong (for a recovered step: the first response), tied to the input and mapping.
+  const explained = responseError && state !== "PASSED" ? { ...finished, responseError: context.redact(responseError) as NonNullable<typeof responseError> } : finished;
   return {
-    result: extractions ? { ...finished, extractions } : finished,
+    result: extractions ? { ...explained, extractions } : explained,
     pausedMs,
   };
 }

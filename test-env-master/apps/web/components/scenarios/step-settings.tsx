@@ -35,12 +35,14 @@ export function AssertionsTab({
   attached,
   output,
   onSaveExpected,
+  onSaveBodyCheck,
   onDeleteAssertion,
 }: {
   step: Step;
   attached: Step[];
   output: StepOutput | null;
   onSaveExpected: (statuses: number[]) => Promise<void>;
+  onSaveBodyCheck: (enabled: boolean) => Promise<void>;
   onDeleteAssertion: (step: Step) => void;
 }) {
   const { t, label } = useI18n();
@@ -80,6 +82,18 @@ export function AssertionsTab({
             {t("builder.settings.save")}
           </Button>
         </form>
+        <label className="flex items-start gap-2 text-xs">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={step.config.checkResponseBody !== false}
+            onChange={(event) => void onSaveBodyCheck(event.target.checked)}
+          />
+          <span>
+            {t("builder.assertions.bodyCheck")}
+            <span className="block text-[11px] text-muted-foreground">{t("builder.assertions.bodyCheckHint")}</span>
+          </span>
+        </label>
       </section>
 
       {output?.assertions?.length ? (

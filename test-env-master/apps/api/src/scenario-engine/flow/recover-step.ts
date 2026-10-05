@@ -19,6 +19,8 @@ import {
   type RecoveryCandidate,
   type RecoveryTrace,
 } from "./recovery";
+import { readBindings } from "./bindings";
+import { assertsOnErrorMembers, describeResponseError, detectBodyError, type ResponseError } from "./body-error";
 import { listInputTargets, setInput, type InputAddress } from "./request-inputs";
 
 export type AssertionCheck = { label: string; passed: boolean; error?: string };
@@ -49,6 +51,9 @@ function isStatusAssertion(assertion: Record<string, unknown>) {
  *   (negative tests expecting 404 keep working);
  * - otherwise any 2xx or 3xx is transport success (a redirect is an answer, not
  *   a failure — requests are sent with redirect: "manual");
+ * - an error the body reports (success: false, status: "error", errors: [...])
+ *   fails the step even with a 2xx — unless `checkResponseBody: false`, or an
+ *   attached assertion checks those members itself (a negative test);
  * - every attached assertion must pass as well — the status alone is never enough.
  */
 export async function evaluateExpectation(
@@ -70,6 +75,14 @@ export async function evaluateExpectation(
     const passed = status !== null && status >= 200 && status < 400;
     checks.push({ label: "status 2xx/3xx", passed, ...(passed ? {} : { error: `HTTP ${status ?? "no response"}` }) });
     if (!passed) failures.push(`HTTP ${status ?? "no response"}`);
+  }
+  if (status !== null && status < 400 && config.checkResponseBody !== false && !assertsOnErrorMembers(attachedAssertions)) {
+    const found = detectBodyError(context.lastHttpResponse?.body);
+    if (found) {
+      const error = `The response reports an error (${found.signal}): ${found.message}`;
+      checks.push({ label: "no error in the response body", passed: false, error });
+      failures.push(error);
+    }
   }
   for (const assertion of attachedAssertions) {
     const result = await assertions.execute(assertion, context);
@@ -129,6 +142,8 @@ export type RecoverResult = {
   checks: AssertionCheck[];
   /** Registry refs a successful candidate used, to prefer them later in the run. */
   learned?: Array<{ fieldName: string; ref: string }>;
+  /** What the (first) response said was wrong, and which input and mapping it is about. */
+  responseError?: ResponseError;
 };
 
 /**
@@ -143,7 +158,23 @@ export type RecoverResult = {
  * - stops at the first success.
  * A rejected retry leaves no trace in the variables or the last response.
  */
-export async function recoverHttpStep(input: {
+export async function recoverHttpStep(input: Parameters<typeof recover>[0]): Promise<RecoverResult> {
+  const response = input.context.lastHttpResponse;
+  const responseError = response
+    ? describeResponseError(
+        response.body,
+        response.status,
+        { ...input.request, method: (input.request.method ?? "GET").toUpperCase() },
+        readBindings(input.config),
+        responseMessage(response.body),
+      )
+    : null;
+  const outcome = await recover({ ...input, hint: responseError?.field ?? null });
+  // A passing step has nothing to explain (a body check that is switched off, a negative test).
+  return outcome.state === "PASSED" || !responseError ? outcome : { ...outcome, responseError };
+}
+
+async function recover(input: {
   config: Record<string, unknown>;
   request: ResolvedHttpRequest;
   firstResult: StepExecutionResult;
@@ -154,6 +185,8 @@ export async function recoverHttpStep(input: {
   onProgress?: (progress: RecoveryProgress) => void | Promise<void>;
   ranker?: SemanticRanker;
   previousMappings?: Array<{ fieldName: string; ref: string }>;
+  /** The input the response error is about: its candidates are tried first. */
+  hint?: InputAddress | null;
 }): Promise<RecoverResult> {
   const { config, request, firstResult, attachedAssertions, context, http, assertions } = input;
   if (firstResult.status === "CANCELLED") return { result: firstResult, state: "CANCELLED", checks: [] };
@@ -191,6 +224,13 @@ export async function recoverHttpStep(input: {
   }
 
   let candidates = planRecoveryCandidates(spec, context.registry, { previousMappings: input.previousMappings });
+  if (input.hint) {
+    // The response named this input: try its corrections first (stable within each group).
+    const hint = input.hint;
+    const touches = (candidate: RecoveryCandidate) =>
+      (candidate.changes?.length ? candidate.changes : [candidate]).some((change) => change.location === hint.location && change.field === hint.field);
+    candidates = [...candidates.filter(touches), ...candidates.filter((candidate) => !touches(candidate))];
+  }
   const safe = isRetrySafe(method, settings.idempotent, request.headers);
   const mediumAllowed = safe ? settings.allowMedium : settings.allowMediumExplicit;
   const confident = (candidate: RecoveryCandidate) =>
@@ -204,7 +244,8 @@ export async function recoverHttpStep(input: {
     candidates = await promoteWithRanker(candidates, input.ranker, base.originalStatus, base.original.message);
   }
 
-  const likely = likelyField(candidates);
+  const hinted = input.hint ? candidates.find((candidate) => candidate.location === input.hint!.location && candidate.field === input.hint!.field) : undefined;
+  const likely = hinted ? { location: hinted.location, field: hinted.field, fieldName: hinted.fieldName } : likelyField(candidates);
   if (candidates.length === 0) {
     return {
       result: failed,

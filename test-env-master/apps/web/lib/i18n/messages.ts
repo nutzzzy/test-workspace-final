@@ -229,6 +229,7 @@ export function localizeUserMessage(raw: string, t: Translate): string {
     [/^AI analysis is not available:\s*(.+)$/, "errors.aiNotAvailable", "reason"],
     [/^Unresolved variable:\s*(.+)$/, "errors.unresolvedVariable", "value"],
     [/^SSRF protection blocked host:\s*(.+)$/, "errors.hostBlocked", "value"],
+    [/^The response reports an error \([^)]*\):\s*(.+)$/, "errors.responseReportsError", "value"],
     [/^Request timed out after\s*(\d+) ms$/, "errors.requestTimeout", "value"],
     [/^Jira issue (\S+) was not found/, "errors.jiraIssueMissing", "value"],
     [/^Jira returned an error \(HTTP (\d+)\)/, "errors.jiraHttp", "value"],

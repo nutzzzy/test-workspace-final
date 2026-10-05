@@ -29,6 +29,8 @@ export type StepExecutionResult = {
   /** Registry values this step produced, and the few worth showing first. */
   values?: RegistryView[];
   important?: RegistryView[];
+  /** What the response said was wrong, and which request input and mapping it is about. */
+  responseError?: ResponseError;
 };
 
 import { isSecretKey, maskDeep } from "../common/mask.util";
@@ -37,6 +39,7 @@ import type { MissingBinding } from "./flow/bindings";
 import type { ManualRecoveryOptions } from "./flow/manual-recovery";
 import type { ExtractionOutcome } from "./flow/response-mapping";
 import type { AssertionCheck } from "./flow/recover-step";
+import type { ResponseError } from "./flow/body-error";
 import { ValueRegistry, type RegistryView } from "./flow/value-registry";
 
 export class ExecutionContext {

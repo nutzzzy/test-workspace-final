@@ -200,3 +200,44 @@ export function bindingFromSuggestion(item: DependencySuggestion, producer: Flow
     createdAt: new Date().toISOString(),
   };
 }
+
+export type AutoMappingPlan = {
+  /** One suggestion per request field, to be saved. */
+  chosen: DependencySuggestion[];
+  /** Fields with two equally good sources: left for the user to choose. */
+  ambiguous: DependencySuggestion[][];
+  /** Fields with only weak (LOW) evidence: shown as suggestions, not saved. */
+  weak: DependencySuggestion[];
+};
+
+/**
+ * Which suggestions "detect mappings automatically" saves. Suggestions come
+ * strongest evidence first (recovery fixes, then values seen in real
+ * responses, then request-only inference); per request field the strongest is
+ * taken, unless it is only LOW or ties with a different source — those stay
+ * suggestions, because a wrong mapping is worse than none.
+ */
+export function chooseAutoMappings(suggestions: DependencySuggestion[]): AutoMappingPlan {
+  const groups = new Map<string, DependencySuggestion[]>();
+  for (const item of suggestions) {
+    const key = `${item.consumerStepId}|${item.target.location}|${item.target.field}`;
+    groups.set(key, [...(groups.get(key) ?? []), item]);
+  }
+  const plan: AutoMappingPlan = { chosen: [], ambiguous: [], weak: [] };
+  for (const group of groups.values()) {
+    const [best, next] = group;
+    if (!best) continue;
+    if (best.confidence === "LOW") {
+      plan.weak.push(best);
+      continue;
+    }
+    const sameSource = (a: DependencySuggestion, b: DependencySuggestion) =>
+      a.producerStepId === b.producerStepId && a.sourcePath === b.sourcePath && a.expect?.key === b.expect?.key;
+    if (next && next.confidence === best.confidence && next.score === best.score && next.evidence === best.evidence && !sameSource(best, next)) {
+      plan.ambiguous.push(group.filter((item) => item.confidence === best.confidence && item.score === best.score));
+      continue;
+    }
+    plan.chosen.push(best);
+  }
+  return plan;
+}

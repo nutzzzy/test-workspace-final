@@ -143,6 +143,17 @@ export type StepOutput = {
   manual?: ManualOptions;
   blocked?: Array<{ target: string; sourceStep: string; path: string; reason: string }>;
   consumedVars?: Array<{ variable: string; location: string; source?: { stepId?: string; orderIndex: number; path: string } }>;
+  responseError?: ResponseError;
+};
+
+/** What the response said was wrong (also with a 2xx), and the request field and mapping it is about. */
+export type ResponseError = {
+  message: string;
+  code: string | null;
+  signal: string;
+  field: { location: InputLocation; field: string; key: string } | null;
+  fieldEvidence: "named" | "mentioned" | "auth" | null;
+  mapping: { stepName: string | null; orderIndex: number | null; path: string | null; fixedValue: boolean } | null;
 };
 
 export type CandidateChange = {

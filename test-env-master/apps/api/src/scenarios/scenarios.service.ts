@@ -18,10 +18,12 @@ import {
   type StepBinding,
 } from "../scenario-engine/flow/bindings";
 import type { InputLocation } from "../scenario-engine/flow/request-inputs";
-import type { FlowHttpStep } from "../scenario-engine/flow/dependency-analyzer";
+import type { DependencySuggestion, FlowHttpStep } from "../scenario-engine/flow/dependency-analyzer";
+import { detectBodyError } from "../scenario-engine/flow/body-error";
 import { flowHealth, validateFlow } from "../scenario-engine/flow/flow-validator";
 import {
   bindingFromSuggestion,
+  chooseAutoMappings,
   reviewMappings,
   suggestDependencies,
   type RecoveredInput,
@@ -561,6 +563,49 @@ export class ScenariosService {
     return this.analyzeFlow(scenarioId);
   }
 
+  /**
+   * "Detect mappings automatically": for every request field without a saved
+   * mapping, find which earlier response it should come from and save the
+   * clear cases. Evidence is the latest successful response of every step
+   * over recent runs, fields recovery fixed, and the requests themselves.
+   * Ambiguous and weak cases stay suggestions. `stepId` limits it to one step.
+   */
+  async autoMap(scenarioId: string, body: { stepId?: unknown }) {
+    const scenario = await this.get(scenarioId);
+    const steps = scenario.steps.map(toFlowStep);
+    const env = await this.publicEnvironment(scenario.environmentId);
+    const samples = latestSuccessfulSamples(scenario.runs);
+    const recovered = scenario.runs.slice(0, 5).flatMap((run) => recoveredInputs(run));
+    const only = typeof body.stepId === "string" ? body.stepId : null;
+    const suggestions = suggestDependencies(steps, samples, env, recovered).filter((item) => !only || item.consumerStepId === only);
+    const plan = chooseAutoMappings(suggestions);
+
+    const byConsumer = new Map<string, DependencySuggestion[]>();
+    for (const item of plan.chosen) byConsumer.set(item.consumerStepId, [...(byConsumer.get(item.consumerStepId) ?? []), item]);
+    for (const [consumerId, items] of byConsumer) {
+      const consumer = scenario.steps.find((step) => step.id === consumerId);
+      if (!consumer) continue;
+      const config = asRecord(consumer.config);
+      let bindings = readBindings(config);
+      for (const item of items) {
+        const producer = steps.find((step) => step.id === item.producerStepId);
+        if (producer) bindings = upsertBinding(bindings, bindingFromSuggestion(item, producer));
+      }
+      await this.prisma.scenarioStep.update({
+        where: { id: consumerId },
+        data: { config: { ...config, bindings } as unknown as Prisma.InputJsonValue },
+      });
+    }
+    return {
+      added: plan.chosen.length,
+      ambiguous: plan.ambiguous.length,
+      weak: plan.weak.length,
+      // Without a run only the request shapes are evidence; a run lets real responses confirm them.
+      usedResponses: samples.length > 0,
+      analysis: await this.analyzeFlow(scenarioId),
+    };
+  }
+
   listRuns(scenarioId?: string) {
     return this.prisma.scenarioRun.findMany({
       where: scenarioId ? { scenarioId } : undefined,
@@ -629,6 +674,25 @@ function samplesFromRun(
       },
     ];
   });
+}
+
+/**
+ * The latest successful response of every step across recent runs (newest
+ * first): a run that stopped early still leaves the earlier runs' responses of
+ * the later steps. Failed responses and bodies that report an error are not
+ * evidence of where a value comes from.
+ */
+function latestSuccessfulSamples(runs: Array<{ stepRuns: Array<{ scenarioStepId: string | null; output: unknown }> }>) {
+  const found = new Map<string, ReturnType<typeof samplesFromRun>[number]>();
+  for (const run of runs) {
+    for (const sample of samplesFromRun(run)) {
+      if (found.has(sample.stepId)) continue;
+      if (sample.status !== undefined && sample.status >= 400) continue;
+      if (detectBodyError(sample.body)) continue;
+      found.set(sample.stepId, sample);
+    }
+  }
+  return [...found.values()];
 }
 
 /**

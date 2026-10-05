@@ -1,6 +1,6 @@
 "use client";
 
-import { AlertTriangle, ArrowLeft, Check, Link2, Plus } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Check, Link2, Plus, Wand2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   isResponseSource,
@@ -121,6 +121,7 @@ export function MappingPanel({
   onRemove,
   onAccept,
   onDismiss,
+  onAutoMap,
 }: {
   stepId: string;
   reviews: MappingReview[];
@@ -132,6 +133,7 @@ export function MappingPanel({
   onRemove: (binding: StepBinding) => void;
   onAccept: (suggestion: Suggestion) => void;
   onDismiss: (suggestion: Suggestion) => void;
+  onAutoMap: () => void;
 }) {
   const { t, n } = useI18n();
   const targetLabel = useTargetLabel(fields);
@@ -143,10 +145,16 @@ export function MappingPanel({
           <h3 className="text-xs font-medium">{t("builder.mapping.title")}</h3>
           <p className="text-[11px] text-muted-foreground">{t("builder.mapping.hint")}</p>
         </div>
-        <Button size="sm" onClick={() => onPick({ consumerId: stepId })}>
-          <Plus className="h-3.5 w-3.5" />
-          {t("builder.mapping.add")}
-        </Button>
+        <span className="flex flex-wrap gap-1">
+          <Button size="sm" variant="outline" title={t("builder.autoMap.hint")} onClick={onAutoMap}>
+            <Wand2 className="h-3.5 w-3.5" />
+            {t("builder.autoMap.button")}
+          </Button>
+          <Button size="sm" onClick={() => onPick({ consumerId: stepId })}>
+            <Plus className="h-3.5 w-3.5" />
+            {t("builder.mapping.add")}
+          </Button>
+        </span>
       </div>
 
       {reviews.length === 0 ? (

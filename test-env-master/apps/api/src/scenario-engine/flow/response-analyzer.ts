@@ -1,3 +1,5 @@
+import { detectBodyError } from "./body-error";
+
 export type ResponseAnalysis = {
   status: number | null;
   durationMs: number | null;
@@ -82,6 +84,9 @@ export function analyzeResponse(input: {
 }
 
 function errorInfo(status: number | null | undefined, body: unknown) {
+  // An error the body reports counts whatever the status (200 with success: false).
+  const reported = detectBodyError(body);
+  if (reported) return { message: reported.message, code: reported.code };
   if (status == null || status < 400) return null;
   const record = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
   const message = firstString(record, ["message", "error", "detail", "title"]) ?? `HTTP ${status}`;

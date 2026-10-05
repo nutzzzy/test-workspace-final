@@ -421,7 +421,7 @@ function persistedOutput(
   context: ExecutionContext,
 ): Prisma.InputJsonValue | undefined {
   const flow: Record<string, unknown> = {};
-  for (const key of ["consumedVars", "recovery", "assertions", "manual", "blocked", "values", "important", "extractions"] as const) {
+  for (const key of ["consumedVars", "recovery", "assertions", "manual", "blocked", "values", "important", "extractions", "responseError"] as const) {
     if (stepResult[key] !== undefined) flow[key] = stepResult[key];
   }
   if (Object.keys(flow).length === 0) {

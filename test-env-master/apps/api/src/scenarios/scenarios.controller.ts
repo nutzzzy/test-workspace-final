@@ -165,6 +165,12 @@ export class ScenariosController {
     return this.scenariosService.acceptDependency(id, body ?? {});
   }
 
+  /** Find and save the clear mappings of every unmapped field (or of one step). */
+  @Post(":id/dependencies/auto")
+  autoMap(@Param("id") id: string, @Body() body: { stepId?: unknown }) {
+    return this.scenariosService.autoMap(id, body ?? {});
+  }
+
   /** Start a run; `untilStepId` runs only the steps up to and including that one. */
   @Post(":id/run")
   start(@Param("id") id: string, @Body() body: { untilStepId?: string }) {
