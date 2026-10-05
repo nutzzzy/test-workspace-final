@@ -1,3 +1,5 @@
+<div dir="rtl" align="right">
+
 # QA Workbench
 
 QA Workbench یک میزکار محلی برای مهندسی تست است. نیازمندی را از Jira یا فایل صفحه‌گسترده دریافت می‌کند، با هوش مصنوعی تحلیل و Test Case تولید می‌کند، اجرای تست و Bug را ثبت می‌کند و پیش‌شرط‌های تست را — با مراحل UI در مرورگر، درخواست‌های API و عملیات Database — روی محیط تست آماده می‌کند.
@@ -130,6 +132,17 @@ Stepها می‌توانند شامل موارد زیر باشند:
 - تایپ‌های پشت‌سرهم یک فیلد یک اقدام می‌شوند و کلیکی که فقط فیلد را فعال کرده حذف می‌شود.
 - رمز عبور، OTP و کدهای مشابه رمزنگاری‌شده ذخیره می‌شوند و دوباره به مرورگر فرستاده نمی‌شوند.
 
+**اجرای هوشمند با داده‌هایی که هر بار عوض می‌شوند:**
+
+مرحلهٔ UI ضبط را کلمه‌به‌کلمه تکرار نمی‌کند؛ هدف هر اقدام را در نظر می‌گیرد:
+
+- **تغییر صفحه بعد از کلیک:** اگر بعد از یک کلیک، Enter یا تایپ، صفحه عوض شده باشد (Redirect، بازگشت از پرداخت)، اجرا دنبال خود اپلیکیشن می‌رود؛ حتی اگر آدرس کد تازه‌ای داشته باشد (`/basket/?code=…`، `/order/invoice/…`) یا اپلیکیشن مستقیم به صفحهٔ اقدام بعدی برود. آدرس ضبط‌شده‌ای که کد دارد هیچ‌وقت دوباره باز نمی‌شود، چون مال اجرای قبلی است (مثلاً سفارش یا سبد قبلی). اگر اپلیکیشن به آن صفحه نرسد، مرحله با پیام روشن متوقف می‌شود. آدرسی که کاربر خودش تایپ کرده مستقیم باز می‌شود.
+- **تایپی که صفحه را جلو می‌برد:** مثل کد یک‌بارمصرفی که با رقم آخر خودش ثبت می‌شود؛ اگر هنوز فیلدش روی صفحه است، قبل از تغییر صفحه تایپ می‌شود. ضبط‌کننده هم تایپ را فعالیت حساب می‌کند و چنین تغییر صفحه‌ای را جدا ثبت نمی‌کند.
+- **کلیکی که مقصدش رسیده:** اگر اپلیکیشن خودش به صفحه‌ای رفته باشد که آن کلیک به آن می‌برد، کلیک انجام‌شده حساب می‌شود.
+- **متن‌های دارای عدد متغیر:** مثل تعداد نظر یک رستوران یا موجودی کیف پول، با همان کلمات و هر عددی پیدا می‌شوند (ارقام فارسی و انگلیسی).
+- **انتخاب گزینه:** کلیک روی یک گزینهٔ انتخابی (Radio، روش پرداخت، Tab) یعنی «انتخابش کن». اگر از قبل انتخاب شده کلیک نمی‌شود، و بعد از کلیک بررسی می‌شود که واقعاً انتخاب شده باشد (کلیکی که روی دکمهٔ «جزئیات» داخل گزینه بیفتد حساب نیست). اگر انتخاب نشود، مرحله متوقف می‌شود تا مثلاً با روش پرداخت دیگری ادامه ندهد.
+- **صبر برای صفحه:** بعد از هر اقدام صبر می‌کند تا درخواست‌هایی که صفحه به خاطر آن فرستاده تمام و صفحه آرام شود. پیام اعلام عنوان صفحه (Route Announcer در Next.js) خطا حساب نمی‌شود.
+
 **نتیجه:**
 
 - Tab «نتیجه» برای هر اقدام وضعیت، زمان، روش پیدا کردن عنصر و نشان «یاد گرفت» را نشان می‌دهد، همراه با آدرس صفحهٔ پایانی و تصویر صفحه.
@@ -166,6 +179,8 @@ Stepها می‌توانند شامل موارد زیر باشند:
 | «The secret value of this action is missing» | رمز این اقدام با کلید دیگری رمزنگاری شده یا پاک شده است (مثلاً `SECRETS_ENCRYPTION_KEY` عوض شده)؛ آن را در Tab «اقدام‌ها» دوباره تایپ کنید. |
 | مرورگر لاگین باز نمی‌شود | Tab «نتیجه» را ببینید که مرورگر با چه Cookie، Header و کلیدی شروع کرده. اگر خالی است، Step لاگین قبلی موفق نبوده یا Token در پاسخش نیست. اگر اپلیکیشن Token را با کلید دیگری می‌خواند، آن کلید را در «لاگین با داده‌های مراحل قبلی» اضافه کنید. اگر «فقط این مراحل» انتخاب شده، مطمئن شوید cURL لاگین در فهرست تیک خورده است. |
 | مرورگر با کاربر اشتباه لاگین می‌شود | چند cURL لاگین با کاربرهای مختلف دارید و با «همهٔ مراحل قبلی» جدیدترین برنده می‌شود؛ در «دریافت نشست از» فقط cURL موردنظر را انتخاب کنید. |
+| «The app did not go on to …» | بعد از یک کلیک، اپلیکیشن به صفحه‌ای که در ضبط بود نرسید (مثلاً پرداخت به درگاه دیگری رفت یا سفارش ثبت نشد)؛ تصویر صفحه و آدرس پایانی را در Tab «نتیجه» ببینید. |
+| «Clicked, but the option did not become selected» | گزینه (مثلاً روش پرداخت) با کلیک انتخاب نشد؛ آن اقدام را دوباره ضبط کنید و روی خود گزینه (نه دکمه‌های داخلش) کلیک کنید. |
 | ضبط بعد از ۳۰ دقیقه بسته شد | ضبطی که ۳۰ دقیقه اقدامی نداشته باشد خودکار بسته می‌شود؛ اقدام‌های ضبط‌شده تا آن لحظه حفظ می‌شوند. |
 
 #### ورود چند cURL
@@ -302,11 +317,17 @@ Jira نیز اختیاری است و تنظیمات اتصال آن از داخ�
 
 اگر سایت ollama.com در دسترس است:
 
+<div dir="ltr" align="left">
+
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
+</div>
+
 اگر ollama.com مسدود است (خطای 403)، همان نسخهٔ رسمی را از GitHub و بدون نیاز به sudo نصب کنید:
+
+<div dir="ltr" align="left">
 
 ```bash
 mkdir -p ~/.local/ollama && cd ~/.local/ollama
@@ -315,19 +336,29 @@ tar --zstd -xf ollama.tar.zst && rm ollama.tar.zst
 ~/.local/ollama/bin/ollama --version
 ```
 
+</div>
+
 ### اجرا
+
+<div dir="ltr" align="left">
 
 ```bash
 OLLAMA_HOST=127.0.0.1:11434 OLLAMA_KEEP_ALIVE=30m ~/.local/ollama/bin/ollama serve
 ```
 
+</div>
+
 این Terminal باید باز بماند. برای اجرای دائمی می‌توان یک systemd user service برای همین دستور ساخت.
 
 ### دانلود مدل
 
+<div dir="ltr" align="left">
+
 ```bash
 ~/.local/ollama/bin/ollama pull qwen3:8b
 ```
+
+</div>
 
 | مدل | حجم | توضیح |
 |---|---|---|
@@ -433,31 +464,47 @@ Pollinations بدون حساب و کلید کار می‌کند. نسخهٔ را
 
 ## 1. نصب Dependencyها
 
+<div dir="ltr" align="left">
+
 ```bash
 npm install
 ```
+
+</div>
 
 ## 2. Generate کردن Prisma Client
 
 Prisma Schema این پروژه در مسیر زیر قرار دارد:
 
+<div dir="ltr" align="left">
+
 ```text
 apps/api/prisma/schema.prisma
 ```
 
+</div>
+
 Prisma Client را Generate کنید:
+
+<div dir="ltr" align="left">
 
 ```bash
 npx prisma generate --schema=apps/api/prisma/schema.prisma
 ```
 
+</div>
+
 در صورت موفقیت باید پیام مربوط به Generated شدن Prisma Client نمایش داده شود.
 
 ## 3. بررسی Build
 
+<div dir="ltr" align="left">
+
 ```bash
 npm run build
 ```
+
+</div>
 
 این مرحله خطاهای TypeScript، Prisma و سایر مشکلات Build را قبل از اجرای محیط مشخص می‌کند.
 
@@ -467,9 +514,13 @@ npm run build
 
 در Terminal اول و از Root پروژه اجرا کنید:
 
+<div dir="ltr" align="left">
+
 ```bash
 npm run demo:db
 ```
+
+</div>
 
 این دستور PostgreSQL داخلی پروژه را روی Port `5433` اجرا می‌کند، Tableهای موردنیاز را می‌سازد و فایل `.env` را آماده می‌کند.
 
@@ -479,39 +530,59 @@ npm run demo:db
 
 در Terminal دوم:
 
+<div dir="ltr" align="left">
+
 ```bash
 npm run dev:api
 ```
+
+</div>
 
 API به‌صورت پیش‌فرض روی Port `3001` اجرا می‌شود.
 
 Health Check:
 
+<div dir="ltr" align="left">
+
 ```text
 http://localhost:3001/api/health
 ```
+
+</div>
 
 ## 6. اجرای Web
 
 در Terminal سوم:
 
+<div dir="ltr" align="left">
+
 ```bash
 npm run dev:web
 ```
 
+</div>
+
 رابط کاربری:
+
+<div dir="ltr" align="left">
 
 ```text
 http://localhost:3000
 ```
 
+</div>
+
 ## 7. ایجاد Demo Data
 
 بعد از بالا آمدن API:
 
+<div dir="ltr" align="left">
+
 ```bash
 npm run demo:seed
 ```
+
+</div>
 
 بعد از این مرحله می‌توانید Demo Flow سیستم را بدون Jira یا Redis اجرا کنید. اگر سرویس هوش مصنوعی تنظیم شده باشد، تحلیل Demo Issue هم در پس‌زمینه شروع می‌شود.
 
@@ -523,37 +594,57 @@ npm run demo:seed
 
 ### Terminal 1
 
+<div dir="ltr" align="left">
+
 ```bash
 npm install
 npm run demo:db
 ```
 
+</div>
+
 این Terminal را باز نگه دارید.
 
 سپس در Terminal دیگری:
+
+<div dir="ltr" align="left">
 
 ```bash
 npx prisma generate --schema=apps/api/prisma/schema.prisma
 npm run build
 ```
 
+</div>
+
 بعد:
+
+<div dir="ltr" align="left">
 
 ```bash
 npm run dev:api
 ```
 
+</div>
+
 و در Terminal دیگری:
+
+<div dir="ltr" align="left">
 
 ```bash
 npm run dev:web
 ```
 
+</div>
+
 بعد از بالا آمدن API:
+
+<div dir="ltr" align="left">
 
 ```bash
 npm run demo:seed
 ```
+
+</div>
 
 ---
 
@@ -561,46 +652,74 @@ npm run demo:seed
 
 Environment را آماده کنید:
 
+<div dir="ltr" align="left">
+
 ```bash
 cp .env.example .env
 cp .env apps/api/.env
 ```
 
+</div>
+
 Dependencyها را نصب کنید:
+
+<div dir="ltr" align="left">
 
 ```bash
 npm install
 ```
 
+</div>
+
 سرویس‌های Docker را اجرا کنید:
+
+<div dir="ltr" align="left">
 
 ```bash
 npm run docker:up
 ```
 
+</div>
+
 Prisma Client را Generate کنید:
+
+<div dir="ltr" align="left">
 
 ```bash
 npx prisma generate --schema=apps/api/prisma/schema.prisma
 ```
 
+</div>
+
 Migrationها را اجرا کنید:
+
+<div dir="ltr" align="left">
 
 ```bash
 npm run db:migrate
 ```
 
+</div>
+
 API را اجرا کنید:
+
+<div dir="ltr" align="left">
 
 ```bash
 npm run dev:api
 ```
 
+</div>
+
 و در Terminal دیگری:
+
+<div dir="ltr" align="left">
 
 ```bash
 npm run dev:web
 ```
+
+</div>
 
 در حالت Docker:
 
@@ -615,35 +734,55 @@ npm run dev:web
 
 اگر دستور:
 
+<div dir="ltr" align="left">
+
 ```bash
 npx prisma generate
 ```
 
+</div>
+
 با خطای:
+
+<div dir="ltr" align="left">
 
 ```text
 Could not find Prisma Schema that is required for this command
 ```
 
+</div>
+
 مواجه شد، علت این است که Prisma Schema پروژه در مسیر Default قرار ندارد.
 
 Schema اصلی پروژه:
+
+<div dir="ltr" align="left">
 
 ```text
 apps/api/prisma/schema.prisma
 ```
 
+</div>
+
 بنابراین دستور صحیح این است:
+
+<div dir="ltr" align="left">
 
 ```bash
 npx prisma generate --schema=apps/api/prisma/schema.prisma
 ```
 
+</div>
+
 از Schema موجود در مسیر زیر برای Generate کردن Client استفاده نکنید:
+
+<div dir="ltr" align="left">
 
 ```text
 node_modules/.prisma/client/schema.prisma
 ```
+
+</div>
 
 ---
 
@@ -651,21 +790,33 @@ node_modules/.prisma/client/schema.prisma
 
 اگر هنگام اجرای:
 
+<div dir="ltr" align="left">
+
 ```bash
 npm run build
 ```
 
+</div>
+
 خطاهای TypeScript مانند `TS7006` در بخش‌هایی که اطلاعات Jira را از Prisma دریافت می‌کنند مشاهده شد، ابتدا Prisma Client را دوباره Generate کنید:
+
+<div dir="ltr" align="left">
 
 ```bash
 npx prisma generate --schema=apps/api/prisma/schema.prisma
 ```
 
+</div>
+
 سپس:
+
+<div dir="ltr" align="left">
 
 ```bash
 npm run build
 ```
+
+</div>
 
 تابع‌هایی مانند `loadIssue()` ممکن است به Typeهای Generated توسط Prisma وابسته باشند.
 
@@ -675,15 +826,21 @@ npm run build
 
 بسته به Query موجود می‌توان از Typeهایی مانند:
 
+<div dir="ltr" align="left">
+
 ```typescript
 Prisma.JiraIssueGetPayload
 ```
+
+</div>
 
 استفاده کرد تا Type خروجی مستقیماً با Prisma Schema و Query واقعی هماهنگ باشد.
 
 ---
 
 # تست‌ها
+
+<div dir="ltr" align="left">
 
 ```bash
 npm run test        # Testهای API (Jest)، شامل تحلیل هوش مصنوعی، پیش‌شرط‌ها، مراحل UI و i18n parity
@@ -692,9 +849,11 @@ npm run lint
 npx tsx --test apps/web/lib/curl/parse-curl.spec.ts packages/shared/src/secrets.spec.ts
 ```
 
+</div>
+
 Testهای پیش‌شرط‌ها و تحلیل هوش مصنوعی از Mock API و مدل شبیه‌سازی‌شده استفاده می‌کنند و به سرویس یا مدل واقعی Request ارسال نمی‌کنند.
 
-Testهای مرحلهٔ UI با Chrome واقعی و یک وب‌سایت آزمایشی محلی اجرا می‌شوند (ضبط، اجرای پس‌زمینه، پیدا کردن عنصر بعد از تغییر صفحه، رمزنگاری رمز عبور، اتصال Token به درخواست بعدی، باز شدن در حالت لاگین با Cookie، Header و localStorage مراحل قبلی همراه با یاد گرفتن کلید Token اپلیکیشن، و انتخاب بین دو cURL لاگین با دو کاربر مختلف). اگر Chrome، Chromium یا Edge نصب نباشد، این Testها رد (Skip) می‌شوند.
+Testهای مرحلهٔ UI با Chrome واقعی و یک وب‌سایت آزمایشی محلی اجرا می‌شوند (ضبط، اجرای پس‌زمینه، پیدا کردن عنصر بعد از تغییر صفحه، رمزنگاری رمز عبور، اتصال Token به درخواست بعدی، باز شدن در حالت لاگین با Cookie، Header و localStorage مراحل قبلی همراه با یاد گرفتن کلید Token اپلیکیشن، انتخاب بین دو cURL لاگین با دو کاربر مختلف، و اجرای هوشمند: OTPی که خودش ثبت می‌شود، Redirect به آدرس با کد تازه، متن با عدد متغیر و انتخاب مطمئن گزینه). اگر Chrome، Chromium یا Edge نصب نباشد، این Testها رد (Skip) می‌شوند.
 
 ---
 
@@ -702,27 +861,43 @@ Testهای مرحلهٔ UI با Chrome واقعی و یک وب‌سایت آزم
 
 اگر Port `3001` اشغال باشد، ابتدا Process مربوط به آن را پیدا کنید:
 
+<div dir="ltr" align="left">
+
 ```bash
 lsof -i :3001
 ```
 
+</div>
+
 بعد از متوقف کردن Process قبلی، API را مجدداً اجرا کنید:
+
+<div dir="ltr" align="left">
 
 ```bash
 npm run dev:api
 ```
 
+</div>
+
 اگر Port `5433` اشغال باشد:
+
+<div dir="ltr" align="left">
 
 ```bash
 lsof -i :5433
 ```
 
+</div>
+
 بعد از متوقف کردن Instance قبلی:
+
+<div dir="ltr" align="left">
 
 ```bash
 npm run demo:db
 ```
+
+</div>
 
 ---
 
@@ -748,3 +923,5 @@ npm run demo:db
 16. Mappingها را پاک کنید و «تشخیص خودکار Mappingها» را بزنید؛ سپس پیش‌شرط را دوباره اجرا کنید.
 
 برای اجرای این Demo Flow نیازی به Jira یا Redis نیست؛ مراحل تحلیل به یک سرویس هوش مصنوعی (مثلاً Pollinations یا Ollama محلی) نیاز دارند.
+
+</div>
