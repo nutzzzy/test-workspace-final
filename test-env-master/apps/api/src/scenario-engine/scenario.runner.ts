@@ -19,6 +19,9 @@ import { DelayExecutor } from "./executors/delay.executor";
 import { ExtractVariableExecutor } from "./executors/extract-variable.executor";
 import { HttpRequestExecutor } from "./executors/http-request.executor";
 import { SetVariableExecutor } from "./executors/set-variable.executor";
+import { UiFlowExecutor, type UiLearning } from "./executors/ui-flow.executor";
+import { decryptSecret, resolveEncryptionKey } from "../common/crypto.util";
+import type { UiAction } from "./ui/ui-types";
 import type { StepBinding } from "./flow/bindings";
 import { parseResolution, type ManualResolution } from "./flow/manual-recovery";
 import type { SemanticRanker } from "./flow/recover-step";
@@ -70,6 +73,7 @@ export class ScenarioRunner implements OnModuleInit {
       new DelayExecutor(),
       new ConditionExecutor(),
       new DatabaseActionExecutor(connectors),
+      new UiFlowExecutor((payload) => decryptSecret(payload, resolveEncryptionKey(process.env.SECRETS_ENCRYPTION_KEY))),
     ]) {
       this.registry.register(executor);
     }
@@ -337,6 +341,27 @@ export class ScenarioRunner implements OnModuleInit {
       });
     };
 
+    /** A replay found an element another way: remember it, so the next run tries that first. */
+    const onLearnUi = async (stepId: string, learned: UiLearning[]) => {
+      const current = await this.prisma.scenarioStep.findUnique({ where: { id: stepId } });
+      if (!current) return;
+      const config = (current.config ?? {}) as Record<string, unknown>;
+      const actions = Array.isArray(config.actions) ? (config.actions as UiAction[]) : [];
+      const next = actions.map((action) => {
+        const lesson = learned.find((item) => item.actionId === action.id);
+        if (!lesson || !action.target) return action;
+        if (lesson.healedCandidate) {
+          const candidates = [lesson.healedCandidate, ...action.target.candidates.filter((item) => item.value !== lesson.healedCandidate!.value)].slice(0, 10);
+          return { ...action, target: { ...action.target, candidates, learned: 0 } };
+        }
+        return { ...action, target: { ...action.target, learned: lesson.candidateIndex } };
+      });
+      await this.prisma.scenarioStep.update({
+        where: { id: stepId },
+        data: { config: { ...config, actions: next } as unknown as Prisma.InputJsonValue },
+      });
+    };
+
     try {
       const result = await orchestrateSteps(
         scenario.steps.map((step) => ({
@@ -352,6 +377,7 @@ export class ScenarioRunner implements OnModuleInit {
         {
           stopOnFailure: scenario.stopOnFailure,
           ranker: this.ai ? this.semanticRanker() : undefined,
+          onLearnUi,
           onProgress: (progress) => {
             this.live.set(runId, progress);
           },

@@ -8,15 +8,42 @@ import {
   Post,
   Query,
 } from "@nestjs/common";
-import { ScenariosService } from "./scenarios.service";
+import { ScenariosService, publicScenario, publicStep } from "./scenarios.service";
 
 @Controller("scenarios")
 export class ScenariosController {
   constructor(private readonly scenariosService: ScenariosService) {}
 
   @Get()
-  list() {
-    return this.scenariosService.list();
+  async list() {
+    return (await this.scenariosService.list()).map(publicScenario);
+  }
+
+  /** Open a browser on this machine at the URL and record what the user does there. */
+  @Post(":id/ui-recordings")
+  startRecording(@Param("id") id: string, @Body() body: { startUrl?: unknown; stepId?: unknown }) {
+    return this.scenariosService.startRecording(id, body ?? {});
+  }
+
+  @Get("ui-recordings/:recordingId")
+  recordingStatus(@Param("recordingId") recordingId: string) {
+    return this.scenariosService.recordingStatus(recordingId);
+  }
+
+  @Post("ui-recordings/:recordingId/stop")
+  stopRecording(@Param("recordingId") recordingId: string) {
+    return this.scenariosService.stopRecording(recordingId);
+  }
+
+  /** Save the recording as a new UI step, or into the step it was started from (append or replace). */
+  @Post("ui-recordings/:recordingId/save")
+  async saveRecording(@Param("recordingId") recordingId: string, @Body() body: { name?: unknown; mode?: unknown }) {
+    return publicStep(await this.scenariosService.saveRecording(recordingId, body ?? {}));
+  }
+
+  @Post("ui-recordings/:recordingId/discard")
+  discardRecording(@Param("recordingId") recordingId: string) {
+    return this.scenariosService.discardRecording(recordingId);
   }
 
   @Get("runs")
@@ -71,7 +98,7 @@ export class ScenariosController {
   }
 
   @Patch("steps/:stepId")
-  updateStep(
+  async updateStep(
     @Param("stepId") stepId: string,
     @Body()
     body: Partial<{
@@ -81,7 +108,7 @@ export class ScenariosController {
       orderIndex: number;
     }>,
   ) {
-    return this.scenariosService.updateStep(stepId, body);
+    return publicStep(await this.scenariosService.updateStep(stepId, body));
   }
 
   @Delete("steps/:stepId")
@@ -95,8 +122,8 @@ export class ScenariosController {
   }
 
   @Get(":id")
-  get(@Param("id") id: string) {
-    return this.scenariosService.get(id);
+  async get(@Param("id") id: string) {
+    return publicScenario(await this.scenariosService.get(id));
   }
 
   @Patch(":id")
@@ -124,7 +151,7 @@ export class ScenariosController {
   }
 
   @Post(":id/steps")
-  addStep(
+  async addStep(
     @Param("id") id: string,
     @Body()
     body: {
@@ -134,7 +161,7 @@ export class ScenariosController {
       enabled?: boolean;
     },
   ) {
-    return this.scenariosService.addStep(id, body);
+    return publicStep(await this.scenariosService.addStep(id, body));
   }
 
   @Post(":id/reorder")

@@ -8,6 +8,10 @@ import { maskSecrets, validateMappings } from "@qa-workbench/shared";
 import { maskDeep } from "../common/mask.util";
 import { DatabaseConnectorsService } from "../database-connectors/database-connectors.service";
 import { PrismaService } from "../prisma/prisma.service";
+import { ConfigService } from "@nestjs/config";
+import { encryptSecret, resolveEncryptionKey } from "../common/crypto.util";
+import { UiRecorderService } from "../scenario-engine/ui/ui-recorder.service";
+import { publicUiConfig, sealUiConfig } from "../scenario-engine/ui/ui-types";
 import {
   isBinding,
   isResponseSource,
@@ -53,13 +57,94 @@ export type ImportItem =
     }
   | { index: number; ok: false; code: string; preview: string };
 
+/** A step as the client sees it: secret values typed in UI steps are never sent back. */
+export function publicStep<T extends { type: string; config: unknown }>(step: T): T {
+  return step.type === "UI_FLOW" ? { ...step, config: publicUiConfig(asRecord(step.config)) as T["config"] } : step;
+}
+
+export function publicScenario<T extends { steps: Array<{ type: string; config: unknown }> }>(scenario: T): T {
+  return { ...scenario, steps: scenario.steps.map(publicStep) };
+}
+
 @Injectable()
 export class ScenariosService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly runner: ScenarioRunner,
     private readonly connectors: DatabaseConnectorsService,
+    private readonly recorder: UiRecorderService,
+    private readonly config: ConfigService,
   ) {}
+
+  private encrypt = (plain: string) => encryptSecret(plain, resolveEncryptionKey(this.config.get<string>("SECRETS_ENCRYPTION_KEY")));
+
+  /** A UI step's config with typed secrets encrypted (the current ones kept when not retyped). */
+  private sealUi(config: Record<string, unknown>, current: Record<string, unknown> | null) {
+    try {
+      return sealUiConfig(config, current, this.encrypt);
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : "Invalid UI step");
+    }
+  }
+
+  // ── UI recording ──────────────────────────────────────────────────────
+
+  async startRecording(scenarioId: string, body: { startUrl?: unknown; stepId?: unknown }) {
+    const scenario = await this.get(scenarioId);
+    const stepId = typeof body.stepId === "string" ? body.stepId : null;
+    if (stepId && !scenario.steps.some((step) => step.id === stepId && step.type === "UI_FLOW")) throw new NotFoundException("Step not found");
+    const { page: _page, ...view } = await this.recorder.start({ scenarioId, stepId, startUrl: body.startUrl });
+    return view;
+  }
+
+  recordingStatus(id: string) {
+    return this.recorder.status(id);
+  }
+
+  stopRecording(id: string) {
+    return this.recorder.stop(id);
+  }
+
+  discardRecording(id: string) {
+    return this.recorder.discard(id);
+  }
+
+  /**
+   * Save a finished recording: a new UI step at the end, or — when it was
+   * started from a step — appended to that step's actions or replacing them.
+   */
+  async saveRecording(id: string, body: { name?: unknown; mode?: unknown }) {
+    const recording = this.recorder.take(id);
+    if (recording.actions.length === 0) throw new BadRequestException("Nothing was recorded");
+    if (recording.stepId) {
+      const current = await this.prisma.scenarioStep.findUnique({ where: { id: recording.stepId } });
+      if (current) {
+        const config = asRecord(current.config);
+        const existing = Array.isArray(config.actions) ? (config.actions as unknown[]) : [];
+        const replace = body.mode === "replace";
+        const next = {
+          ...config,
+          ...(replace ? { startUrl: recording.startUrl } : {}),
+          actions: replace ? recording.actions : [...existing, ...recording.actions],
+        };
+        return this.prisma.scenarioStep.update({
+          where: { id: current.id },
+          data: { config: this.sealUi(next, config) as Prisma.InputJsonValue },
+        });
+      }
+    }
+    const name = typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, 120) : `UI · ${hostAndPath(recording.startUrl)}`;
+    return this.prisma.scenarioStep.create({
+      data: {
+        scenarioId: recording.scenarioId,
+        name,
+        type: "UI_FLOW",
+        orderIndex: await this.nextOrderIndex(recording.scenarioId),
+        enabled: true,
+        config: this.sealUi({ startUrl: recording.startUrl, actions: recording.actions }, null) as Prisma.InputJsonValue,
+      },
+    });
+  }
 
   list() {
     return this.prisma.scenario.findMany({
@@ -165,6 +250,7 @@ export class ScenariosService {
       await this.connectors.assertStepConfig(input.config ?? {});
     }
     if (input.type === "HTTP_REQUEST") assertMappings(input.config);
+    if (input.type === "UI_FLOW") input = { ...input, config: this.sealUi({ startUrl: "", actions: [], ...(input.config ?? {}) }, null) };
     return this.prisma.scenarioStep.create({
       data: {
         scenarioId,
@@ -192,6 +278,7 @@ export class ScenariosService {
         await this.connectors.assertStepConfig(data.config);
       }
       if (current?.type === "HTTP_REQUEST") assertMappings(data.config);
+      if (current?.type === "UI_FLOW") data = { ...data, config: this.sealUi(data.config, asRecord(current.config)) };
     }
     return this.prisma.scenarioStep.update({
       where: { id: stepId },
@@ -671,6 +758,7 @@ function samplesFromRun(
         status: typeof output.status === "number" ? output.status : undefined,
         headers: asRecord(output.headers) as Record<string, string>,
         body: output.body,
+        ...(output.kind === "ui" ? { cookies: asRecord(output.cookies) as Record<string, string> } : {}),
       },
     ];
   });
@@ -757,4 +845,13 @@ function bodyKind(config: ParsedHttpRequest): "none" | "json" | "form" | "text" 
   if (typeof body === "object") return "json";
   const type = Object.entries(config.headers).find(([key]) => key.toLowerCase() === "content-type")?.[1] ?? "";
   return type.includes("x-www-form-urlencoded") || /^[^=&\s{}]+=/.test(String(body)) ? "form" : "text";
+}
+
+function hostAndPath(url: string) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.host}${parsed.pathname === "/" ? "" : parsed.pathname}`.slice(0, 80);
+  } catch {
+    return url.slice(0, 80);
+  }
 }

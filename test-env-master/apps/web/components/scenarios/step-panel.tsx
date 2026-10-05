@@ -21,6 +21,7 @@ import type { ConnectorChoice } from "@/components/scenarios/database-step-form"
 import { ManualRecovery, type ManualChoice } from "@/components/scenarios/manual-recovery";
 import { MappingPanel } from "@/components/scenarios/mapping-panel";
 import { ResponseErrorCard } from "@/components/scenarios/response-error";
+import { UiActionsTab, UiResultTab, type UiOutput } from "@/components/scenarios/ui-step";
 import { RequestEditor, RequestView } from "@/components/scenarios/request-tab";
 import { ResponseExplorer } from "@/components/scenarios/response-explorer";
 import { AssertionsTab, StepSettings } from "@/components/scenarios/step-settings";
@@ -28,7 +29,7 @@ import type { PickerRequest } from "@/components/scenarios/value-picker";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
-type Tab = "request" | "response" | "mapping" | "assertions" | "attempts" | "settings";
+type Tab = "request" | "response" | "mapping" | "assertions" | "attempts" | "settings" | "actions" | "result";
 
 export type StepActions = {
   pick: (request: PickerRequest) => void;
@@ -44,6 +45,8 @@ export type StepActions = {
   skipInput: () => Promise<void>;
   /** Detect and save the clear mappings of this step's unmapped fields. */
   autoMap: (stepId?: string) => void;
+  /** Record more actions into a UI step (or re-record it). */
+  recordUi: (step: Step) => void;
 };
 
 /** Focused details of one step: request, response, mappings, assertions, attempts, advanced settings. */
@@ -72,6 +75,7 @@ export function StepPanel({
 }) {
   const { t, n, err, label } = useI18n();
   const http = step.type === "HTTP_REQUEST";
+  const ui = step.type === "UI_FLOW";
   const index = steps.findIndex((item) => item.id === step.id);
   const stepRun = stepRunOf(step, run);
   const output = outputOf(stepRun);
@@ -89,7 +93,7 @@ export function StepPanel({
   }
   const stepNumber = (id: string | undefined) => steps.findIndex((item) => item.id === id) + 1;
 
-  const defaultTab: Tab = !http ? "settings" : output?.blocked?.length || broken ? "mapping" : "request";
+  const defaultTab: Tab = ui ? (stepRun ? "result" : "actions") : !http ? "settings" : output?.blocked?.length || broken ? "mapping" : "request";
   const [tab, setTab] = useState<Tab>(defaultTab);
   const [editing, setEditing] = useState(false);
   const tabs: Array<{ id: Tab; badge?: string; warn?: boolean }> = http
@@ -101,7 +105,9 @@ export function StepPanel({
         { id: "attempts", badge: attempts ? n(attempts) : undefined },
         { id: "settings" },
       ]
-    : [{ id: "response" }, { id: "settings" }];
+    : ui
+      ? [{ id: "actions", badge: n(((step.config.actions as unknown[]) ?? []).length) }, { id: "result" }, { id: "settings" }]
+      : [{ id: "response" }, { id: "settings" }];
 
   const { method } = httpSummary(step.config);
 
@@ -306,6 +312,17 @@ export function StepPanel({
         ) : null}
 
         {tab === "attempts" ? <AttemptHistory output={output} /> : null}
+
+        {tab === "actions" && ui ? (
+          <UiActionsTab
+            key={`${step.id}:${JSON.stringify(step.config).length}`}
+            step={step}
+            onSave={(config) => actions.saveStep(step.id, { config })}
+            onRecordMore={() => actions.recordUi(step)}
+          />
+        ) : null}
+
+        {tab === "result" && ui ? <UiResultTab output={stepRun ? (output as UiOutput | null) : null} error={stepRun?.error} /> : null}
 
         {tab === "settings" ? (
           <StepSettings

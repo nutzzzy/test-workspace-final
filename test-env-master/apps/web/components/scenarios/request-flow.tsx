@@ -1,6 +1,6 @@
 "use client";
 
-import { AlertTriangle, ArrowDown, ArrowUp, Copy, Link2, Play, Power, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, Copy, Link2, MonitorPlay, Play, Power, Trash2 } from "lucide-react";
 import { Menu } from "@/components/ui/menu";
 import {
   httpSummary,
@@ -65,7 +65,9 @@ export function RequestFlow({
         ].sort((a, b) => a - b);
         const broken = own.some((item) => NEEDS_REVIEW.includes(item.status));
         const http = step.type === "HTTP_REQUEST";
+        const ui = step.type === "UI_FLOW";
         const { method, url } = httpSummary(step.config);
+        const uiCount = ui && Array.isArray(step.config.actions) ? step.config.actions.length : 0;
         const selected = selectedId === step.id;
         const failed = state === "FAILED" || state === "BLOCKED" || state === "NEEDS_INPUT";
         return (
@@ -102,6 +104,11 @@ export function RequestFlow({
                   <span className="flex min-w-0 items-center gap-1.5">
                     {http ? (
                       <span className="shrink-0 font-mono text-[10px] font-semibold text-primary">{method}</span>
+                    ) : ui ? (
+                      <span className="inline-flex shrink-0 items-center gap-0.5 rounded border border-primary/40 px-1 text-[10px] font-semibold text-primary">
+                        <MonitorPlay className="h-3 w-3" aria-hidden />
+                        UI
+                      </span>
                     ) : (
                       <span className="shrink-0 rounded border border-border px-1 text-[10px] text-muted-foreground">
                         {label("stepType", step.type)}
@@ -112,6 +119,13 @@ export function RequestFlow({
                   {http ? (
                     <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground dir-ltr" dir="ltr" title={url}>
                       {url}
+                    </span>
+                  ) : ui ? (
+                    <span className="mt-0.5 flex min-w-0 gap-1.5 text-[10px] text-muted-foreground">
+                      <span className="truncate font-mono" dir="ltr" title={String(step.config.startUrl ?? "")}>
+                        {String(step.config.startUrl ?? "")}
+                      </span>
+                      <span className="shrink-0">· {t("uiStep.actionCount", { count: n(uiCount) })}</span>
                     </span>
                   ) : null}
                 </span>

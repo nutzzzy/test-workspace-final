@@ -38,6 +38,7 @@ export enum ScenarioStepType {
   DELAY = "DELAY",
   CONDITION = "CONDITION",
   DATABASE_ACTION = "DATABASE_ACTION",
+  UI_FLOW = "UI_FLOW",
 }
 
 export enum DatabaseType {

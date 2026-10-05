@@ -23,6 +23,7 @@ import {
 } from "@/components/scenarios/builder-types";
 import { CurlImportDialog } from "@/components/scenarios/curl-import-dialog";
 import { DatabaseStepDialog } from "@/components/scenarios/database-step-dialog";
+import { UiRecordDialog } from "@/components/scenarios/ui-step";
 import type { ConnectorChoice } from "@/components/scenarios/database-step-form";
 import type { ManualChoice } from "@/components/scenarios/manual-recovery";
 import { RequestFlow } from "@/components/scenarios/request-flow";
@@ -39,7 +40,7 @@ const TEMPLATES: Record<string, Record<string, unknown>> = {
   EXTRACT_VARIABLE: { variable: "name", path: "body.data.id" },
   CONDITION: { left: "{{status}}", op: "equals", right: "OK" },
 };
-const OTHER_TYPES = ["ASSERTION", "DELAY", "DATABASE_ACTION", "SET_VARIABLE", "EXTRACT_VARIABLE", "CONDITION"];
+const OTHER_TYPES = ["UI_FLOW", "ASSERTION", "DELAY", "DATABASE_ACTION", "SET_VARIABLE", "EXTRACT_VARIABLE", "CONDITION"];
 const POLL_MS = 500;
 
 function readDismissed(scenarioId: string): string[] {
@@ -73,6 +74,7 @@ export default function ScenariosPage() {
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [dbStepOpen, setDbStepOpen] = useState(false);
+  const [uiRecord, setUiRecord] = useState<{ step: Step | null } | null>(null);
   const [picker, setPicker] = useState<PickerRequest | null>(null);
   const [confirm, setConfirm] = useState<{ title: string; body: string; action: () => Promise<void> } | null>(null);
   const [dismissed, setDismissed] = useState<string[]>([]);
@@ -293,6 +295,11 @@ export default function ScenariosPage() {
       setDbStepOpen(true);
       return;
     }
+    // A UI step is recorded in a browser first.
+    if (type === "UI_FLOW") {
+      setUiRecord({ step: null });
+      return;
+    }
     void guarded(() =>
       createStep(type, type === "HTTP_REQUEST" ? t("builder.flow.newRequestName") : label("stepType", type), TEMPLATES[type] ?? {}),
     );
@@ -345,6 +352,7 @@ export default function ScenariosPage() {
     accept: (suggestion) => void accept([suggestion]),
     dismiss,
     autoMap: (stepId) => void autoMap(stepId),
+    recordUi: (step) => setUiRecord({ step }),
     addAssertion: (step, path, value) =>
       guarded(async () => {
         if (!detail) return;
@@ -606,6 +614,19 @@ export default function ScenariosPage() {
           onImported={async ({ imported }) => {
             toast.notify("success", t("builder.import.done", { count: n(imported) }));
             await Promise.all([refresh(), loadList()]);
+          }}
+        />
+      ) : null}
+
+      {uiRecord && detail ? (
+        <UiRecordDialog
+          scenarioId={detail.id}
+          step={uiRecord.step}
+          onClose={() => setUiRecord(null)}
+          onSaved={async (saved) => {
+            toast.notify("success", t("uiStep.saved"));
+            await refresh();
+            setSelectedStepId(saved.id);
           }}
         />
       ) : null}

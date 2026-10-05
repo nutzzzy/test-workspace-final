@@ -15,6 +15,8 @@ export type SampleResponse = {
   status?: number;
   headers?: Record<string, string>;
   body?: unknown;
+  /** Cookies a UI step's browser held. */
+  cookies?: Record<string, string>;
 };
 
 export type DependencyLocation = "url" | "path" | "header" | "query" | "body" | "form" | "cookie";
@@ -62,22 +64,23 @@ export function analyzeDependencies(
   steps: FlowHttpStep[],
   samples: SampleResponse[],
 ): DependencySuggestion[] {
-  const http = [...steps]
-    .filter((step) => (step.type ?? "HTTP_REQUEST") === "HTTP_REQUEST")
+  // HTTP steps consume and produce; a UI step produces too (cookies, storage, URL of the page it left).
+  const flow = [...steps]
+    .filter((step) => ["HTTP_REQUEST", "UI_FLOW"].includes(step.type ?? "HTTP_REQUEST"))
     .sort((a, b) => a.orderIndex - b.orderIndex);
   const suggestions: DependencySuggestion[] = [];
   const seen = new Set<string>();
 
-  for (let index = 0; index < http.length; index += 1) {
-    const producer = http[index];
+  for (let index = 0; index < flow.length; index += 1) {
+    const producer = flow[index];
     if (!producer) continue;
     const sample = samples.find((item) => item.stepId === producer.id);
     if (!sample) continue;
-    const found = leaves(sample.body, sample.status);
+    const found = [...leaves(sample.body, sample.status), ...cookieLeaves(producer.type === "UI_FLOW" ? sample.cookies : undefined)];
     const counts = new Map<string, number>();
     for (const leaf of found) counts.set(leaf.value, (counts.get(leaf.value) ?? 0) + 1);
 
-    for (const consumer of http.slice(index + 1)) {
+    for (const consumer of flow.slice(index + 1).filter((step) => (step.type ?? "HTTP_REQUEST") === "HTTP_REQUEST")) {
       for (const target of requestTargets(consumer.config)) {
         if (target.value.includes("{{")) continue;
         for (const leaf of found) {
@@ -165,6 +168,14 @@ function leaves(body: unknown, status?: number): Leaf[] {
       value: leaf.value,
       secret: /token|password|secret|authorization|cookie|api[_-]?key/i.test(leaf.key),
     }));
+}
+
+/** Cookies of a UI step, addressed the way the value registry stores them. */
+function cookieLeaves(cookies: Record<string, string> | undefined): Leaf[] {
+  if (!cookies) return [];
+  return Object.entries(cookies)
+    .filter(([, value]) => typeof value === "string" && value.length >= 2 && !COMMON.has(value.toLowerCase()))
+    .map(([name, value]) => ({ path: `response.cookies.${name}`, value, secret: true }));
 }
 
 type Target = { location: DependencyLocation; detail: string; value: string; address: InputAddress & { key: string } };

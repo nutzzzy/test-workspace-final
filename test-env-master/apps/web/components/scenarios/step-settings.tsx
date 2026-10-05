@@ -164,7 +164,8 @@ export function StepSettings({
   const { t } = useI18n();
   const http = step.type === "HTTP_REQUEST";
   const recovery = (step.config.recovery && typeof step.config.recovery === "object" ? step.config.recovery : {}) as Record<string, unknown>;
-  const rest = omit(step.config, http ? FORM_KEYS : ["continueOnFailure"]);
+  // A UI step's actions are edited in its Actions tab.
+  const rest = omit(step.config, http ? FORM_KEYS : step.type === "UI_FLOW" ? ["continueOnFailure", "actions"] : ["continueOnFailure"]);
   const [name, setName] = useState(step.name);
   const [enabled, setEnabled] = useState(step.enabled);
   const [continueOnFailure, setContinueOnFailure] = useState(step.config.continueOnFailure === true);
@@ -207,6 +208,8 @@ export function StepSettings({
     } else if (step.type === "DATABASE_ACTION") {
       // The database form has its own "continue on failure" control.
       config = databaseStepConfig(db);
+    } else if (step.type === "UI_FLOW") {
+      config = { ...config, actions: step.config.actions ?? [], continueOnFailure: continueOnFailure || undefined };
     } else {
       config = { ...config, continueOnFailure: continueOnFailure || undefined };
     }

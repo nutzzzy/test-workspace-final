@@ -31,6 +31,10 @@ export type StepExecutionResult = {
   important?: RegistryView[];
   /** What the response said was wrong, and which request input and mapping it is about. */
   responseError?: ResponseError;
+  /** UI step: values for later steps (cookies, storage, URL); not stored as such. */
+  uiProduced?: UiProduced;
+  /** UI step: locators that worked better than the remembered ones. */
+  uiLearned?: UiLearning[];
 };
 
 import { isSecretKey, maskDeep } from "../common/mask.util";
@@ -40,6 +44,7 @@ import type { ManualRecoveryOptions } from "./flow/manual-recovery";
 import type { ExtractionOutcome } from "./flow/response-mapping";
 import type { AssertionCheck } from "./flow/recover-step";
 import type { ResponseError } from "./flow/body-error";
+import type { UiLearning, UiProduced } from "./executors/ui-flow.executor";
 import { ValueRegistry, type RegistryView } from "./flow/value-registry";
 
 export class ExecutionContext {
@@ -58,6 +63,9 @@ export class ExecutionContext {
   private varTypes = new Map<string, "number" | "boolean" | "json">();
   private cancelled = false;
   private readonly abortHandlers = new Set<() => void>();
+  /** Things a run keeps between steps (the UI steps' browser session), closed by dispose(). */
+  readonly resources = new Map<string, unknown>();
+  private readonly disposers: Array<() => Promise<void> | void> = [];
   lastHttpResponse: {
     status: number;
     headers: Record<string, string>;
@@ -113,6 +121,23 @@ export class ExecutionContext {
 
   isCancelled() {
     return this.cancelled;
+  }
+
+  onDispose(handler: () => Promise<void> | void) {
+    this.disposers.push(handler);
+  }
+
+  /** Release what the run kept open (browsers). Safe to call twice. */
+  async dispose() {
+    const handlers = this.disposers.splice(0);
+    this.resources.clear();
+    for (const handler of handlers.reverse()) {
+      try {
+        await handler();
+      } catch {
+        // ignore cleanup errors
+      }
+    }
   }
 
   get(key: string): string | undefined {

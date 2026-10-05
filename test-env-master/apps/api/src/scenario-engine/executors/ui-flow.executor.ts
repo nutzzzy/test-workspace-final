@@ -1,0 +1,387 @@
+import type { Browser, BrowserContext, Frame, Page } from "playwright-core";
+import { lookup } from "../auto-bind";
+import type { ExecutionContext, StepExecutionResult, StepExecutor } from "../types";
+import { pageErrorsMain } from "../ui/recorder-script";
+import { describeCandidate, launchBrowser, locate, type Located } from "../ui/ui-browser";
+import { describeAction, readUiConfig, type LocatorCandidate, type UiAction, type UiFlowConfig } from "../ui/ui-types";
+
+/** One replayed action, as shown in the step result. */
+export type UiActionResult = {
+  id: string;
+  kind: UiAction["kind"];
+  label: string;
+  status: "PASSED" | "FAILED" | "SKIPPED";
+  durationMs: number;
+  /** How the element was found. */
+  how?: string;
+  /** Found another way than last time: the new way is remembered. */
+  healed?: boolean;
+  error?: string;
+  optional?: boolean;
+};
+
+/** A locator that worked better than the remembered one, to save on the step. */
+export type UiLearning = { actionId: string; candidateIndex: number; healedCandidate?: LocatorCandidate };
+
+/** Values a UI step leaves for later steps (cookies, storage, URL), recorded in the value registry. */
+export type UiProduced = { url: string; body: Record<string, unknown>; cookies: Record<string, string> };
+
+type Session = { browser: Browser; context: BrowserContext; page: Page };
+
+const SESSION_KEY = "ui-session";
+const DEFAULT_TIMEOUT_MS = 15_000;
+const MAX_SCREENSHOT_BYTES = 450_000;
+
+/**
+ * Replays a recorded UI flow in a headless browser. Consecutive UI steps of a
+ * run share one browser session (cookies, storage, open page) unless a step
+ * asks for a new one; it is closed when the run ends.
+ */
+export class UiFlowExecutor implements StepExecutor {
+  readonly type = "UI_FLOW";
+
+  constructor(private readonly decrypt: (payload: string) => string) {}
+
+  async execute(config: Record<string, unknown>, context: ExecutionContext): Promise<StepExecutionResult> {
+    const parsed = readUiConfig(config);
+    if (!parsed.ok) return { status: "FAILED", error: parsed.error };
+    const flow = parsed.value;
+    const timeout = flow.actionTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const results: UiActionResult[] = [];
+    const learned: UiLearning[] = [];
+
+    let session: Session;
+    try {
+      session = await this.session(context, flow);
+    } catch (error) {
+      return { status: "FAILED", error: error instanceof Error ? error.message : "Could not start the browser" };
+    }
+    const stopOnCancel = context.onAbort(() => void session.page.close().catch(() => undefined));
+
+    let failure: string | undefined;
+    let page = session.page;
+    try {
+      // Recording started at the start URL, so replay does too (the session's cookies are kept).
+      const startUrl = fill(flow.startUrl, context);
+      await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: Math.max(timeout, 30_000) });
+      await settle(page);
+
+      // Errors already on the page before the final submit are not caused by it.
+      const submit = lastSubmit(flow.actions);
+      let errorsBefore = new Set<string>();
+      for (const action of flow.actions) {
+        if (context.isCancelled()) return { status: "CANCELLED", error: "Cancelled during UI step" };
+        const started = Date.now();
+        const label = action.label || describeAction(action);
+        try {
+          page = await pageFor(session, action.tab ?? 0, timeout);
+          if (action === submit) errorsBefore = new Set(await page.evaluate(pageErrorsMain).catch(() => [] as string[]));
+          const located = await this.perform(page, action, context, timeout);
+          if (located && (located.healed || located.healedCandidate)) {
+            learned.push({ actionId: action.id, candidateIndex: located.candidateIndex, healedCandidate: located.healedCandidate });
+          }
+          results.push({
+            id: action.id,
+            kind: action.kind,
+            label,
+            status: "PASSED",
+            durationMs: Date.now() - started,
+            ...(located ? { how: located.how, healed: located.healed } : {}),
+            ...(action.optional ? { optional: true } : {}),
+          });
+        } catch (error) {
+          const message = context.isCancelled() ? "Cancelled" : error instanceof Error ? firstLine(error.message) : "Action failed";
+          results.push({ id: action.id, kind: action.kind, label, status: "FAILED", durationMs: Date.now() - started, error: message, ...(action.optional ? { optional: true } : {}) });
+          if (context.isCancelled()) return { status: "CANCELLED", error: "Cancelled during UI step" };
+          if (!action.optional) {
+            failure = `${label}: ${message}`;
+            break;
+          }
+        }
+      }
+      // Actions after a failure did not run.
+      for (const action of flow.actions.slice(results.length)) {
+        results.push({ id: action.id, kind: action.kind, label: action.label || describeAction(action), status: "SKIPPED", durationMs: 0 });
+      }
+
+      await settle(page);
+      const pageErrors = await page.evaluate(pageErrorsMain).catch(() => [] as string[]);
+      const newErrors = pageErrors.filter((item) => !errorsBefore.has(item));
+      if (!failure && submit && newErrors.length && flow.failOnPageError !== false) {
+        failure = `The page shows an error: ${newErrors[0]}`;
+      }
+      const produced = await this.produced(session, page);
+      const screenshot = await shot(page);
+      return {
+        status: failure ? "FAILED" : "PASSED",
+        ...(failure ? { error: failure } : {}),
+        resolvedInput: { startUrl, actions: flow.actions.length },
+        output: {
+          kind: "ui",
+          url: page.url(),
+          title: await page.title().catch(() => ""),
+          actions: results,
+          ...(pageErrors.length ? { pageErrors } : {}),
+          ...(screenshot ? { screenshot } : {}),
+          // Shown like a response: later steps map values from it.
+          body: produced.body,
+          cookies: produced.cookies,
+        },
+        uiProduced: produced,
+        uiLearned: learned,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? firstLine(error.message) : "UI step failed";
+      const screenshot = await shot(page);
+      return {
+        status: context.isCancelled() ? "CANCELLED" : "FAILED",
+        error: message,
+        output: { kind: "ui", url: page.url(), actions: results, ...(screenshot ? { screenshot } : {}) },
+      };
+    } finally {
+      stopOnCancel();
+    }
+  }
+
+  /** The run's browser session: the previous UI step's, or a new one. */
+  private async session(context: ExecutionContext, flow: UiFlowConfig): Promise<Session> {
+    const existing = context.resources.get(SESSION_KEY) as Session | undefined;
+    if (existing && !flow.newSession && existing.browser.isConnected() && !existing.page.isClosed()) return existing;
+    if (existing) await existing.browser.close().catch(() => undefined);
+    const browser = await launchBrowser({ headless: true });
+    const browserContext = await browser.newContext({
+      viewport: flow.viewport ?? { width: 1366, height: 860 },
+      ignoreHTTPSErrors: false,
+    });
+    const page = await browserContext.newPage();
+    const session = { browser, context: browserContext, page };
+    context.resources.set(SESSION_KEY, session);
+    context.onDispose(async () => {
+      await browser.close().catch(() => undefined);
+    });
+    return session;
+  }
+
+  private async perform(page: Page, action: UiAction, context: ExecutionContext, timeout: number): Promise<Located | null> {
+    const scope = await frameFor(page, action.frameUrl, timeout);
+    const value = () => {
+      if (action.secret) {
+        if (!action.valueEnc) throw new Error("The secret value of this action is missing; type it again in the step");
+        const plain = this.decrypt(action.valueEnc);
+        context.markSecret(plain);
+        return plain;
+      }
+      return fill(action.value ?? "", context);
+    };
+    const find = async () => {
+      if (!action.target) throw new Error("This action has no element");
+      return locate(scope, action.target, timeout, () => context.isCancelled());
+    };
+
+    switch (action.kind) {
+      case "navigate": {
+        await page.goto(fill(action.url ?? action.value ?? "", context), { waitUntil: "domcontentloaded", timeout: Math.max(timeout, 30_000) });
+        await settle(page);
+        return null;
+      }
+      case "click": {
+        const located = await find();
+        try {
+          await located.locator.click({ timeout });
+        } catch (error) {
+          // Covered by an overlay that is about to go away, or animating: one forced try.
+          if (!/intercepts pointer events|not stable|outside of the viewport/i.test(String(error))) throw error;
+          await located.locator.click({ timeout, force: true });
+        }
+        await settle(page);
+        return located;
+      }
+      case "fill": {
+        const located = await find();
+        const text = value();
+        try {
+          await located.locator.fill(text, { timeout });
+        } catch {
+          // Masked or custom inputs that refuse fill(): type it like a user.
+          await located.locator.click({ timeout });
+          await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
+          await page.keyboard.type(text, { delay: 15 });
+        }
+        return located;
+      }
+      case "select": {
+        const located = await find();
+        const wanted = value();
+        try {
+          await located.locator.selectOption({ value: wanted }, { timeout });
+        } catch {
+          if (!action.optionLabel) throw new Error(`Option "${wanted}" not found`);
+          await located.locator.selectOption({ label: action.optionLabel }, { timeout });
+        }
+        await settle(page);
+        return located;
+      }
+      case "check":
+      case "uncheck": {
+        const located = await find();
+        try {
+          if (action.kind === "check") await located.locator.check({ timeout });
+          else await located.locator.uncheck({ timeout });
+        } catch {
+          // Custom checkboxes: a click toggles them.
+          await located.locator.click({ timeout });
+        }
+        await settle(page);
+        return located;
+      }
+      case "press": {
+        const key = action.value || "Enter";
+        if (action.target) {
+          const located = await find();
+          await located.locator.press(key, { timeout });
+          await settle(page);
+          return located;
+        }
+        await page.keyboard.press(key);
+        await settle(page);
+        return null;
+      }
+      case "waitForText":
+      case "assertText": {
+        const text = value();
+        await scope.getByText(text, { exact: false }).first().waitFor({ state: "visible", timeout });
+        return null;
+      }
+      case "assertUrl": {
+        const part = value();
+        const deadline = Date.now() + timeout;
+        while (!page.url().includes(part)) {
+          if (Date.now() > deadline) throw new Error(`The URL is ${page.url()}, expected it to contain "${part}"`);
+          await page.waitForTimeout(200);
+        }
+        return null;
+      }
+    }
+  }
+
+  /** Cookies, storage and URL of the page after the step. */
+  private async produced(session: Session, page: Page): Promise<UiProduced> {
+    const url = page.url();
+    const cookies = Object.fromEntries((await session.context.cookies().catch(() => [])).slice(0, 60).map((cookie) => [cookie.name, cookie.value]));
+    const storage = await page
+      .evaluate(() => {
+        const read = (store: Storage) => {
+          const out: Record<string, string> = {};
+          for (let index = 0; index < Math.min(store.length, 60); index += 1) {
+            const key = store.key(index);
+            if (key) out[key] = (store.getItem(key) ?? "").slice(0, 8000);
+          }
+          return out;
+        };
+        try {
+          return { local: read(localStorage), session: read(sessionStorage) };
+        } catch {
+          return { local: {}, session: {} };
+        }
+      })
+      .catch(() => ({ local: {}, session: {} }));
+    let parsedUrl: URL | null = null;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      parsedUrl = null;
+    }
+    return {
+      url,
+      cookies,
+      body: {
+        url,
+        path: parsedUrl?.pathname ?? "",
+        query: parsedUrl ? Object.fromEntries(parsedUrl.searchParams.entries()) : {},
+        title: await page.title().catch(() => ""),
+        // Stored JSON (e.g. {"token": …}) is opened up so its fields can be mapped.
+        localStorage: openJson(storage.local),
+        sessionStorage: openJson(storage.session),
+      },
+    };
+  }
+}
+
+/** {{variables}} in a recorded value. */
+function fill(template: string, context: ExecutionContext): string {
+  return template.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (_match, key: string) => {
+    const value = lookup(key, context);
+    if (value === undefined) throw new Error(`Unresolved variable: {{${key}}}`);
+    return value;
+  });
+}
+
+async function settle(page: Page) {
+  await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => undefined);
+  await page.waitForLoadState("networkidle", { timeout: 2_500 }).catch(() => undefined);
+}
+
+async function pageFor(session: Session, tab: number, timeout: number): Promise<Page> {
+  const pages = session.context.pages().filter((page) => !page.isClosed());
+  if (pages[tab]) return pages[tab]!;
+  // A tab the previous action opens (target=_blank, window.open).
+  const opened = await session.context.waitForEvent("page", { timeout });
+  await opened.waitForLoadState("domcontentloaded").catch(() => undefined);
+  return opened;
+}
+
+async function frameFor(page: Page, frameUrl: string | undefined, timeout: number): Promise<Page | Frame> {
+  if (!frameUrl) return page;
+  const wanted = stripQuery(frameUrl);
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const frame = page.frames().find((item) => item !== page.mainFrame() && stripQuery(item.url()) === wanted);
+    if (frame) return frame;
+    await page.waitForTimeout(250);
+  }
+  return page;
+}
+
+function stripQuery(url: string) {
+  return url.split(/[?#]/)[0] ?? url;
+}
+
+/** The final submit (a click or Enter after which only checks follow): where a form shows its errors. */
+function lastSubmit(actions: UiAction[]) {
+  const last = [...actions].reverse().find((action) => action.kind !== "waitForText" && action.kind !== "assertText" && action.kind !== "assertUrl");
+  return last && (last.kind === "click" || last.kind === "press") ? last : undefined;
+}
+
+function openJson(values: Record<string, string>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(values).map(([key, value]) => {
+      const trimmed = value.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          return [key, JSON.parse(trimmed)];
+        } catch {
+          return [key, value];
+        }
+      }
+      return [key, value];
+    }),
+  );
+}
+
+async function shot(page: Page): Promise<string | null> {
+  try {
+    if (page.isClosed()) return null;
+    const buffer = await page.screenshot({ type: "jpeg", quality: 55, timeout: 5_000 });
+    if (buffer.byteLength > MAX_SCREENSHOT_BYTES) return null;
+    return `data:image/jpeg;base64,${buffer.toString("base64")}`;
+  } catch {
+    return null;
+  }
+}
+
+function firstLine(message: string) {
+  // Playwright errors carry a call log after the first line.
+  return message.split("\n")[0]!.replace(/^locator\.\w+: /, "").slice(0, 400);
+}
+
+export { describeCandidate };

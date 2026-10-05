@@ -1,6 +1,7 @@
 import { AssertionExecutor } from "./executors/assertion.executor";
 import { ExtractVariableExecutor } from "./executors/extract-variable.executor";
 import { expectedStatuses as expectedStatusOf, HttpRequestExecutor } from "./executors/http-request.executor";
+import { UiFlowExecutor, type UiLearning } from "./executors/ui-flow.executor";
 import { applyBindings, readBindings, upsertBinding, verifyBindings, type StepBinding } from "./flow/bindings";
 import {
   buildManualOptions,
@@ -62,6 +63,8 @@ export type OrchestrationOptions = {
   onSaveBindings?: (stepId: string, bindings: StepBinding[]) => Promise<void>;
   /** Optional model ranking of LOW candidates (`recovery.aiAssist`). */
   ranker?: SemanticRanker;
+  /** Remember locators of a UI step that worked better than the saved ones. */
+  onLearnUi?: (stepId: string, learned: UiLearning[]) => Promise<void>;
 };
 
 /** A user may try several values; this bounds a single step's manual loop. */
@@ -121,6 +124,7 @@ export async function orchestrateSteps(
       } else {
         result = await executor.execute(step.config ?? {}, context);
         if (executor instanceof ExtractVariableExecutor && result.status === "PASSED") markExtraction(result, context);
+        if (executor instanceof UiFlowExecutor) result = await afterUiStep(step, result, context, options);
       }
     } catch (error) {
       result = {
@@ -158,8 +162,42 @@ export async function orchestrateSteps(
   if (context.isCancelled()) {
     finalStatus = "CANCELLED";
   }
+  // Browsers of UI steps live as long as the run.
+  await context.dispose();
 
   return { status: finalStatus, error: runError, stepResults };
+}
+
+/**
+ * After a UI step: what it left (cookies, storage, URL) becomes values later
+ * steps can map, like an HTTP response; locators that worked better than the
+ * saved ones are remembered on the step.
+ */
+async function afterUiStep(
+  step: OrchestrationStep,
+  result: StepExecutionResult,
+  context: ExecutionContext,
+  options: OrchestrationOptions,
+): Promise<StepExecutionResult> {
+  const { uiProduced, uiLearned, ...rest } = result;
+  if (uiLearned?.length && step.id && options.onLearnUi) await options.onLearnUi(step.id, uiLearned).catch(() => undefined);
+  if (rest.status !== "PASSED" || !uiProduced) return rest;
+  let path = "";
+  try {
+    path = new URL(uiProduced.url).pathname;
+  } catch {
+    path = "";
+  }
+  const produced = context.registry.addResponse(
+    { stepId: step.id, stepName: step.name, orderIndex: step.orderIndex },
+    { status: 200, headers: path ? { location: path } : {}, body: uiProduced.body, cookies: uiProduced.cookies },
+  );
+  for (const entry of produced) if (entry.secret) context.markSecret(entry.text);
+  for (const value of Object.values(uiProduced.cookies)) context.markSecret(value);
+  const secrets = context.secretSet();
+  return produced.length
+    ? { ...rest, values: produced.slice(0, 80).map((entry) => viewEntry(entry, secrets)), important: importantValues(produced, 8, secrets) }
+    : rest;
 }
 
 /** ASSERTION steps directly after an HTTP step check that step's response. */
