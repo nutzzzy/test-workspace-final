@@ -35,7 +35,7 @@ export type ResolvedHttpRequest = {
 /**
  * Optional `expectedStatus` (number or list). Without it the executor itself
  * reports any response as PASSED; in a scenario the orchestrator then requires
- * 2xx (or a status assertion) plus every attached assertion.
+ * 2xx/3xx (or a status assertion) plus every attached assertion.
  */
 export function expectedStatuses(config: Record<string, unknown>): number[] | null {
   const raw = config.expectedStatus;
@@ -204,9 +204,8 @@ export class HttpRequestExecutor implements StepExecutor {
         return { status: "CANCELLED", error: "Cancelled during HTTP request" };
       }
 
-      if ([301, 302, 303, 307, 308].includes(response.status)) {
-        throw new Error(`Redirects are not followed (status ${response.status})`);
-      }
+      // Redirects are not followed (the target could be any host), but a 3xx is a
+      // normal answer: its Location header and cookies are available to later steps.
 
       const rawBody = await response.text();
       if (rawBody.length > 1_000_000) {

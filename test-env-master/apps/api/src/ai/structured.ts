@@ -49,3 +49,46 @@ export function parseAndValidate<T>(content: string, schema: z.ZodType<T>): T {
   }
   return result.data;
 }
+
+/**
+ * Close a JSON object that was cut off while being written (a model stopped
+ * at its time limit). Everything after the last complete array element or
+ * top-level field is dropped, so no half-written item survives; the open
+ * containers are then closed. Null when nothing usable was written.
+ */
+export function closePartialJson(text: string): string | null {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  let safe = -1;
+  let safeStack: string[] = [];
+  const mark = (at: number) => {
+    safe = at;
+    safeStack = [...stack];
+  };
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{" || char === "[") {
+      stack.push(char === "{" ? "}" : "]");
+      // An empty list is fine; an empty item is not.
+      if (char === "[" || stack.length === 1) mark(index + 1);
+    } else if (char === "}" || char === "]") {
+      stack.pop();
+      if (stack.length === 0) return text.slice(start, index + 1);
+      mark(index + 1);
+    } else if (char === "," && (stack.length === 1 || stack[stack.length - 1] === "]")) {
+      mark(index);
+    }
+  }
+  if (safe < 0) return null;
+  return text.slice(start, safe) + [...safeStack].reverse().join("");
+}

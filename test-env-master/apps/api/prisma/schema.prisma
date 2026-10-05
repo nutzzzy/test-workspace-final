@@ -88,6 +88,9 @@ model AiConnection {
   enabled       Boolean   @default(true)
   temperature   Float     @default(0.2)
   timeoutMs     Int       @default(600000)
+  /// Longest time the model may spend writing one answer; at the limit the
+  /// answer written so far is used (streaming models). 0 = no limit.
+  answerBudgetMs Int      @default(180000)
   /// Context window requested from the model (tokens).
   contextTokens Int       @default(16384)
   /// Let reasoning models think before answering (slower, sometimes better).

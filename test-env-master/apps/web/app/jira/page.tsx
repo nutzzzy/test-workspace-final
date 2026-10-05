@@ -7,7 +7,6 @@ import {
   FileSpreadsheet,
   Keyboard,
   Plug,
-  Sparkles,
   Upload,
 } from "lucide-react";
 import { api, API_BASE } from "@/lib/api";
@@ -29,7 +28,7 @@ type Issue = {
   _count?: { testCases: number; risks: number; bugs: number };
 };
 
-type MethodId = "demo" | "file" | "manual" | "api";
+type MethodId = "file" | "manual" | "api";
 
 export default function JiraPage() {
   const { t, n, label, err } = useI18n();
@@ -152,26 +151,6 @@ export default function JiraPage() {
     }
   };
 
-  const onDemo = async () => {
-    setMethod("demo");
-    try {
-      await progress.run(
-        [
-          { to: 25, label: t("jira.progressPrepare") },
-          { to: 55, label: t("jira.progressDemo") },
-          { to: 88, label: t("jira.progressReload") },
-        ],
-        async () => {
-          await api("/jira/demo-import", { method: "POST", body: "{}" });
-          await reload();
-        },
-        { successLabel: t("jira.successDemo") },
-      );
-    } catch {
-      // banner
-    }
-  };
-
   const onManual = async () => {
     setMethod("manual");
     try {
@@ -234,17 +213,11 @@ export default function JiraPage() {
 
   const methods: Array<{
     id: MethodId;
-    icon: typeof Sparkles;
+    icon: typeof FileSpreadsheet;
     title: string;
     hint: string;
     recommended?: boolean;
   }> = [
-    {
-      id: "demo",
-      icon: Sparkles,
-      title: t("jira.stepDemo"),
-      hint: t("jira.stepDemoHint"),
-    },
     {
       id: "file",
       icon: FileSpreadsheet,
@@ -292,7 +265,7 @@ export default function JiraPage() {
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-xs text-muted-foreground">{t("jira.howHint")}</p>
-          <div className="grid gap-2 md:grid-cols-3">
+          <div className="grid gap-2 md:grid-cols-2">
             {methods.map((m) => {
               const Icon = m.icon;
               const active = method === m.id;
@@ -326,23 +299,6 @@ export default function JiraPage() {
           </div>
         </CardContent>
       </Card>
-
-      {method === "demo" ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>{t("jira.stepDemo")}</CardTitle>
-          </CardHeader>
-          <CardContent className="flex flex-wrap items-center gap-3">
-            <p className="flex-1 text-xs text-muted-foreground">
-              {t("jira.stepDemoHint")}
-            </p>
-            <Button disabled={busy} onClick={() => void onDemo()}>
-              <Sparkles className="h-3.5 w-3.5" />
-              {t("jira.loadDemo")}
-            </Button>
-          </CardContent>
-        </Card>
-      ) : null}
 
       {method === "file" ? (
         <Card>

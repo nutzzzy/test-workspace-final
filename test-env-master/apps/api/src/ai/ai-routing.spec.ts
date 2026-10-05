@@ -4,10 +4,15 @@ import { LearningService } from "../analysis/studio/learning";
 import type { PrismaService } from "../prisma/prisma.service";
 import { AIService, isExternal } from "./ai.service";
 
-// Model calls go through long-request (node http); here they are routed to the mocked fetch.
+// Model calls go through long-request (node http); here they are routed to the mocked fetch,
+// and the body is handed over as one streamed chunk.
 jest.mock("./long-request", () => ({
-  longRequest: (url: string, init: { method?: string; headers?: Record<string, string>; body?: string }) =>
-    fetch(url, { method: init.method, headers: init.headers, body: init.body }),
+  longRequest: async (url: string, init: { method?: string; headers?: Record<string, string>; body?: string; onData?: (chunk: string) => void }) => {
+    const response = await fetch(url, { method: init.method, headers: init.headers, body: init.body });
+    const text = await response.text();
+    if (response.ok) init.onData?.(`${text}\n`);
+    return { status: response.status, ok: response.ok, headers: response.headers, text: async () => text };
+  },
 }));
 
 type Row = Record<string, unknown> & { id: string; name: string; kind: string; baseUrl: string; model: string };
@@ -82,13 +87,28 @@ describe("AI routing", () => {
     expect(chain[0]!.id).toBe("reviewer");
   });
 
-  it("never sends text to an external service without consent and a key", async () => {
+  it("never sends text to an external service without consent", async () => {
     const ai = service([{ id: "x", name: "hosted", kind: "openai", baseUrl: "https://api.example.com/v1", model: "m" }]);
     const fetch = jest.spyOn(global, "fetch");
     expect(await ai.analysisStatus()).toMatchObject({ ready: false, reason: "external_not_allowed" });
     await expect(ai.call("analysis", { system: "s", prompt: "p", schema })).rejects.toThrow(/not available/);
     expect(fetch).not.toHaveBeenCalled();
     expect(isExternal("http://192.168.1.20:11434")).toBe(false);
+  });
+
+  it("stops a call queued behind another analysis as soon as it is cancelled", async () => {
+    const ai = service([local("a", "1001")]);
+    let answer!: () => void;
+    jest.spyOn(global, "fetch").mockImplementation(
+      () => new Promise<Response>((resolve) => (answer = () => resolve(ok({ answer: "first" })()))),
+    );
+    const first = ai.call("analysis", { system: "s", prompt: "p", schema });
+    const cancel = new AbortController();
+    const queued = ai.call("analysis", { system: "s", prompt: "p", schema }, { signal: cancel.signal });
+    cancel.abort();
+    await expect(queued).rejects.toThrow("cancelled");
+    answer();
+    await expect(first).resolves.toMatchObject({ data: { answer: "first" } });
   });
 
   it("asks again with the validation error when an answer does not fit the schema", async () => {

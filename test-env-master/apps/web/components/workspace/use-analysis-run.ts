@@ -10,6 +10,7 @@ export type StudioStage = "digest" | "understand" | "criteria" | "assessment" | 
 export type StageState = {
   state: "pending" | "running" | "done" | "failed" | "skipped";
   detail?: string;
+  tokens?: number;
   origins: Array<{ connectionId: string; name: string; model: string }>;
 };
 
@@ -118,7 +119,8 @@ export function useAnalysisRun(issueId: string | undefined, locale: Locale, onFi
   const cancel = useCallback(async () => {
     if (!issueId) return;
     await api(`/analysis/${issueId}/run/cancel`, { method: "POST", body: "{}" }).catch(() => undefined);
-  }, [issueId]);
+    await load();
+  }, [issueId, load]);
 
   return { status, error, running: status?.job?.state === "running", start, cancel, reload: load };
 }

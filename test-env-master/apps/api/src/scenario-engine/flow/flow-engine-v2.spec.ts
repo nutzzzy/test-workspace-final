@@ -38,7 +38,8 @@ function mockFetch(route: (call: Call) => Reply | null) {
     calls.push(call);
     const hit = route(call) ?? { status: 404, body: { message: "not found" } };
     const headers = new Headers({ "content-type": "application/json", ...(hit.headers ?? {}) });
-    return new Response(hit.status === 204 ? null : JSON.stringify(hit.body ?? {}), { status: hit.status, headers });
+    // 204 and 304 never carry a body.
+    return new Response(hit.status === 204 || hit.status === 304 ? null : JSON.stringify(hit.body ?? {}), { status: hit.status, headers });
   });
   return calls;
 }
@@ -239,11 +240,24 @@ describe("dependencies in every input location", () => {
 });
 
 describe("success definition", () => {
-  it.each([200, 201, 202, 204, 206])("HTTP %i passes when no status is configured", async (status) => {
+  it.each([200, 201, 202, 204, 206, 301, 302, 303, 304, 307, 308])("HTTP %i passes when no status is configured", async (status) => {
     mockFetch(() => ({ status, body: {} }));
     const { results } = await run([http("x", { method: "GET", url: `${BASE}/x` })]);
     expect(results[0]!.status).toBe("PASSED");
-    expect(results[0]!.assertions).toEqual([{ label: "status 2xx", passed: true }]);
+    expect(results[0]!.assertions).toEqual([{ label: "status 2xx/3xx", passed: true }]);
+  });
+
+  it("a redirect does not stop the scenario: the next step runs", async () => {
+    let calls = 0;
+    mockFetch(() => (++calls === 1 ? { status: 302, body: {} } : { status: 200, body: {} }));
+    const { results } = await run([http("login", { method: "POST", url: `${BASE}/login` }), http("home", { method: "GET", url: `${BASE}/home` })]);
+    expect(results.map((item) => item.status)).toEqual(["PASSED", "PASSED"]);
+  });
+
+  it.each([400, 401, 404])("HTTP %i without an expectation still does not pass", async (status) => {
+    mockFetch(() => ({ status, body: {} }));
+    const { results } = await run([http("x", { method: "GET", url: `${BASE}/x`, recovery: { enabled: false } })]);
+    expect(results[0]!.status).not.toBe("PASSED");
   });
 
   it("HTTP 500 without an expectation does not pass", async () => {
@@ -259,7 +273,7 @@ describe("success definition", () => {
     expect(results[0]!.error).toBe("Expected HTTP 201, got 200");
   });
 
-  it("2xx is not enough when an attached assertion fails", async () => {
+  it("a passing status is not enough when an attached assertion fails", async () => {
     mockFetch(() => ({ status: 200, body: { status: "PENDING" } }));
     const { results } = await run([
       http("x", { method: "GET", url: `${BASE}/x` }),

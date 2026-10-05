@@ -1,6 +1,7 @@
 import { maskSecrets } from "@qa-workbench/shared";
 import type { z } from "zod";
 import type { AppLocale } from "../../ai/localize-fa";
+import { TIME_LIMIT } from "../../ai/ai-provider";
 import type { CallOrigin, StageGroup } from "../../ai/ai.service";
 import * as P from "./prompts";
 import {
@@ -53,7 +54,7 @@ export type GuidanceScope = "criteria" | "questions" | "testCases" | "edgeCases"
 export type StudioLlm = <T>(
   group: StageGroup,
   stage: StudioStage,
-  call: { system: string; prompt: string; schema: z.ZodType<T>; locale: AppLocale },
+  call: { system: string; prompt: string; schema: z.ZodType<T>; locale: AppLocale; deadlineAt?: number },
 ) => Promise<{ data: T; origin: CallOrigin }>;
 
 export type SourceCriterion = { key: string; text: string; origin: string };
@@ -115,11 +116,36 @@ export type StudioRunInput = {
   budgetChars: number;
   onProgress?: (progress: StudioProgress) => void;
   isCancelled?: () => boolean;
+  /** Epoch ms the whole run must finish by; each stage gets its share and what is done is kept. */
+  deadline?: number;
+};
+
+/**
+ * Point of the run's time budget by which each stage must be done. Later
+ * stages build on earlier ones, so no stage may eat the time of the rest.
+ */
+const STAGE_DEADLINE: Record<StudioStage, number> = {
+  digest: 0.2,
+  understand: 0.35,
+  criteria: 0.55,
+  assessment: 0.82,
+  cases: 0.82,
+  edges: 0.82,
+  translate: 0.82,
+  review: 0.93,
+  // The rest is kept for saving the results.
+  automation: 0.97,
 };
 
 const CASE_BATCH = 3;
 const AUTOMATION_BATCH = 10;
 const MAX_UNDERSTANDING_CHARS = 14_000;
+
+/** Warning for a stage of which some batches were left out. */
+function partialNote(reason: unknown, missed: number, total: number) {
+  const text = reason instanceof Error ? reason.message : String(reason);
+  return maskSecrets(`${missed}/${total} batches left out — ${text}`).slice(0, 600);
+}
 
 /** Persian when Persian letters dominate. */
 export function detectLanguage(value: string): AppLocale {
@@ -234,9 +260,14 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
     if (input.isCancelled?.()) throw new Error("AI analysis was cancelled");
     input.onProgress?.({ stage, state, ...extra });
   };
+  const startedAt = Date.now();
+  const deadlineOf = (stage: StudioStage) =>
+    input.deadline ? startedAt + Math.round((input.deadline - startedAt) * STAGE_DEADLINE[stage]) : undefined;
   const ask = async <T>(stage: StudioStage, prompt: string, schema: z.ZodType<T>) => {
     if (input.isCancelled?.()) throw new Error("AI analysis was cancelled");
-    const answer = await llm(GROUP[stage], stage, { system: P.SYSTEM, prompt, schema, locale });
+    const deadlineAt = deadlineOf(stage);
+    if (deadlineAt && Date.now() >= deadlineAt) throw new Error(TIME_LIMIT);
+    const answer = await llm(GROUP[stage], stage, { system: P.SYSTEM, prompt, schema, locale, deadlineAt });
     (result.origins[stage] ??= []).push(answer.origin);
     progress(stage, "running", { origin: answer.origin });
     return answer.data;
@@ -250,7 +281,11 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
     } catch (error) {
       if (input.isCancelled?.()) throw error;
       result.errors[stage] = maskSecrets(error instanceof Error ? error.message : String(error)).slice(0, 600);
-      progress(stage, "failed", { detail: result.errors[stage] });
+      // Out of time is not a failure: the stage is skipped and the run keeps what it has.
+      const deadlineAt = deadlineOf(stage);
+      const outOfTime = Boolean(deadlineAt && Date.now() >= deadlineAt - 1_000);
+      if (outOfTime) result.errors[stage] = TIME_LIMIT;
+      progress(stage, outOfTime ? "skipped" : "failed", { detail: result.errors[stage] });
     }
   };
 
@@ -329,30 +364,39 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
   const criteriaText = targets.map((item) => `${item.key}: ${item.text}`).join("\n");
 
   // Independent stages; each is routed to its own connections and runs in parallel.
+  // Started in order of value: when a service limits concurrent requests, test cases go first.
   const parallel: Array<Promise<void>> = [];
-  if (wanted.has("assessment")) {
-    parallel.push(
-      guard("assessment", async () => {
-        const guidance = [input.guidance("questions"), input.guidance("risks"), input.guidance("strategy")].filter(Boolean).join("\n");
-        result.assessment = await ask("assessment", P.assessmentPrompt(context, locale, criteriaText, guidance), AssessmentSchema);
-      }),
-    );
-  }
   if (wanted.has("cases") && targets.length > 0) {
     parallel.push(
       guard("cases", async () => {
         const cases: CaseWithKeys[] = [];
         const keys = new Set(targets.map((item) => item.key));
-        for (let start = 0; start < targets.length; start += CASE_BATCH) {
-          const batch = targets.slice(start, start + CASE_BATCH);
-          progress("cases", "running", { detail: `${Math.min(start + CASE_BATCH, targets.length)}/${targets.length}` });
-          const answer = await ask("cases", P.casesPrompt(context, locale, batch, input.guidance("testCases")), CasesSchema);
-          for (const item of answer.testCases) {
+        const batches: Array<typeof targets> = [];
+        for (let start = 0; start < targets.length; start += CASE_BATCH) batches.push(targets.slice(start, start + CASE_BATCH));
+        // Batches run at once on hosted services (a local model queues them); a batch
+        // that runs out of time is left out and the others are kept.
+        let finished = 0;
+        progress("cases", "running", { detail: `0/${targets.length}` });
+        const answers = await Promise.allSettled(
+          batches.map(async (batch) => {
+            const answer = await ask("cases", P.casesPrompt(context, locale, batch, input.guidance("testCases")), CasesSchema);
+            finished += batch.length;
+            progress("cases", "running", { detail: `${finished}/${targets.length}` });
+            return answer;
+          }),
+        );
+        if (input.isCancelled?.()) throw new Error("AI analysis was cancelled");
+        answers.forEach((settled, index) => {
+          if (settled.status !== "fulfilled") return;
+          for (const item of settled.value.testCases) {
             if (!item.title || item.steps.length === 0 || !item.expectedResult) continue;
             const refs = item.criterionKeys.filter((key) => keys.has(key));
-            cases.push({ ...item, criterionKeys: refs.length ? refs : [batch[0]!.key] });
+            cases.push({ ...item, criterionKeys: refs.length ? refs : [batches[index]![0]!.key] });
           }
-        }
+        });
+        const missed = answers.find((settled) => settled.status === "rejected");
+        if (missed && cases.length === 0) throw missed.reason;
+        if (missed) result.errors.cases = partialNote(missed.reason, answers.filter((settled) => settled.status === "rejected").length, batches.length);
         result.cases = cases;
       }),
     );
@@ -365,6 +409,14 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
       }),
     );
   }
+  if (wanted.has("assessment")) {
+    parallel.push(
+      guard("assessment", async () => {
+        const guidance = [input.guidance("questions"), input.guidance("risks"), input.guidance("strategy")].filter(Boolean).join("\n");
+        result.assessment = await ask("assessment", P.assessmentPrompt(context, locale, criteriaText, guidance), AssessmentSchema);
+      }),
+    );
+  }
   if (wanted.has("translate") && result.sourceLanguage !== locale) {
     parallel.push(
       guard("translate", async () => {
@@ -373,7 +425,9 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
         result.translation = answer.acceptanceCriteria.length === written.length ? answer : { ...answer, acceptanceCriteria: [] };
       }),
     );
-  }
+  }  // Same language as the issue: nothing to translate.
+  else if (wanted.has("translate")) progress("translate", "skipped");
+
   await Promise.all(parallel);
 
   // A different model checks the drafts (the review chain prefers one).
@@ -402,14 +456,27 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
     if (cases.length > 0) {
       await guard("automation", async () => {
         const items: NonNullable<StudioResult["automation"]> = [];
-        for (let start = 0; start < cases.length; start += AUTOMATION_BATCH) {
-          const batch = cases.slice(start, start + AUTOMATION_BATCH).map((item, offset) => ({ index: start + offset, ...item }));
-          const answer = await ask("automation", P.automationPrompt(context, locale, JSON.stringify(batch), input.guidance("automation")), AutomationSchema);
-          for (const item of answer.items) {
-            if (item.index < start || item.index >= start + batch.length || items.some((existing) => existing.caseIndex === item.index)) continue;
+        const starts: number[] = [];
+        for (let start = 0; start < cases.length; start += AUTOMATION_BATCH) starts.push(start);
+        const answers = await Promise.allSettled(
+          starts.map((start) => {
+            const batch = cases.slice(start, start + AUTOMATION_BATCH).map((item, offset) => ({ index: start + offset, ...item }));
+            return ask("automation", P.automationPrompt(context, locale, JSON.stringify(batch), input.guidance("automation")), AutomationSchema);
+          }),
+        );
+        if (input.isCancelled?.()) throw new Error("AI analysis was cancelled");
+        answers.forEach((settled, position) => {
+          if (settled.status !== "fulfilled") return;
+          const start = starts[position]!;
+          const end = Math.min(start + AUTOMATION_BATCH, cases.length);
+          for (const item of settled.value.items) {
+            if (item.index < start || item.index >= end || items.some((existing) => existing.caseIndex === item.index)) continue;
             items.push({ caseIndex: item.index, suitability: item.suitability, layer: item.layer, rationale: item.rationale, prerequisites: item.prerequisites, tooling: item.tooling });
           }
-        }
+        });
+        const missed = answers.find((settled) => settled.status === "rejected");
+        if (missed && items.length === 0) throw missed.reason;
+        if (missed) result.errors.automation = partialNote(missed.reason, answers.filter((settled) => settled.status === "rejected").length, starts.length);
         result.automation = items;
       });
     }

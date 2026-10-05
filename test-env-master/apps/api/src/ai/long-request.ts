@@ -11,7 +11,7 @@ export type LongResponse = { status: number; ok: boolean; headers: { get(name: s
 
 export function longRequest(
   url: string,
-  init: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs: number },
+  init: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs: number; signal?: AbortSignal; onData?: (chunk: string) => void },
 ): Promise<LongResponse> {
   const target = new URL(url);
   const send = target.protocol === "https:" ? httpsRequest : httpRequest;
@@ -21,11 +21,15 @@ export function longRequest(
       {
         method: init.method ?? "GET",
         headers: { ...(init.headers ?? {}), ...(init.body !== undefined ? { "Content-Length": String(Buffer.byteLength(init.body)) } : {}) },
-        signal: AbortSignal.timeout(init.timeoutMs),
+        signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(init.timeoutMs)]) : AbortSignal.timeout(init.timeoutMs),
       },
       (res) => {
         const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("data", (chunk: Buffer) => {
+          chunks.push(chunk);
+          // Only a successful answer is streamed; an error body is read whole.
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) init.onData?.(chunk.toString("utf8"));
+        });
         res.on("error", reject);
         res.on("end", () => {
           const body = Buffer.concat(chunks).toString("utf8");
@@ -44,7 +48,9 @@ export function longRequest(
     );
     req.on("error", (error: Error) => {
       // Same shape as fetch's network failure, so callers handle both alike.
-      reject(error.name === "AbortError" ? Object.assign(new Error("The model did not answer in time"), { name: "TimeoutError" }) : new TypeError(`fetch failed: ${error.message}`));
+      if (init.signal?.aborted) reject(Object.assign(new Error("AI analysis was cancelled"), { name: "AbortError" }));
+      else if (error.name === "AbortError") reject(Object.assign(new Error("The model did not answer in time"), { name: "TimeoutError" }));
+      else reject(new TypeError(`fetch failed: ${error.message}`));
     });
     if (init.body !== undefined) req.write(init.body);
     req.end();

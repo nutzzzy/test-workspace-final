@@ -33,7 +33,8 @@ const SCOPE_STAGES: Record<AnalysisScope, StudioStage[]> = {
   automation: ["automation"],
 };
 
-type StageState = { state: StudioProgress["state"] | "pending"; detail?: string; origins: CallOrigin[] };
+/** `tokens`: what the model has written for this stage so far (streaming providers only). */
+type StageState = { state: StudioProgress["state"] | "pending"; detail?: string; tokens?: number; origins: CallOrigin[] };
 
 export type AnalysisJob = {
   id: string;
@@ -94,6 +95,11 @@ const CASE_INCLUDE = {
  * core (see studio/pipeline). Runs are background jobs per issue; every
  * artifact can be edited, and each edit teaches the analysis (studio/learning).
  */
+/** Shown when a stage's answer was stopped at the writing time limit. */
+export const ANSWER_CUT = "The model reached its writing time limit; this step was shortened";
+/** Shown when the service cut an answer at its length limit (free tiers). */
+export const ANSWER_CAPPED = "The service limits the answer length; the complete part of the answer was kept";
+
 @Injectable()
 export class AnalysisService {
   private readonly logger = new Logger(AnalysisService.name);
@@ -166,15 +172,19 @@ export class AnalysisService {
     this.jobs.set(issue.id, job);
     void this.exclusive(issue.id, () => this.run(issue.id, job, acceptanceKeys))
       .then(() => {
-        job.state = "done";
+        if (job.state === "running") job.state = "done";
       })
       .catch((error: unknown) => {
-        job.state = job.cancel.signal.aborted ? "cancelled" : "failed";
+        if (job.cancel.signal.aborted) {
+          job.state = "cancelled";
+          return;
+        }
+        job.state = "failed";
         job.error = maskSecrets(error instanceof Error ? error.message : "AI analysis failed").slice(0, 800);
         this.logger.warn(`Analysis ${issue.key} failed: ${job.error}`);
       })
       .finally(() => {
-        job.finishedAt = new Date().toISOString();
+        job.finishedAt ??= new Date().toISOString();
       });
     return this.status(issue.id, locale);
   }
@@ -192,7 +202,9 @@ export class AnalysisService {
     if (!previous && !stages.includes("understand")) {
       job.stages = { understand: { state: "pending", origins: [] }, ...job.stages };
     }
+    const { runBudgetMs } = await this.ai.getRunBudget();
     const result = await runStudio({
+      deadline: runBudgetMs > 0 ? started + runBudgetMs : undefined,
       source: {
         issueKey: issue.key,
         title: issue.title,
@@ -223,6 +235,13 @@ export class AnalysisService {
             const entry = (job.stages[stage] ??= { state: "running", origins: [] });
             entry.detail = `${origin.name} · ${origin.model}`;
           },
+          onTokens: (count) => {
+            const entry = (job.stages[stage] ??= { state: "running", origins: [] });
+            entry.tokens = (entry.tokens ?? 0) + count;
+          },
+          onCut: (reason) => {
+            if (!job.warnings.some((warning) => warning.stage === stage)) job.warnings.push({ stage, message: reason === "time" ? ANSWER_CUT : ANSWER_CAPPED });
+          },
         }),
       onProgress: (progress) => {
         const entry = (job.stages[progress.stage] ??= { state: "pending", origins: [] });
@@ -233,6 +252,7 @@ export class AnalysisService {
     });
     for (const [stage, message] of Object.entries(result.errors)) job.warnings.push({ stage: stage as StudioStage, message: message! });
     job.dropped = result.dropped;
+    if (job.cancel.signal.aborted) throw new Error("AI analysis was cancelled");
 
     // Everything is applied in one transaction: a failure leaves the previous state intact.
     await this.prisma.$transaction(
@@ -305,7 +325,13 @@ export class AnalysisService {
 
   async cancel(jiraIssueId: string) {
     const issue = await this.loadIssue(jiraIssueId);
-    this.jobs.get(issue.id)?.cancel.abort();
+    const job = this.jobs.get(issue.id);
+    if (job?.state === "running") {
+      // The model request is aborted too; the page sees the run stop right away.
+      job.cancel.abort();
+      job.state = "cancelled";
+      job.finishedAt = new Date().toISOString();
+    }
     return { ok: true };
   }
 

@@ -5,7 +5,7 @@ import { z } from "zod";
 import { decryptSecret, encryptSecret, resolveEncryptionKey } from "../common/crypto.util";
 import { classifyAddress, normalizeHost } from "../common/network-policy";
 import { PrismaService } from "../prisma/prisma.service";
-import type { AIProvider } from "./ai-provider";
+import { TIME_LIMIT, type AIProvider } from "./ai-provider";
 import type { AppLocale } from "./localize-fa";
 import { OllamaProvider } from "./ollama.provider";
 import { OpenAICompatibleProvider } from "./openai-compatible.provider";
@@ -35,6 +35,7 @@ export type ConnectionView = {
   enabled: boolean;
   temperature: number;
   timeoutMs: number;
+  answerBudgetMs: number;
   contextTokens: number;
   reasoning: boolean;
   priority: number;
@@ -57,6 +58,7 @@ export type ConnectionInput = Partial<{
   enabled: boolean;
   temperature: number;
   timeoutMs: number;
+  answerBudgetMs: number;
   contextTokens: number;
   reasoning: boolean;
   priority: number;
@@ -67,6 +69,10 @@ export type StructuredCall<T> = {
   prompt: string;
   schema: z.ZodType<T>;
   locale?: AppLocale;
+  onTokens?: (count: number) => void;
+  onCut?: (reason: "time" | "length") => void;
+  /** Epoch ms by which the answer must be in (the analysis time limit). */
+  deadlineAt?: number;
 };
 
 /** Which connection produced an answer. */
@@ -76,6 +82,11 @@ const ROUTING_KEY = "ai.routing";
 const MAX_TIMEOUT_MS = 3_600_000;
 /** A rate limit longer than this moves on to the next connection instead of waiting. */
 const MAX_WAIT_MS = 30_000;
+/** Free tiers (Pollinations) refuse a 4th concurrent request. */
+const HOSTED_CONCURRENCY = 3;
+const RATE_LIMIT_ATTEMPTS = 6;
+const RUN_BUDGET_KEY = "ai.runBudgetMs";
+const DEFAULT_RUN_BUDGET_MS = 180_000;
 const LEGACY_KEYS = ["ai.provider", "ai.baseUrl", "ai.model", "ai.temperature", "ai.timeoutMs", "ai.apiKeyEnc", "ai.allowExternal", "ai.deepAnalysis"];
 
 @Injectable()
@@ -245,6 +256,20 @@ export class AIService {
     ) as Routing;
   }
 
+  /** Longest time one analysis run may take (ms); at the limit it keeps what is done. 0 = no limit. */
+  async getRunBudget(): Promise<{ runBudgetMs: number }> {
+    const row = await this.prisma.systemSetting.findUnique({ where: { key: RUN_BUDGET_KEY } });
+    const value = Number(row?.value);
+    return { runBudgetMs: row && Number.isFinite(value) ? value : DEFAULT_RUN_BUDGET_MS };
+  }
+
+  async saveRunBudget(input: { runBudgetMs?: unknown }): Promise<{ runBudgetMs: number }> {
+    const runBudgetMs = Math.round(clamp(Number(input.runBudgetMs ?? DEFAULT_RUN_BUDGET_MS) || 0, 0, MAX_TIMEOUT_MS));
+    const value = String(runBudgetMs);
+    await this.prisma.systemSetting.upsert({ where: { key: RUN_BUDGET_KEY }, create: { key: RUN_BUDGET_KEY, value }, update: { value } });
+    return { runBudgetMs };
+  }
+
   async saveRouting(input: Partial<Record<string, unknown>>): Promise<Routing> {
     const ids = new Set((await this.prisma.aiConnection.findMany({ select: { id: true } })).map((row) => row.id));
     const routing = Object.fromEntries(
@@ -313,7 +338,14 @@ export class AIService {
   async call<T>(
     group: StageGroup,
     call: StructuredCall<T>,
-    options: { signal?: AbortSignal; attemptsPerConnection?: number; onConnection?: (origin: CallOrigin) => void } = {},
+    options: {
+      signal?: AbortSignal;
+      attemptsPerConnection?: number;
+      onConnection?: (origin: CallOrigin) => void;
+      onTokens?: (count: number) => void;
+      /** The answer was stopped at the connection's writing time limit (partial). */
+      onCut?: (reason: "time" | "length") => void;
+    } = {},
   ): Promise<{ data: T; origin: CallOrigin }> {
     const chain = await this.chainFor(group);
     if (chain.length === 0) throw new Error("AI analysis is not available: none");
@@ -328,7 +360,7 @@ export class AIService {
       const origin = { connectionId: row.id, name: row.name, model: row.model };
       options.onConnection?.(origin);
       try {
-        const data = await this.tryConnection(row, call, options.attemptsPerConnection ?? 3, options.signal);
+        const data = await this.tryConnection(row, { ...call, onTokens: options.onTokens, onCut: options.onCut }, options.attemptsPerConnection ?? 3, options.signal);
         return { data, origin };
       } catch (error) {
         if (options.signal?.aborted) throw new Error("AI analysis was cancelled");
@@ -352,13 +384,52 @@ export class AIService {
   private readonly queues = new Map<string, Promise<unknown>>();
 
   private tryConnection<T>(row: AiConnection, call: StructuredCall<T>, attempts: number, signal?: AbortSignal): Promise<T> {
+    // Hosted services answer a few requests at once (free tiers limit bursts); a local model one at a time.
+    if (isExternal(row.baseUrl)) return this.limited(row.id, HOSTED_CONCURRENCY, () => this.attempt(row, call, attempts, signal), signal);
     const previous = this.queues.get(row.id) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(() => this.attempt(row, call, attempts, signal));
     this.queues.set(row.id, next);
     void next.finally(() => {
       if (this.queues.get(row.id) === next) this.queues.delete(row.id);
     }).catch(() => undefined);
-    return next;
+    if (!signal) return next;
+    // A cancelled call stops waiting at once, even while queued behind another analysis.
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(new Error("AI analysis was cancelled"));
+      if (signal.aborted) return onAbort();
+      signal.addEventListener("abort", onAbort, { once: true });
+      next.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+    });
+  }
+
+  private readonly slots = new Map<string, { active: number; waiting: Array<() => void> }>();
+
+  /** Run `work` when fewer than `max` calls to this connection are in flight. */
+  private async limited<T>(id: string, max: number, work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const slot = this.slots.get(id) ?? { active: 0, waiting: [] };
+    this.slots.set(id, slot);
+    if (slot.active >= max) {
+      await new Promise<void>((resolve, reject) => {
+        const wake = () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        };
+        // A cancelled call leaves the line, so it never holds up the calls behind it.
+        const onAbort = () => {
+          slot.waiting.splice(slot.waiting.indexOf(wake), 1);
+          reject(new Error("AI analysis was cancelled"));
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+        slot.waiting.push(wake);
+      });
+    }
+    slot.active += 1;
+    try {
+      return await work();
+    } finally {
+      slot.active -= 1;
+      slot.waiting.shift()?.();
+    }
   }
 
   private async attempt<T>(row: AiConnection, call: StructuredCall<T>, attempts: number, signal?: AbortSignal): Promise<T> {
@@ -367,23 +438,31 @@ export class AIService {
     let lastError: unknown;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       if (signal?.aborted) throw new Error("AI analysis was cancelled");
+      if (call.deadlineAt && Date.now() >= call.deadlineAt) throw new Error(TIME_LIMIT);
       try {
-        return await provider.generateStructured({ ...call, prompt });
+        return await provider.generateStructured({ ...call, prompt, signal });
       } catch (error) {
         lastError = error;
+        if (signal?.aborted) break;
         if (error instanceof AiHttpError) {
-          if (error.status === 429 || error.status >= 500) {
-            const wait = backoff(attempt, error.retryAfter);
-            if (wait > MAX_WAIT_MS || attempt === attempts) {
-              this.cooldown.set(row.id, Date.now() + Math.max(wait, MAX_WAIT_MS));
+          // Rate limits (free tiers answer 402 or 429) and server errors are short-lived.
+          if (error.status === 402 || error.status === 429 || error.status >= 500) {
+            const wait = backoff(attempt, error.retryAfter) + Math.random() * 1_000;
+            if (wait > MAX_WAIT_MS) {
+              this.cooldown.set(row.id, Date.now() + wait);
               break;
             }
+            // Within an analysis time limit a busy service is worth more retries than a slow fallback.
+            const limit = call.deadlineAt ? Math.max(attempts, RATE_LIMIT_ATTEMPTS) : attempts;
+            if (attempt >= limit || (call.deadlineAt && Date.now() + wait >= call.deadlineAt)) break;
+            if (call.deadlineAt) attempts = limit;
             await sleep(wait, signal);
             continue;
           }
           break;
         }
         const text = message(error);
+        if (/response is empty/i.test(text) && attempt < attempts) continue;
         if (/JSON|schema/i.test(text)) {
           prompt = `${call.prompt}\n\nYour previous answer was rejected: ${text.slice(0, 500)}\nReturn one JSON object that matches the requested shape exactly.`;
           continue;
@@ -405,13 +484,14 @@ export class AIService {
     return new OllamaProvider(row.baseUrl, row.model, {
       temperature: row.temperature,
       timeoutMs: row.timeoutMs,
+      answerBudgetMs: row.answerBudgetMs,
       contextTokens: row.contextTokens,
       reasoning: row.reasoning,
     });
   }
 
   private openai(row: AiConnection) {
-    return new OpenAICompatibleProvider(row.baseUrl, row.model, this.apiKey(row), row.temperature, row.timeoutMs);
+    return new OpenAICompatibleProvider(row.baseUrl, row.model, this.apiKey(row), row.temperature, row.timeoutMs, row.reasoning);
   }
 
   // ── helpers ───────────────────────────────────────────────────────────
@@ -435,7 +515,7 @@ export class AIService {
     if (!row.enabled) return "disabled";
     const external = isExternal(row.baseUrl);
     if (external && !row.allowExternal) return "external_not_allowed";
-    if (row.kind === "openai" && external && !this.apiKey(row)) return "missing_api_key";
+    // Some free services (LLM7, Pollinations) need no key; one that does answers 401.
     return null;
   }
 
@@ -453,6 +533,7 @@ export class AIService {
       enabled: row.enabled,
       temperature: row.temperature,
       timeoutMs: row.timeoutMs,
+      answerBudgetMs: row.answerBudgetMs,
       contextTokens: row.contextTokens,
       reasoning: row.reasoning,
       priority: row.priority,
@@ -487,6 +568,7 @@ export class AIService {
       enabled: input.enabled ?? current?.enabled ?? true,
       temperature: clamp(input.temperature ?? current?.temperature ?? 0.2, 0, 1),
       timeoutMs: Math.round(clamp(input.timeoutMs ?? current?.timeoutMs ?? 600_000, 5_000, MAX_TIMEOUT_MS)),
+      answerBudgetMs: Math.round(clamp(input.answerBudgetMs ?? current?.answerBudgetMs ?? 180_000, 0, MAX_TIMEOUT_MS)),
       contextTokens: Math.round(clamp(input.contextTokens ?? current?.contextTokens ?? 16_384, 2_048, 1_048_576)),
       reasoning: input.reasoning ?? current?.reasoning ?? false,
       ...(input.priority !== undefined ? { priority: Math.round(input.priority) } : {}),

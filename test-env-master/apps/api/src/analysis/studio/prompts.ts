@@ -50,18 +50,18 @@ export function digestPrompt(chunk: string, part: number, total: number, locale:
 export function understandPrompt(context: string, locale: AppLocale, guidance?: string) {
   return [
     context,
-    "TASK: Build a precise model of what this requirement asks for.",
-    "- summary: 3–6 sentences — what is built, for whom, and the main flow.",
-    "- rules: EVERY business rule as one atomic statement (one condition → one outcome), including rules hidden in tables, status lists, flows,",
-    "  configuration sections, formulas and API descriptions. evidence = a short verbatim quote (original language). source = issue|document.",
-    "- apis: every endpoint with method, path, purpose, request body, documented responses and who calls it.",
-    "- entities (with fields and types), states, transitions (from, to, trigger, conditions), configurations (keys and meaning),",
-    "  calculations (formula exactly as given and what it decides), flows (ordered steps), integrations, nonFunctional.",
-    "- assumptions: only things you had to assume; outOfScope: what the source explicitly excludes.",
+    "TASK: Build a precise, compact model of what this requirement asks for. Write in this order — the most important first:",
+    "- summary: 2–4 sentences — what is built, for whom, and the main flow.",
+    "- rules: every business rule as one short atomic statement (one condition → one outcome), including rules hidden in tables,",
+    "  status lists, flows, configuration sections, formulas and API descriptions. evidence = a short verbatim quote (original language). source = issue|document.",
+    "- apis: every endpoint with method, path, purpose, request body and documented responses.",
+    "- states, transitions (from, to, trigger, conditions), calculations (formula exactly as given), configurations (keys and meaning), flows (ordered steps).",
+    "- entities with their fields and types, actors, integrations, nonFunctional, assumptions (only what you had to assume), outOfScope (only explicit exclusions).",
+    "Be brief: one sentence per item, no repetition between sections, leave a list empty when the source says nothing about it.",
     languageRule(locale),
-    "Return {summary, actors:[{name,description}], entities:[{name,description,fields:[{name,type,notes}]}], states:[{name,meaning}],",
-    "transitions:[{from,to,trigger,conditions}], rules:[{text,evidence,source}], apis:[{method,path,purpose,request,responses:[],auth}],",
-    "configurations:[{key,meaning}], calculations:[{name,formula,meaning}], flows:[{name,steps:[]}], integrations:[], nonFunctional:[], assumptions:[], outOfScope:[]}.",
+    "Return {summary, rules:[{text,evidence,source}], apis:[{method,path,purpose,request,responses:[],auth}], states:[{name,meaning}],",
+    "transitions:[{from,to,trigger,conditions}], calculations:[{name,formula,meaning}], configurations:[{key,meaning}], flows:[{name,steps:[]}],",
+    "entities:[{name,description,fields:[{name,type,notes}]}], actors:[{name,description}], integrations:[], nonFunctional:[], assumptions:[], outOfScope:[]}.",
     guidanceBlock(guidance),
   ].join("\n");
 }
@@ -185,7 +185,7 @@ export function translatePrompt(context: string, locale: AppLocale, criteriaCoun
     context,
     `TASK: Translate the issue in <source> into natural ${languageName(locale)} for a QA reader, preserving structure (headings, lists, tables as text).`,
     "Keep identifiers, endpoints, field names, statuses, code and numbers unchanged. Do not translate the attached documents.",
-    `Return {"title","description","acceptanceCriteria":[exactly ${criteriaCount} items, same order, without keys]}.`,
+    `Return {"title","acceptanceCriteria":[exactly ${criteriaCount} items, same order, without keys],"description"}.`,
   ].join("\n");
 }
 

@@ -8,6 +8,9 @@ import type { AnalysisStatus, StageState, StudioStage } from "@/components/works
 import { useI18n, type Locale } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
+/** The API's note for an answer cut at the service's length limit. */
+const ANSWER_CAPPED = "The service limits the answer length; the complete part of the answer was kept";
+
 const ORDER: StudioStage[] = ["digest", "understand", "criteria", "assessment", "cases", "edges", "translate", "review", "automation"];
 
 function StageIcon({ state }: { state: StageState["state"] }) {
@@ -111,6 +114,9 @@ export function AnalysisRunner({
                       {entry.detail}
                     </span>
                   ) : null}
+                  {entry.state === "running" && entry.tokens ? (
+                    <span className="shrink-0 text-[10px] text-muted-foreground">{t("studio.runner.tokens", { count: n(entry.tokens) })}</span>
+                  ) : null}
                 </li>
               );
             })}
@@ -118,14 +124,26 @@ export function AnalysisRunner({
           {running ? <p className="text-[11px] text-muted-foreground">{t("studio.runner.slowHint")}</p> : null}
           {job.state === "failed" ? <p className="text-xs text-destructive">{err(job.error ?? "")}</p> : null}
           {job.state === "cancelled" ? <p className="text-xs text-muted-foreground">{t("studio.runner.cancelled")}</p> : null}
-          {job.warnings.map((warning) => (
-            <p key={warning.stage} className="flex items-start gap-1 text-[11px] text-warning">
-              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
-              <span>
-                {t(`studio.stages.${warning.stage}`)}: {err(warning.message)}
-              </span>
+          {job.warnings
+            .filter((warning) => warning.message !== ANSWER_CAPPED)
+            .map((warning, index) => (
+              <p key={`${warning.stage}-${index}`} className="flex items-start gap-1 text-[11px] text-warning">
+                <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                <span>
+                  {t(`studio.stages.${warning.stage}`)}: {err(warning.message)}
+                </span>
+              </p>
+            ))}
+          {/* Normal on free tiers: one quiet note instead of a warning per stage. */}
+          {job.warnings.some((warning) => warning.message === ANSWER_CAPPED) ? (
+            <p className="text-[11px] text-muted-foreground">
+              {job.warnings
+                .filter((warning) => warning.message === ANSWER_CAPPED)
+                .map((warning) => t(`studio.stages.${warning.stage}`))
+                .join(locale === "fa" ? "، " : ", ")}
+              : {err(ANSWER_CAPPED)}
             </p>
-          ))}
+          ) : null}
         </div>
       ) : null}
 

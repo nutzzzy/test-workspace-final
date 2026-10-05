@@ -47,8 +47,9 @@ function isStatusAssertion(assertion: Record<string, unknown>) {
  * - an explicit `expectedStatus` is authoritative (201 expected ≠ 200 received);
  * - otherwise a status_code assertion right after the step decides the status
  *   (negative tests expecting 404 keep working);
- * - otherwise any 2xx is transport success;
- * - every attached assertion must pass as well — 2xx alone is never enough.
+ * - otherwise any 2xx or 3xx is transport success (a redirect is an answer, not
+ *   a failure — requests are sent with redirect: "manual");
+ * - every attached assertion must pass as well — the status alone is never enough.
  */
 export async function evaluateExpectation(
   config: Record<string, unknown>,
@@ -66,8 +67,8 @@ export async function evaluateExpectation(
     checks.push({ label: `status ∈ ${expected.join(", ")}`, passed, ...(passed ? {} : { error }) });
     if (!passed) failures.push(error);
   } else if (!attachedAssertions.some(isStatusAssertion)) {
-    const passed = status !== null && status >= 200 && status < 300;
-    checks.push({ label: "status 2xx", passed, ...(passed ? {} : { error: `HTTP ${status ?? "no response"}` }) });
+    const passed = status !== null && status >= 200 && status < 400;
+    checks.push({ label: "status 2xx/3xx", passed, ...(passed ? {} : { error: `HTTP ${status ?? "no response"}` }) });
     if (!passed) failures.push(`HTTP ${status ?? "no response"}`);
   }
   for (const assertion of attachedAssertions) {
@@ -138,7 +139,7 @@ export type RecoverResult = {
  * - only safe methods unless `recovery.idempotent` or an Idempotency-Key; DELETE never;
  * - at most `recovery.maxAttempts` sends, never more than 10;
  * - never the same effective request twice (fingerprint);
- * - success = HTTP expectation AND every attached assertion, not just 2xx;
+ * - success = HTTP expectation AND every attached assertion, not just the status;
  * - stops at the first success.
  * A rejected retry leaves no trace in the variables or the last response.
  */

@@ -21,6 +21,7 @@ type Connection = {
   enabled: boolean;
   temperature: number;
   timeoutMs: number;
+  answerBudgetMs: number;
   contextTokens: number;
   reasoning: boolean;
   priority: number;
@@ -37,6 +38,7 @@ const GROUPS = ["analysis", "testCases", "edgeCases", "review", "automation", "t
 const PRESETS = [
   { id: "ollama", name: "Local Ollama", kind: "ollama", baseUrl: "http://localhost:11434", model: "qwen3:8b", contextTokens: 24576 },
   { id: "lmstudio", name: "LM Studio", kind: "openai", baseUrl: "http://localhost:1234/v1", model: "", contextTokens: 16384 },
+  { id: "pollinations", name: "Pollinations (no key)", kind: "openai", baseUrl: "https://text.pollinations.ai/openai", model: "openai", contextTokens: 32768 },
   { id: "huggingface", name: "Hugging Face", kind: "openai", baseUrl: "https://router.huggingface.co/v1", model: "Qwen/Qwen2.5-72B-Instruct", contextTokens: 32768 },
   { id: "github", name: "GitHub Models", kind: "openai", baseUrl: "https://models.github.ai/inference", model: "openai/gpt-4.1-mini", contextTokens: 32768 },
   { id: "sambanova", name: "SambaNova", kind: "openai", baseUrl: "https://api.sambanova.ai/v1", model: "DeepSeek-V3.1", contextTokens: 65536 },
@@ -61,6 +63,7 @@ type Form = {
   enabled: boolean;
   contextTokens: string;
   timeoutMs: string;
+  answerBudget: string;
   temperature: string;
   reasoning: boolean;
   hasApiKey?: boolean;
@@ -76,7 +79,8 @@ const blankForm = (preset: (typeof PRESETS)[number] = PRESETS[0]): Form => ({
   allowExternal: false,
   enabled: true,
   contextTokens: String(preset.contextTokens),
-  timeoutMs: "600000",
+  timeoutMs: "3600000",
+  answerBudget: "180",
   temperature: "0.2",
   reasoning: false,
 });
@@ -94,6 +98,7 @@ export function AiSettings() {
   const { t, n, err } = useI18n();
   const [connections, setConnections] = useState<Connection[]>([]);
   const [routing, setRouting] = useState<Routing>({});
+  const [runBudget, setRunBudget] = useState("");
   const [form, setForm] = useState<Form | null>(null);
   const [models, setModels] = useState<Record<string, string[]>>({});
   const [pull, setPull] = useState<{ id: string; model: string; status: string; completed: number; total: number; state: string; error?: string } | null>(null);
@@ -101,9 +106,14 @@ export function AiSettings() {
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
-    const [list, route] = await Promise.all([api<Connection[]>("/ai/connections"), api<Routing>("/ai/routing")]);
+    const [list, route, limits] = await Promise.all([
+      api<Connection[]>("/ai/connections"),
+      api<Routing>("/ai/routing"),
+      api<{ runBudgetMs: number }>("/ai/limits"),
+    ]);
     setConnections(list);
     setRouting(route);
+    setRunBudget(String(Math.round(limits.runBudgetMs / 1000)));
   }, []);
   useEffect(() => {
     void load().catch(() => undefined);
@@ -144,6 +154,7 @@ export function AiSettings() {
         allowExternal: isExternalUrl(form.baseUrl) ? form.allowExternal : false,
         contextTokens: Number(form.contextTokens),
         timeoutMs: Number(form.timeoutMs),
+        answerBudgetMs: Math.round(Number(form.answerBudget || 0) * 1000),
         temperature: Number(form.temperature),
         reasoning: form.reasoning,
         ...(form.apiKey.trim() ? { apiKey: form.apiKey.trim() } : {}),
@@ -216,6 +227,7 @@ export function AiSettings() {
                         enabled: item.enabled,
                         contextTokens: String(item.contextTokens),
                         timeoutMs: String(item.timeoutMs),
+                        answerBudget: String(Math.round(item.answerBudgetMs / 1000)),
                         temperature: String(item.temperature),
                         reasoning: item.reasoning,
                         hasApiKey: item.hasApiKey,
@@ -285,6 +297,19 @@ export function AiSettings() {
           <Plus className="h-3.5 w-3.5" />
           {t("aiSettings.add")}
         </Button>
+
+        <label className="block space-y-1 rounded-md border border-border p-3 text-xs">
+          <span className="font-medium">{t("aiSettings.runBudget")}</span>
+          <input
+            className={cn(input, "w-32 font-mono")}
+            dir="ltr"
+            inputMode="numeric"
+            value={runBudget}
+            onChange={(event) => setRunBudget(event.target.value.replace(/[^0-9]/g, ""))}
+            onBlur={() => void run(() => api("/ai/limits", { method: "PUT", body: JSON.stringify({ runBudgetMs: Number(runBudget || 0) * 1000 }) }))}
+          />
+          <span className="block text-[11px] text-muted-foreground">{t("aiSettings.runBudgetHint")}</span>
+        </label>
 
         {connections.length > 1 ? (
           <section className="space-y-2 rounded-md border border-border p-3" aria-labelledby="routing-title">
@@ -398,20 +423,25 @@ export function AiSettings() {
                   <span className="text-muted-foreground">{t("settings.timeout")}</span>
                   <input className={cn(input, "font-mono")} dir="ltr" inputMode="numeric" value={form.timeoutMs} onChange={(event) => setForm({ ...form, timeoutMs: event.target.value })} />
                 </label>
+                {form.kind === "ollama" ? (
+                  <label className="block space-y-1 text-xs sm:col-span-2">
+                    <span className="text-muted-foreground">{t("aiSettings.answerBudget")}</span>
+                    <input className={cn(input, "font-mono")} dir="ltr" inputMode="numeric" value={form.answerBudget} onChange={(event) => setForm({ ...form, answerBudget: event.target.value })} />
+                    <span className="block text-[11px] text-muted-foreground">{t("aiSettings.answerBudgetHint")}</span>
+                  </label>
+                ) : null}
               </div>
               <label className="flex items-center gap-2 text-xs">
                 <input type="checkbox" checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} />
                 {t("aiSettings.enabled")}
               </label>
-              {form.kind === "ollama" ? (
-                <label className="flex items-start gap-2 text-xs">
-                  <input type="checkbox" className="mt-0.5" checked={form.reasoning} onChange={(event) => setForm({ ...form, reasoning: event.target.checked })} />
-                  <span>
-                    {t("aiSettings.reasoning")}
-                    <span className="block text-[11px] text-muted-foreground">{t("aiSettings.reasoningHint")}</span>
-                  </span>
-                </label>
-              ) : null}
+              <label className="flex items-start gap-2 text-xs">
+                <input type="checkbox" className="mt-0.5" checked={form.reasoning} onChange={(event) => setForm({ ...form, reasoning: event.target.checked })} />
+                <span>
+                  {t("aiSettings.reasoning")}
+                  <span className="block text-[11px] text-muted-foreground">{t("aiSettings.reasoningHint")}</span>
+                </span>
+              </label>
               {external ? (
                 <div className="space-y-1 rounded-md border border-warning/50 bg-warning/5 p-2">
                   <p className="flex items-start gap-1.5 text-[11px] text-warning">

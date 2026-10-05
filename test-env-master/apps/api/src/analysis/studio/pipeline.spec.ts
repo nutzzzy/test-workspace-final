@@ -178,4 +178,47 @@ describe("analysis studio pipeline", () => {
     const parts = chunk("a".repeat(50) + "\n\n" + "b".repeat(50) + "\n\n" + "c".repeat(50), 110);
     expect(parts).toHaveLength(2);
   });
+
+  it("finishes within the run's time limit: a slow stage is skipped, finished stages are kept", async () => {
+    const { llm: fast } = scripted(answers);
+    const seenDeadlines: Record<string, number | undefined> = {};
+    // The edge-case model hangs until its stage deadline, like a slow model that never answers.
+    const llm: StudioLlm = async (group, stage, call) => {
+      seenDeadlines[stage] = call.deadlineAt;
+      if (stage === "edges") {
+        await new Promise((resolve) => setTimeout(resolve, Math.max(0, call.deadlineAt! - Date.now())));
+        throw new Error("The model did not answer in time");
+      }
+      return fast(group, stage, call);
+    };
+    const started = Date.now();
+    const result = await runStudio({ source: NFC, locale: "fa", stages: [...all], llm, guidance: () => "", budgetChars: 50_000, deadline: started + 1_500 });
+
+    expect(Date.now() - started).toBeLessThan(1_700);
+    expect(result.cases!.length).toBeGreaterThan(0);
+    expect(result.assessment).not.toBeNull();
+    expect(result.edges).toBeNull();
+    expect(result.errors.edges).toBe("The analysis reached its time limit");
+    // Each stage gets a deadline inside the run's limit, earlier stages earlier.
+    expect(seenDeadlines.understand!).toBeLessThan(seenDeadlines.cases!);
+    expect(seenDeadlines.automation!).toBeLessThanOrEqual(started + 1_500);
+  });
+
+  it("does not start a stage whose share of the time is already used up", async () => {
+    const { llm, calls } = scripted(answers);
+    await expect(runStudio({ source: NFC, locale: "fa", stages: [...all], llm, guidance: () => "", budgetChars: 50_000, deadline: Date.now() - 1 })).rejects.toThrow(
+      "The analysis reached its time limit",
+    );
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("answer shapes", () => {
+  it("accepts a single value where a list was asked", async () => {
+    const { CasesSchema } = await import("./schemas");
+    const parsed = CasesSchema.parse({
+      testCases: [{ criterionKeys: "AC-01", title: "t", preconditions: "بایکر وارد شده است.", steps: [{ action: "a", expected: "e" }], expectedResult: "r" }],
+    });
+    expect(parsed.testCases[0]).toMatchObject({ criterionKeys: ["AC-01"], preconditions: ["بایکر وارد شده است."] });
+  });
 });

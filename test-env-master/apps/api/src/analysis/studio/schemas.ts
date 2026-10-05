@@ -11,8 +11,11 @@ const text = (max: number) => z.coerce.string().transform((value) => value.trim(
 const opt = (max: number) => text(max).optional().default("");
 const list = <T extends z.ZodTypeAny>(item: T, max: number) =>
   z
-    .array(item)
-    .nullish()
+    .preprocess(
+      // A single value where a list was asked ("preconditions": "logged in") is a list of one.
+      (value) => (value === null || value === undefined || Array.isArray(value) ? value : value === "" ? [] : [value]),
+      z.array(item).nullish(),
+    )
     .transform((items) => (items ?? []).slice(0, max));
 const strings = (max: number, length = 400) => list(text(length), max).transform((items) => items.filter(Boolean));
 const level = z.enum(["HIGH", "MEDIUM", "LOW"]).catch("MEDIUM");
@@ -45,19 +48,12 @@ export const DigestSchema = z.object({
   ),
 });
 
+/**
+ * Fields are in order of importance: a model writes them in this order, so an
+ * answer stopped at the writing time limit still has the rules and APIs.
+ */
 export const UnderstandingSchema = z.object({
   summary: text(2000),
-  actors: list(z.object({ name: text(120), description: opt(400) }), 15),
-  entities: list(
-    z.object({
-      name: text(120),
-      description: opt(400),
-      fields: list(z.object({ name: text(120), type: opt(80), notes: opt(300) }), 40),
-    }),
-    20,
-  ),
-  states: list(z.object({ name: text(80), meaning: opt(300) }), 20),
-  transitions: list(z.object({ from: text(80), to: text(80), trigger: opt(300), conditions: opt(300) }), 30),
   rules: list(z.object({ text: text(600), evidence: opt(500), source: z.enum(["issue", "document"]).catch("issue") }), 60),
   apis: list(
     z.object({
@@ -70,9 +66,20 @@ export const UnderstandingSchema = z.object({
     }),
     30,
   ),
-  configurations: list(z.object({ key: text(160), meaning: opt(400) }), 30),
+  states: list(z.object({ name: text(80), meaning: opt(300) }), 20),
+  transitions: list(z.object({ from: text(80), to: text(80), trigger: opt(300), conditions: opt(300) }), 30),
   calculations: list(z.object({ name: text(160), formula: text(400), meaning: opt(400) }), 10),
+  configurations: list(z.object({ key: text(160), meaning: opt(400) }), 30),
   flows: list(z.object({ name: text(160), steps: strings(15, 300) }), 12),
+  entities: list(
+    z.object({
+      name: text(120),
+      description: opt(400),
+      fields: list(z.object({ name: text(120), type: opt(80), notes: opt(300) }), 40),
+    }),
+    20,
+  ),
+  actors: list(z.object({ name: text(120), description: opt(400) }), 15),
   integrations: strings(15),
   nonFunctional: strings(15),
   assumptions: strings(20),
@@ -202,10 +209,11 @@ export const AutomationSchema = z.object({
   ),
 });
 
+/** Short parts first; a part missing from a shortened answer shows in the original language. */
 export const TranslationSchema = z.object({
-  title: text(500),
-  description: text(40_000),
+  title: opt(500),
   acceptanceCriteria: strings(80, 2000),
+  description: opt(40_000),
 });
 export type Translation = z.infer<typeof TranslationSchema>;
 

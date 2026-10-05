@@ -56,6 +56,16 @@ export class AiController {
     return this.ai.saveRouting(body ?? {});
   }
 
+  @Get("limits")
+  limits() {
+    return this.ai.getRunBudget();
+  }
+
+  @Put("limits")
+  saveLimits(@Body() body: { runBudgetMs?: unknown }) {
+    return this.ai.saveRunBudget(body ?? {});
+  }
+
   @Get("status")
   status() {
     return this.ai.analysisStatus();
