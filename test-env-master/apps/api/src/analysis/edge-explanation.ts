@@ -1,167 +1,94 @@
 import type { AppLocale } from "../ai/localize-fa";
-import type { PipelineResult } from "../qa-engine/pipeline";
-import type { DeepAnalysis } from "./deep-analysis";
+import type { StudioUnderstanding } from "./studio/pipeline";
 
 export type EdgeExplanation = {
-  /** Why this requirement produced no edge cases, most important first. */
+  /** Kept for the web client: a run would fill the list. */
+  wouldGenerate: number;
   reasons: string[];
-  /** What would let the analysis find some. */
   suggestions: string[];
 };
 
 /**
- * Why the edge-case list is empty, in terms of THIS requirement: each kind of
- * edge case the analysis can produce is listed with the detail it was missing.
- * Nothing here guesses; it reports what the rule engine and the AI analysis
- * did and did not find.
+ * Why the edge-case list is empty: what the last analysis run did for edge
+ * cases, and which kinds of detail the understanding of this requirement
+ * lacks. Nothing is guessed.
  */
 export function explainNoEdgeCases(input: {
-  result: PipelineResult;
-  deep: Pick<DeepAnalysis, "testCases" | "dropped"> | null;
+  run: { edges: { state: string; error?: string } | null; dropped: number; current: boolean } | null;
+  understanding: StudioUnderstanding | null;
   aiReady: boolean;
   locale: AppLocale;
 }): EdgeExplanation {
   const fa = input.locale === "fa";
-  const facts = input.result.understanding;
+  const say = (en: string, persian: string) => (fa ? persian : en);
   const reasons: string[] = [];
   const suggestions: string[] = [];
-  const say = (en: string, persian: string) => (fa ? persian : en);
+  const run = input.run;
 
-  if (input.result.testCases.some((item) => item.partition === "insufficient")) {
-    reasons.push(
-      say(
-        "The requirement does not describe an executable action with an observable result, so no case — normal or edge — could be designed from it.",
-        "نیازمندی کنش قابل اجرا و نتیجهٔ قابل مشاهده‌ای توصیف نمی‌کند؛ بنابراین هیچ کیسی (عادی یا مرزی) از آن طراحی نشد.",
-      ),
-    );
-  }
-  const text = facts.text;
-  const mentions = (pattern: RegExp) => pattern.test(text);
-  /**
-   * Each kind of edge case: present in the text but not recognised by the
-   * rules (a deep analysis can use it), or simply not described.
-   */
-  const kind = (spec: { found: boolean; mentioned: boolean; absent: [string, string]; unrecognised: [string, string]; suggestion?: [string, string] }) => {
-    if (spec.found) return;
-    if (spec.mentioned) {
-      reasons.push(say(...spec.unrecognised));
-      unrecognised = true;
-      return;
-    }
-    reasons.push(say(...spec.absent));
-    if (spec.suggestion) suggestions.push(say(...spec.suggestion));
-  };
-  let unrecognised = false;
-
-  kind({
-    found: facts.limits.length > 0,
-    mentioned:
-      // Persian and Arabic-Indic digits count too: "حداکثر ۳۰ کاراکتر".
-      /[0-9۰-۹٠-٩]/.test(text) &&
-      mentions(/(at (most|least)|maximum|minimum|\bmax\b|\bmin\b|up to|between|more than|less than|exceed|characters?|digits?|length|حداکثر|حداقل|بیشتر از|کمتر از|بیش از|کاراکتر|رقم|طول|بین)/i),
-    absent: [
-      "No numeric limit is given (minimum, maximum, length, count or amount), so there are no boundary values to test.",
-      "هیچ محدودیت عددی (حداقل، حداکثر، طول، تعداد یا مبلغ) ذکر نشده؛ بنابراین مقدار مرزی‌ای برای آزمون وجود ندارد.",
-    ],
-    unrecognised: [
-      "The text mentions a numeric limit, but the rule engine could not turn it into boundary values.",
-      "متن به یک محدودیت عددی اشاره می‌کند، اما موتور قاعده‌محور نتوانست از آن مقدار مرزی بسازد.",
-    ],
-    suggestion: ["State the allowed ranges of the inputs (e.g. amount 1,000–5,000,000).", "بازهٔ مجاز ورودی‌ها را مشخص کنید (مثلاً مبلغ بین ۱٬۰۰۰ تا ۵٬۰۰۰٬۰۰۰)."],
-  });
-  kind({
-    found: facts.required.length > 0 || facts.optional.length > 0,
-    mentioned: mentions(/(required|mandatory|optional|must (be )?(provided|entered|filled)|الزامی|اجباری|اختیاری|باید وارد)/i),
-    absent: [
-      "No required or optional fields are named, so missing or empty input cannot be tested.",
-      "هیچ فیلد الزامی یا اختیاری نام برده نشده؛ بنابراین ورودی ناقص یا خالی قابل آزمون نیست.",
-    ],
-    unrecognised: [
-      "The text says some input is required or optional, but the rule engine could not tell which fields.",
-      "متن می‌گوید ورودی‌ای الزامی یا اختیاری است، اما موتور قاعده‌محور تشخیص نداد کدام فیلدها.",
-    ],
-    suggestion: ["List the input fields and which of them are required.", "فیلدهای ورودی و الزامی بودن هر کدام را فهرست کنید."],
-  });
-  kind({
-    found: Boolean(facts.uniqueField || facts.table),
-    mentioned: mentions(/(unique|duplicate|already exists|twice|یکتا|تکراری|دو بار|از قبل وجود)/i),
-    absent: [
-      "No uniqueness rule or stored record is described, so duplicate-data cases do not apply.",
-      "هیچ قاعدهٔ یکتایی یا رکورد ذخیره‌شده‌ای توصیف نشده؛ بنابراین کیس دادهٔ تکراری مطرح نیست.",
-    ],
-    unrecognised: [
-      "The text mentions uniqueness or duplicates, but the rule engine could not tell which field must be unique.",
-      "متن به یکتایی یا تکرار اشاره می‌کند، اما موتور قاعده‌محور تشخیص نداد کدام فیلد باید یکتا باشد.",
-    ],
-  });
-  kind({
-    found: Boolean(facts.searchBy || facts.filterBy || facts.sortBy),
-    mentioned: mentions(/(search|filter|sort|جستجو|فیلتر|مرتب)/i),
-    absent: ["There is no search, filter or sort, so no empty-result case applies.", "جستجو، فیلتر یا مرتب‌سازی‌ای وجود ندارد؛ بنابراین کیس «بدون نتیجه» مطرح نیست."],
-    unrecognised: [
-      "The text mentions search, filter or sort, but not the field it works on.",
-      "متن به جستجو، فیلتر یا مرتب‌سازی اشاره می‌کند، اما فیلد آن را مشخص نکرده است.",
-    ],
-  });
-  kind({
-    found: Boolean(facts.payment.failure || facts.payment.retry || facts.payment.success),
-    mentioned: mentions(/(payment|transaction|refund|پرداخت|تراکنش|بازپرداخت|استرداد)/i),
-    absent: ["No payment or transaction failure/retry is described.", "شکست یا تلاش دوبارهٔ پرداخت و تراکنشی توصیف نشده است."],
-    unrecognised: [
-      "The text involves a payment or transaction, but not what happens when it fails or is retried.",
-      "متن با پرداخت یا تراکنش سروکار دارد، اما نگفته در صورت شکست یا تلاش دوباره چه اتفاقی می‌افتد.",
-    ],
-  });
-  if (!facts.errorStatus && facts.gaps.some((gap) => gap.id === "GAP-ERROR")) {
-    reasons.push(
-      say(
-        "Failure behaviour is mentioned but its contract (status or message) is not defined, so negative cases would have to guess the result.",
-        "رفتار خطا ذکر شده ولی قرارداد آن (کد وضعیت یا پیام) مشخص نیست؛ کیس منفی ناچار به حدس زدن نتیجه می‌شد.",
-      ),
-    );
-    suggestions.push(say("Define the error status and message for invalid input.", "کد وضعیت و پیام خطا برای ورودی نامعتبر را مشخص کنید."));
-  }
-
-  if (unrecognised && !input.deep) {
-    suggestions.unshift(
-      say(
-        "Run the deep AI analysis: it reads the text itself and can design edge cases from the details above.",
-        "تحلیل عمیق هوش مصنوعی را اجرا کنید: متن را خودش می‌خواند و می‌تواند از جزئیات بالا حالت مرزی طراحی کند.",
-      ),
-    );
-  }
-  if (!input.deep) {
+  if (!run || !run.edges) {
     reasons.push(
       input.aiReady
-        ? say(
-            "Only the rule-based engine has analysed this requirement; a deep AI analysis can find edge cases the rules cannot.",
-            "این نیازمندی فقط با موتور قاعده‌محور تحلیل شده؛ تحلیل عمیق هوش مصنوعی می‌تواند حالت‌های مرزی‌ای پیدا کند که قاعده‌ها نمی‌بینند.",
-          )
-        : say(
-            "AI analysis is not set up, so only the rule-based engine looked for edge cases.",
-            "هوش مصنوعی تنظیم نشده و فقط موتور قاعده‌محور به‌دنبال حالت‌های مرزی گشت.",
-          ),
+        ? say("Edge cases have not been analysed for this issue yet.", "حالات مرزی این ایشو هنوز تحلیل نشده‌اند.")
+        : say("No AI service is set up, so edge cases cannot be analysed.", "هیچ سرویس هوش مصنوعی‌ای تنظیم نشده و حالات مرزی قابل تحلیل نیستند."),
     );
-    if (!unrecognised || !input.aiReady) suggestions.push(
+    suggestions.push(
       input.aiReady
-        ? say("Run “Persian analysis” or “English analysis” on the Overview tab.", "از زبانهٔ نمای کلی «تحلیل فارسی» یا «تحلیل انگلیسی» را اجرا کنید.")
-        : say("Set up an AI service in Settings, then run the analysis again.", "در تنظیمات یک سرویس هوش مصنوعی وصل کنید و دوباره تحلیل را اجرا کنید."),
+        ? say("Use “Generate edge cases”, or run the full analysis.", "«تولید حالات مرزی» را بزنید یا تحلیل کامل را اجرا کنید.")
+        : say("Add an AI service under Settings → AI.", "از تنظیمات ← هوش مصنوعی یک سرویس اضافه کنید."),
     );
-  } else if (input.deep.dropped.testCases > 0) {
+    return { wouldGenerate: 0, reasons, suggestions };
+  }
+  if (run.edges.state === "failed") {
     reasons.push(
       say(
-        `The AI analysis proposed cases, but its review removed ${input.deep.dropped.testCases} of them as unsupported by the requirement text.`,
-        `تحلیل هوش مصنوعی کیس‌هایی پیشنهاد داد، اما بازبینی ${input.deep.dropped.testCases} مورد را چون در متن نیازمندی پشتوانه نداشتند حذف کرد.`,
+        `The last run could not analyse edge cases: ${run.edges.error ?? "the AI service failed"}.`,
+        `آخرین اجرا نتوانست حالات مرزی را تحلیل کند: ${run.edges.error ?? "سرویس هوش مصنوعی خطا داد"}.`,
+      ),
+    );
+    suggestions.push(say("Check the AI service in Settings and run it again.", "سرویس هوش مصنوعی را در تنظیمات بررسی کنید و دوباره اجرا کنید."));
+  } else if (run.dropped > 0) {
+    reasons.push(
+      say(
+        `Edge cases were proposed, but the review removed all ${run.dropped} of them as not supported by the requirement text.`,
+        `حالات مرزی پیشنهاد شدند، اما بازبینی همهٔ ${run.dropped} مورد را چون در متن نیازمندی پشتوانه نداشتند حذف کرد.`,
       ),
     );
   } else {
     reasons.push(
       say(
-        "The AI analysis did not find an edge case supported by the requirement text.",
-        "تحلیل هوش مصنوعی هیچ حالت مرزی‌ای با پشتوانهٔ متن نیازمندی پیدا نکرد.",
+        "The analysis found no edge case that this requirement makes real (only edge cases tied to the source text are listed).",
+        "تحلیل هیچ حالت مرزی‌ای پیدا نکرد که این نیازمندی واقعاً ایجاد کند (فقط حالاتی آورده می‌شوند که به متن نیازمندی گره خورده باشند).",
       ),
     );
   }
+  if (!run.current) {
+    reasons.push(say("The issue or its documents changed after that run.", "ایشو یا اسناد آن بعد از آن اجرا تغییر کرده‌اند."));
+    suggestions.push(say("Run the analysis again.", "تحلیل را دوباره اجرا کنید."));
+  }
 
-  return { reasons, suggestions: [...new Set(suggestions)] };
+  // What would give edge cases something to work with.
+  const understanding = input.understanding;
+  if (understanding && Array.isArray(understanding.configurations)) {
+    if (understanding.configurations.length === 0 && (understanding.calculations ?? []).length === 0) {
+      suggestions.push(
+        say(
+          "State the limits and configurable values (maximums, minimums, counts, time windows); boundaries come from them.",
+          "محدودیت‌ها و مقادیر قابل تنظیم (حداکثر، حداقل، تعداد، بازهٔ زمانی) را مشخص کنید؛ حالات مرزی از آن‌ها ساخته می‌شوند.",
+        ),
+      );
+    }
+    if ((understanding.transitions ?? []).length === 0) {
+      suggestions.push(say("Describe the statuses and which actions are allowed in each.", "وضعیت‌ها و اینکه در هر وضعیت چه کاری مجاز است را توضیح دهید."));
+    }
+    if ((understanding.apis ?? []).length > 0 && understanding.apis.every((api) => api.responses.length === 0)) {
+      suggestions.push(say("Document the error responses of the APIs.", "پاسخ‌های خطای APIها را مستند کنید."));
+    }
+  }
+  suggestions.push(
+    say(
+      "Attach the PRD if there is one — it usually holds the business rules edge cases come from.",
+      "اگر PRD دارید پیوست کنید — معمولاً قواعد کسب‌وکاری که حالات مرزی از آن‌ها می‌آیند آنجاست.",
+    ),
+  );
+  return { wouldGenerate: 0, reasons, suggestions: [...new Set(suggestions)] };
 }

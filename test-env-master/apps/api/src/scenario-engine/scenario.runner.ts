@@ -101,18 +101,18 @@ export class ScenarioRunner implements OnModuleInit {
   /**
    * Optional model ranking for `recovery.aiAssist` steps. It only sees
    * candidate metadata (step, key, path, type) and the error message — never
-   * values — and the heuristic fallback counts as "no suggestion".
+   * values. No reachable model means "no suggestion".
    */
   private semanticRanker(): SemanticRanker {
     return async (input) => {
       if (!this.ai) return [];
-      const { data, provider } = await this.ai.generateStructured({
+      const data = await this.ai.tryStructured("analysis", {
         system:
           "You rank which earlier API response field most likely supplies a request input. Answer with candidate ids only.",
         prompt: JSON.stringify(input),
         schema: RANK_SCHEMA,
       });
-      return provider === "heuristic" ? [] : data.candidateIds.slice(0, 3);
+      return data ? data.candidateIds.slice(0, 3) : [];
     };
   }
 

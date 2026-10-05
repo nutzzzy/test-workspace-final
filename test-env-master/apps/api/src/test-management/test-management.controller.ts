@@ -105,6 +105,16 @@ export class TestManagementController {
     return this.service.updateCase(id, parseBody(UpdateCaseSchema, body, "Invalid test case field"));
   }
 
+  @Delete("test-cases/:id")
+  deleteCase(@Param("id") id: string) {
+    return this.service.deleteCase(id);
+  }
+
+  @Post("test-cases/:id/approve")
+  approveCase(@Param("id") id: string) {
+    return this.service.approveCase(id);
+  }
+
   @Patch("test-cases/:id/execution")
   saveExecution(
     @Param("id") id: string,

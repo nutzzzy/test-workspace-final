@@ -2,11 +2,13 @@ import {
   BadRequestException,
   Injectable,
   NotFoundException,
+  Optional,
 } from "@nestjs/common";
 import { TestExecutionStatus } from "@qa-workbench/shared";
 import { computeCoverage } from "../dashboard/dashboard.math";
 import { testCaseContentHash } from "../jira/test-case-document";
 import { PrismaService } from "../prisma/prisma.service";
+import { LearningService } from "../analysis/studio/learning";
 
 const ALLOWED_STATUSES = new Set(Object.values(TestExecutionStatus));
 const CLOSED_BUG_STATUSES = new Set(["RESOLVED", "CLOSED"]);
@@ -31,7 +33,53 @@ function profileGaps(value: unknown): Array<{ id: string; description: string; s
 
 @Injectable()
 export class TestManagementService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional() private readonly learning?: LearningService,
+  ) {}
+
+  /** The content a correction is learned from. */
+  private static design(row: { title: string; description: string; preconditions: unknown; steps: unknown; stepExpectations: unknown; testData: unknown; expectedResult: string; priority: string; type: string }) {
+    return {
+      title: row.title,
+      objective: row.description,
+      preconditions: row.preconditions,
+      steps: row.steps,
+      stepExpectations: row.stepExpectations,
+      testData: row.testData,
+      expectedResult: row.expectedResult,
+      priority: row.priority,
+      type: row.type,
+    };
+  }
+
+  private static generated(row: { tags: string[]; designStatus: string }) {
+    return !row.tags.includes("manual") && row.designStatus !== "MANUALLY_EDITED";
+  }
+
+  /** Delete a test case (its runs and links go with it). Deleting a generated case teaches the analysis. */
+  async deleteCase(id: string) {
+    const current = await this.getCase(id);
+    await this.prisma.testCase.delete({ where: { id } });
+    if (TestManagementService.generated(current)) {
+      await this.learning
+        ?.record({ artifact: "testCase", action: "delete", jiraIssueId: current.jiraIssueId, before: TestManagementService.design(current) })
+        .catch(() => undefined);
+    }
+    return { ok: true };
+  }
+
+  /** Approve a generated case: it is kept as is by every later analysis run. */
+  async approveCase(id: string) {
+    const current = await this.getCase(id);
+    const updated = await this.prisma.testCase.update({ where: { id }, data: { designStatus: "APPROVED" } });
+    if (TestManagementService.generated(current)) {
+      await this.learning
+        ?.record({ artifact: "testCase", action: "accept", jiraIssueId: current.jiraIssueId, before: TestManagementService.design(current) })
+        .catch(() => undefined);
+    }
+    return updated;
+  }
 
   listCases(jiraIssueId?: string) {
     return this.prisma.testCase.findMany({
@@ -177,10 +225,23 @@ export class TestManagementService {
     } else if (current.jiraSyncHash && current.jiraSyncHash === hash && current.jiraSyncStatus === "MODIFIED") {
       jiraSyncStatus = "SYNCED";
     }
-    return this.prisma.testCase.update({
+    const updated = await this.prisma.testCase.update({
       where: { id },
       data: { ...data, manuallyEdited: true, designStatus: "MANUALLY_EDITED", jiraSyncStatus },
     });
+    // A correction of generated content is what the analysis learns from.
+    if (TestManagementService.generated(current)) {
+      await this.learning
+        ?.record({
+          artifact: "testCase",
+          action: "edit",
+          jiraIssueId: current.jiraIssueId,
+          before: TestManagementService.design(current),
+          after: TestManagementService.design(updated),
+        })
+        .catch(() => undefined);
+    }
+    return updated;
   }
 
   async recordRun(input: {

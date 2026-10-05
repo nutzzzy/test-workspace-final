@@ -1,6 +1,9 @@
 import type { AIProvider, AiGenerateOptions } from "./ai-provider";
 import { normalizeLocale } from "./localize-fa";
-import { parseAndValidate } from "./ollama.provider";
+import { longRequest } from "./long-request";
+import { AiHttpError, parseAndValidate } from "./structured";
+
+export { AiHttpError } from "./structured";
 import { outputLanguageInstruction } from "./prompt-contract";
 
 /**
@@ -39,13 +42,13 @@ export class OpenAICompatibleProvider implements AIProvider {
   /** One chat completion; `json` asks for JSON mode and falls back when the model does not support it. */
   async chat(messages: Array<{ role: string; content: string }>, json: boolean): Promise<string> {
     const send = async (withFormat: boolean) =>
-      fetch(`${this.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      longRequest(`${this.baseUrl.replace(/\/$/, "")}/chat/completions`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
         },
-        signal: AbortSignal.timeout(this.timeoutMs),
+        timeoutMs: this.timeoutMs,
         body: JSON.stringify({
           model: this.model,
           temperature: this.temperature,
@@ -63,7 +66,7 @@ export class OpenAICompatibleProvider implements AIProvider {
     if (!response.ok) {
       throw new AiHttpError(response.status, await response.text().catch(() => ""), response.headers.get("retry-after"));
     }
-    const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const data = JSON.parse(await response.text()) as { choices?: Array<{ message?: { content?: string } }> };
     const content = data.choices?.[0]?.message?.content;
     if (!content) throw new Error("AI response is empty");
     return content;
@@ -78,16 +81,5 @@ export class OpenAICompatibleProvider implements AIProvider {
     const data = (await response.json()) as { data?: Array<{ id?: string }>; models?: Array<{ name?: string }> };
     const ids = (data.data ?? []).map((item) => item.id).concat((data.models ?? []).map((item) => item.name));
     return ids.filter((id): id is string => Boolean(id)).map((id) => id.replace(/^models\//, "")).sort();
-  }
-}
-
-/** An HTTP error from the AI service; the body is kept short and never includes the request. */
-export class AiHttpError extends Error {
-  constructor(
-    readonly status: number,
-    body: string,
-    readonly retryAfter: string | null = null,
-  ) {
-    super(`AI service error ${status}${body ? `: ${body.replace(/\s+/g, " ").slice(0, 200)}` : ""}`);
   }
 }

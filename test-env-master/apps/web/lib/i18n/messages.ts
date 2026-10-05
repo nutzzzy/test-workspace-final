@@ -107,6 +107,26 @@ const EXACT: Record<string, string> = {
   "This run is not waiting for input": "errors.notWaiting",
   "Choose a target field and a value": "errors.chooseTargetValue",
   "AI analysis was cancelled": "errors.aiCancelled",
+  "Run the analysis first": "errors.runAnalysisFirst",
+  "Write the acceptance criterion": "errors.writeCriterion",
+  "Criteria imported from Jira are edited on the Jira page": "errors.criterionFromJira",
+  "Acceptance criterion not found": "errors.recordGone",
+  "Edge case not found": "errors.recordGone",
+  "Risk not found": "errors.recordGone",
+  "Automation suggestion not found": "errors.recordGone",
+  "Document not found": "errors.recordGone",
+  "Guideline not found": "errors.recordGone",
+  "AI connection not found": "errors.recordGone",
+  "Choose a file": "errors.chooseFile",
+  "The document is too large (max 15 MB)": "errors.documentTooLarge",
+  "Supported documents: .md, .txt, .pdf, .docx": "errors.documentType",
+  "The document could not be read": "errors.documentUnreadable",
+  "The document has no readable text": "errors.documentEmpty",
+  "The document text is too long (max 400,000 characters)": "errors.documentTooLong",
+  "Choose a model": "errors.chooseModel",
+  "Only Ollama connections can download models": "errors.ollamaOnly",
+  "Invalid model name": "errors.invalidModel",
+  "Write the guideline (up to 600 characters)": "errors.writeGuideline",
   "AI base URL must be a valid http(s) URL": "errors.aiBaseUrl",
 };
 
@@ -185,6 +205,13 @@ export function localizeUserMessage(raw: string, t: Translate): string {
   if (exact) return t(exact);
   const variable = localizeVariableMessage(text, t);
   if (variable) return variable;
+  const unavailable = /^AI analysis is not available:\s*(\w+)$/.exec(text);
+  if (unavailable) {
+    const code = unavailable[1]!;
+    return t(code === "none" ? "studio.runner.notReady" : `errors.aiBlocked.${code}`);
+  }
+  const everywhere = /^AI (\w+) failed on every connection — (.*)$/.exec(text);
+  if (everywhere) return t("errors.aiAllFailed", { detail: everywhere[2]! });
   const blocked = localizeBlocked(text, t);
   if (blocked) return blocked;
   const curl = /^cURL (\w+)$/.exec(text);

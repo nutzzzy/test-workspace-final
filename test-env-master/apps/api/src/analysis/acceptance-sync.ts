@@ -72,18 +72,25 @@ export function planCriteriaSync(
   return { keep, create, remove };
 }
 
+/** Origins of criteria that Jira owns (an "edited" one is a Jira criterion the user reworded). */
+export const JIRA_ORIGINS = ["imported", "cleaned", "edited"] as const;
+
 /** Apply a rebuild inside the caller's transaction, preserving row ids and links. */
 export async function syncAcceptanceCriteria(
   tx: Prisma.TransactionClient,
   jiraIssueId: string,
   next: CriterionInput[],
 ): Promise<CriteriaSyncPlan> {
+  // Only criteria that came from Jira are rebuilt from Jira. The workspace's
+  // own (written by the user, AI proposals, confirmed proposals) are kept.
   const current = await tx.acceptanceCriterion.findMany({
-    where: { jiraIssueId },
+    where: { jiraIssueId, origin: { in: [...JIRA_ORIGINS] } },
     orderBy: { orderIndex: "asc" },
     select: { id: true, key: true, text: true },
   });
   const plan = planCriteriaSync(current, next);
+  // Rows derived by the old rule engine are superseded by real Jira criteria (and use their key space).
+  if (next.length > 0) await tx.acceptanceCriterion.deleteMany({ where: { jiraIssueId, origin: "derived" } });
 
   if (plan.remove.length > 0) {
     await tx.acceptanceCriterion.deleteMany({ where: { id: { in: plan.remove } } });

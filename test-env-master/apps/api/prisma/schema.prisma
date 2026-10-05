@@ -51,8 +51,88 @@ model JiraIssue {
   automationCandidates AutomationCandidate[]
   bugs                 Bug[]
   requirementProfile   RequirementProfile?
+  documents            IssueDocument[]
 
   @@map("jira_issues")
+}
+
+/// A PRD or other business document attached to an issue; only its extracted text is kept.
+model IssueDocument {
+  id          String    @id @default(cuid())
+  jiraIssueId String
+  jiraIssue   JiraIssue @relation(fields: [jiraIssueId], references: [id], onDelete: Cascade)
+  kind        String    @default("PRD")
+  title       String
+  fileName    String?
+  mimeType    String?
+  sizeBytes   Int       @default(0)
+  text        String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([jiraIssueId])
+  @@map("issue_documents")
+}
+
+/// One configured language-model service (local or hosted).
+model AiConnection {
+  id            String    @id @default(cuid())
+  name          String
+  /// ollama | openai (any OpenAI-compatible API)
+  kind          String
+  baseUrl       String
+  model         String
+  apiKeyEnc     String    @default("")
+  /// The user allowed sending requirement text to this (external) service.
+  allowExternal Boolean   @default(false)
+  enabled       Boolean   @default(true)
+  temperature   Float     @default(0.2)
+  timeoutMs     Int       @default(600000)
+  /// Context window requested from the model (tokens).
+  contextTokens Int       @default(16384)
+  /// Let reasoning models think before answering (slower, sometimes better).
+  reasoning     Boolean   @default(false)
+  priority      Int       @default(0)
+  lastStatus    String?
+  lastError     String?
+  lastCheckedAt DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@map("ai_connections")
+}
+
+/// A user correction of generated content (edit, delete, accept, reject) — what the analysis learns from.
+model AiFeedback {
+  id          String   @id @default(cuid())
+  artifact    String
+  action      String
+  jiraIssueId String?
+  locale      String   @default("en")
+  before      Json?
+  after       Json?
+  /// Already distilled into guidelines.
+  learned     Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([artifact, createdAt])
+  @@map("ai_feedback")
+}
+
+/// A rule the analysis follows: written by the user, or learned from feedback and editable.
+model AiGuideline {
+  id          String   @id @default(cuid())
+  /// all | criteria | questions | testCases | edgeCases | risks | strategy | automation | summary
+  scope       String
+  text        String
+  /// manual | learned
+  source      String   @default("manual")
+  enabled     Boolean  @default(true)
+  feedbackIds Json     @default("[]")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("ai_guidelines")
 }
 
 model RequirementProfile {
@@ -74,6 +154,11 @@ model AcceptanceCriterion {
   text        String
   orderIndex  Int       @default(0)
   origin      String    @default("imported")
+  /// AI-proposed criteria: the quote that supports it, how sure, and why.
+  evidence    String    @default("")
+  confidence  String?
+  rationale   String    @default("")
+  category    String?
   createdAt   DateTime  @default(now())
 
   testCases   TestCaseAcceptanceCriterion[]
@@ -99,6 +184,8 @@ model RequirementAnalysis {
   questionDetails    Json     @default("[]")
   /// [{ text, reason, source }] — suggested, never mixed with the Jira criteria.
   suggestedCriteria  Json     @default("[]")
+  /// Structured understanding: business rules, APIs, entities, states, configuration…
+  understanding      Json     @default("{}")
   manuallyEdited     Boolean  @default(false)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
@@ -182,6 +269,11 @@ model EdgeCase {
   jiraIssue      JiraIssue @relation(fields: [jiraIssueId], references: [id], onDelete: Cascade)
   title          String
   description    String
+  /// Why it matters and what could break.
+  rationale      String    @default("")
+  severity       String    @default("MEDIUM")
+  ruleRefs       String[]  @default([])
+  acceptanceKeys String[]  @default([])
   manuallyEdited Boolean   @default(false)
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
@@ -215,6 +307,8 @@ model AutomationCandidate {
   recommendedLevel      String
   apiUiRecommendation   String
   reasoning             String
+  prerequisites         Json      @default("[]")
+  tooling               String    @default("")
   manuallyEdited        Boolean   @default(false)
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt

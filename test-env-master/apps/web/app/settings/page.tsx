@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { AiLearning } from "@/components/ai/ai-learning";
 import { AiSettings } from "@/components/ai/ai-settings";
 import { ConnectorSettings } from "@/components/connectors/connector-settings";
 import { useI18n, type Locale } from "@/lib/i18n";
@@ -162,6 +163,7 @@ export default function SettingsPage() {
       <ConnectorSettings />
 
       <AiSettings />
+      <AiLearning />
     </div>
   );
 }

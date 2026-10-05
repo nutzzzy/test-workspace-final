@@ -37,8 +37,23 @@ async function main() {
   const issue = await req("/jira/demo-import", { method: "POST", body: "{}" });
   console.log(`[demo-seed] Issue ${issue.key}`);
 
-  await req(`/analysis/${issue.id}/all`, { method: "POST", body: "{}" });
-  console.log("[demo-seed] AI artifacts generated (heuristic/Ollama)");
+  // The analysis is done by the configured AI service, in the background.
+  try {
+    await req(`/analysis/${issue.id}/run`, { method: "POST", body: JSON.stringify({ scope: "all", locale: process.env.DEMO_LOCALE ?? "fa" }) });
+    console.log("[demo-seed] AI analysis started — this can take a while on a local model");
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 5000));
+      const status = await req(`/analysis/${issue.id}/run`);
+      const running = Object.entries(status.job?.stages ?? {}).find(([, stage]) => stage.state === "running");
+      if (status.job?.state !== "running") {
+        console.log(`[demo-seed] analysis ${status.job?.state}${status.job?.error ? `: ${status.job.error}` : ""}`);
+        break;
+      }
+      if (running) console.log(`[demo-seed]   … ${running[0]} ${running[1].detail ?? ""}`);
+    }
+  } catch (error) {
+    console.log(`[demo-seed] AI analysis skipped (${error.message}). Set up an AI service under Settings → AI.`);
+  }
 
   const cases = await req(`/test-cases?jiraIssueId=${issue.id}`);
   console.log(`[demo-seed] ${cases.length} test cases`);
