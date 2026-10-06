@@ -236,6 +236,8 @@ export function localizeUserMessage(raw: string, t: Translate): string {
     [/^SSRF protection blocked host:\s*(.+)$/, "errors.hostBlocked", "value"],
     [/^The response reports an error \([^)]*\):\s*(.+)$/, "errors.responseReportsError", "value"],
     [/^Element not found:\s*(.+)$/, "errors.uiElementNotFound", "value"],
+    [/^Ambiguous element:\s*(.+)$/, "errors.uiAmbiguous", "value"],
+    [/^AUTHENTICATION_STATE_EXPIRED:\s*(.+)$/, "errors.uiAuthExpired", "value"],
     [/^The page shows an error:\s*(.+)$/, "errors.uiPageError", "value"],
     [/^Request timed out after\s*(\d+) ms$/, "errors.requestTimeout", "value"],
     [/^Jira issue (\S+) was not found/, "errors.jiraIssueMissing", "value"],

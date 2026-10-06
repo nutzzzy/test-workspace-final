@@ -35,6 +35,16 @@ export const SessionConfigSchema = z.object({
   /** Only these earlier steps supply the session (cookies, headers, latest token); all when absent. */
   fromSteps: z.array(z.string().max(100)).max(100).optional(),
   storage: z.array(StorageSeedSchema).max(20).optional(),
+  /** A saved browser session (cookies and storage) to start from, so the replay does not sign in again. */
+  savedSessionId: z.string().max(100).optional(),
+  /** Use `savedSessionId` (an explicit switch: a chosen session can be kept but turned off). */
+  useSavedSession: z.boolean().optional(),
+  /**
+   * How to tell the saved session still works: text the page shows only when
+   * signed in, or a URL part that means "sent to sign in" (default: login/sign-in pages).
+   */
+  signedInText: z.string().max(300).optional(),
+  signInUrlPattern: z.string().max(300).optional(),
 });
 export type SessionConfig = z.infer<typeof SessionConfigSchema>;
 

@@ -9,7 +9,8 @@ export default [
     rules: {
       "@typescript-eslint/no-unused-vars": [
         "error",
-        { argsIgnorePattern: "^_" },
+        // "_" marks a value left out on purpose (e.g. `const { secret: _drop, ...rest } = item`).
+        { argsIgnorePattern: "^_", varsIgnorePattern: "^_", ignoreRestSiblings: true },
       ],
       "@typescript-eslint/no-require-imports": "off",
     },

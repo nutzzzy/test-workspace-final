@@ -9,6 +9,8 @@ import {
   Circle,
   Eye,
   Globe,
+  Hand,
+  Hourglass,
   Keyboard,
   ListChecks,
   MinusCircle,
@@ -18,6 +20,7 @@ import {
   Square,
   Trash2,
   Type,
+  Upload,
   Video,
   XCircle,
 } from "lucide-react";
@@ -28,12 +31,27 @@ import { BidiText } from "@/components/bidi-text";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import type { Step, StepOutput } from "@/components/scenarios/builder-types";
+import { SaveSessionPanel, SessionPicker, type SessionChoice } from "@/components/scenarios/saved-sessions";
 
 /** Mirrors the API's UI action (apps/api/src/scenario-engine/ui/ui-types.ts). */
 export type UiAction = {
   id: string;
-  kind: "navigate" | "click" | "fill" | "select" | "check" | "uncheck" | "press" | "waitForText" | "assertText" | "assertUrl";
-  target?: { candidates: Array<{ kind: string; value: string; name?: string }>; fingerprint: Record<string, unknown>; learned?: number };
+  kind: "navigate" | "click" | "fill" | "select" | "check" | "uncheck" | "press" | "hover" | "upload" | "waitForElement" | "waitForText" | "assertText" | "assertUrl";
+  target?: {
+    candidates: Array<{ kind: string; value: string; name?: string; unique?: boolean; confidence?: number }>;
+    fingerprint: Record<string, unknown>;
+    learned?: number;
+    /** The element is in a table / list row, found by what identifies the row. */
+    scope?: {
+      container?: { role?: string; name?: string };
+      identity: Array<{ strategy: string; attr?: string; value?: string; column?: string; columnIndex?: number; index?: number }>;
+      target: Array<{ kind: string; value: string; name?: string; confidence?: number }>;
+      rowCount?: number;
+    };
+    context?: { role?: string; name?: string };
+  };
+  files?: Array<{ name: string; type?: string }>;
+  dynamicValue?: "uuid" | "timestamp" | "random";
   value?: string;
   secret?: boolean;
   optionLabel?: string;
@@ -53,6 +71,8 @@ export type UiActionResult = {
   how?: string;
   healed?: boolean;
   error?: string;
+  code?: string;
+  diagnostics?: Record<string, unknown>;
   optional?: boolean;
 };
 
@@ -111,6 +131,12 @@ export function actionIcon(kind: UiAction["kind"]) {
       return CheckCircle2;
     case "press":
       return Keyboard;
+    case "hover":
+      return Hand;
+    case "upload":
+      return Upload;
+    case "waitForElement":
+      return Hourglass;
     default:
       return Eye;
   }
@@ -378,6 +404,7 @@ export function UiRecordDialog({
             </p>
             {recording.error ? <p className="text-xs text-warning">{err(recording.error)}</p> : null}
             {recording.prepared ? <PreparedNote prepared={recording.prepared} /> : null}
+            <SaveSessionPanel recordingId={recording.id} />
             {count === 0 ? (
               <p className="rounded-md border border-dashed border-border px-3 py-6 text-center text-xs text-muted-foreground">{t("uiStep.waiting")}</p>
             ) : (
@@ -537,7 +564,12 @@ export function UiActionsTab({
   const [timeout, setTimeoutValue] = useState(String(step.config.actionTimeoutMs ?? 15000));
   const [newSession, setNewSession] = useState(step.config.newSession === true);
   const [failOnPageError, setFailOnPageError] = useState(step.config.failOnPageError !== false);
-  const savedSession = (step.config.session ?? {}) as { fromEarlierSteps?: boolean; fromSteps?: string[]; storage?: StorageSeed[] };
+  const savedSession = (step.config.session ?? {}) as { fromEarlierSteps?: boolean; fromSteps?: string[]; storage?: StorageSeed[] } & SessionChoice;
+  const [sessionChoice, setSessionChoice] = useState<SessionChoice>({
+    useSavedSession: savedSession.useSavedSession,
+    savedSessionId: savedSession.savedSessionId,
+    signedInText: savedSession.signedInText,
+  });
   const [fromEarlier, setFromEarlier] = useState(savedSession.fromEarlierSteps !== false);
   const [storage, setStorage] = useState<StorageSeed[]>(savedSession.storage ?? []);
   const [fromSteps, setFromSteps] = useState<string[] | null>(savedSession.fromSteps?.length ? savedSession.fromSteps : null);
@@ -575,12 +607,15 @@ export function UiActionsTab({
         newSession: newSession || undefined,
         failOnPageError: failOnPageError ? undefined : false,
         session:
-          fromEarlier && storage.length === 0 && !fromSteps
+          fromEarlier && storage.length === 0 && !fromSteps && !sessionChoice.savedSessionId && !sessionChoice.useSavedSession
             ? undefined
             : {
                 ...(fromEarlier ? {} : { fromEarlierSteps: false }),
                 ...(fromSteps ? { fromSteps } : {}),
                 ...(storage.length ? { storage: storage.filter((item) => item.key.trim()) } : {}),
+                ...(sessionChoice.savedSessionId ? { savedSessionId: sessionChoice.savedSessionId } : {}),
+                ...(sessionChoice.useSavedSession ? { useSavedSession: true } : {}),
+                ...(sessionChoice.signedInText ? { signedInText: sessionChoice.signedInText } : {}),
               },
       });
       setDirty(false);
@@ -660,12 +695,8 @@ export function UiActionsTab({
                       }
                     />
                   ) : null}
-                  {locator ? (
-                    <span className="min-w-0 truncate font-mono text-[10px] text-muted-foreground" dir="ltr" title={action.target!.candidates.map((item) => `${item.kind}: ${item.value}${item.name ? ` "${item.name}"` : ""}`).join("\n")}>
-                      {locator.kind === "role" ? `${locator.value} "${locator.name ?? ""}"` : locator.value}
-                      {action.target!.candidates.length > 1 ? ` +${n(action.target!.candidates.length - 1)}` : ""}
-                    </span>
-                  ) : null}
+                  {locator ? <LocatorBadge target={action.target!} locator={locator} /> : null}
+                  {action.dynamicValue ? <span className="text-[10px] text-warning">{t("uiStep.dynamicValue", { kind: action.dynamicValue })}</span> : null}
                   <label className="ms-auto flex items-center gap-1 text-[11px] text-muted-foreground">
                     <input type="checkbox" checked={action.optional === true} onChange={(event) => patch(index, { optional: event.target.checked || undefined })} />
                     {t("uiStep.optional")}
@@ -685,6 +716,14 @@ export function UiActionsTab({
           </Button>
         ))}
       </div>
+
+      <SessionPicker
+        value={sessionChoice}
+        onChange={(next) => {
+          setSessionChoice(next);
+          setDirty(true);
+        }}
+      />
 
       <details className="rounded-md border border-border" open={storage.length > 0 || !fromEarlier || fromSteps !== null}>
         <summary className="cursor-pointer px-3 py-2 text-xs font-medium">{t("uiStep.signIn")}</summary>
@@ -957,7 +996,12 @@ export function UiResultTab({ output, error }: { output: UiOutput | null; error?
                 {action.how}
               </p>
             ) : null}
-            {action.error ? <p className="ps-7 text-[11px] text-destructive">{err(action.error)}</p> : null}
+            {action.error ? (
+              <p className="ps-7 text-[11px] text-destructive">
+                {action.code ? <span className="me-1 font-mono">[{action.code}]</span> : null}
+                {err(action.error)}
+              </p>
+            ) : null}
           </li>
         ))}
       </ol>
@@ -985,5 +1029,35 @@ export function UiResultTab({ output, error }: { output: UiOutput | null; error?
         </section>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * How the action finds its element: the row it is in (by what identifies the
+ * row) and the way inside it, or the main locator — with its confidence.
+ */
+function LocatorBadge({ target, locator }: { target: NonNullable<UiAction["target"]>; locator: NonNullable<UiAction["target"]>["candidates"][number] }) {
+  const { t, n } = useI18n();
+  const show = (item: { kind: string; value: string; name?: string }) => (item.kind === "role" ? `${item.value} "${item.name ?? ""}"` : item.value);
+  const all = target.candidates.map((item) => `${item.kind}: ${show(item)}${item.confidence !== undefined ? ` (${Math.round(item.confidence * 100)}%)` : ""}`).join("\n");
+  if (target.scope) {
+    const identity = target.scope.identity
+      .map((item) => (item.strategy === "index" ? `#${n((item.index ?? 0) + 1)}` : item.strategy === "cell" ? `${item.column ?? n((item.columnIndex ?? 0) + 1)}=${item.value}` : item.strategy === "attr" ? `${item.attr}=${item.value}` : item.value))
+      .join(" + ");
+    const inner = target.scope.target[0];
+    return (
+      <span className="min-w-0 truncate text-[10px] text-muted-foreground" title={all}>
+        {t("uiStep.inRow", { container: target.scope.container?.name ?? t("uiStep.list"), row: identity })}
+        {inner ? <span className="font-mono" dir="ltr"> → {show(inner)}</span> : null}
+        {inner?.confidence !== undefined ? ` · ${n(Math.round(inner.confidence * 100))}%` : ""}
+      </span>
+    );
+  }
+  return (
+    <span className="min-w-0 truncate font-mono text-[10px] text-muted-foreground" dir="ltr" title={all}>
+      {show(locator)}
+      {locator.confidence !== undefined ? ` · ${Math.round(locator.confidence * 100)}%` : ""}
+      {target.candidates.length > 1 ? ` +${n(target.candidates.length - 1)}` : ""}
+    </span>
   );
 }

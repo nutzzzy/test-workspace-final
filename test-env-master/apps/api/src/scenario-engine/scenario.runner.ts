@@ -22,6 +22,8 @@ import { SetVariableExecutor } from "./executors/set-variable.executor";
 import { UiFlowExecutor, type UiLearning } from "./executors/ui-flow.executor";
 import { decryptSecret, resolveEncryptionKey } from "../common/crypto.util";
 import type { UiAction } from "./ui/ui-types";
+import { UiSessionStore } from "./ui/saved-sessions";
+import type { AiResolver } from "./ui/ui-browser";
 import type { StorageSeed } from "./ui/browser-session";
 import type { StepBinding } from "./flow/bindings";
 import { parseResolution, type ManualResolution } from "./flow/manual-recovery";
@@ -65,6 +67,7 @@ export class ScenarioRunner implements OnModuleInit {
     private readonly environments: EnvironmentsService,
     connectors: DatabaseConnectorsService,
     @Optional() private readonly ai?: AIService,
+    @Optional() private readonly savedSessions?: UiSessionStore,
   ) {
     for (const executor of [
       new HttpRequestExecutor(),
@@ -74,7 +77,10 @@ export class ScenarioRunner implements OnModuleInit {
       new DelayExecutor(),
       new ConditionExecutor(),
       new DatabaseActionExecutor(connectors),
-      new UiFlowExecutor((payload) => decryptSecret(payload, resolveEncryptionKey(process.env.SECRETS_ENCRYPTION_KEY))),
+      new UiFlowExecutor((payload) => decryptSecret(payload, resolveEncryptionKey(process.env.SECRETS_ENCRYPTION_KEY)), {
+        loadSession: (id) => this.savedSessions?.state(id) ?? Promise.resolve(null),
+        ai: (question) => this.resolveUiTarget(question),
+      }),
     ]) {
       this.registry.register(executor);
     }
@@ -101,6 +107,26 @@ export class ScenarioRunner implements OnModuleInit {
 
   getRegistry() {
     return this.registry;
+  }
+
+  /**
+   * The AI fallback of UI replay: called only when the page alone cannot tell
+   * which element or row was meant. It sees one short line per option and
+   * what was recorded — never the page — and answers with an index.
+   */
+  private async resolveUiTarget(question: Parameters<AiResolver>[0]): Promise<{ index: number; confidence: number } | null> {
+    if (!this.ai) return null;
+    const answer = await this.ai.tryStructured("analysis", {
+      system: "You match a recorded UI element to one of the options found on the page now. Reply with JSON only.",
+      prompt: JSON.stringify({
+        task: `Which option is the ${question.kind} that was recorded? index = position in options; null when none clearly is. confidence 0-1.`,
+        recorded: question.recorded.slice(0, 300),
+        options: question.options.slice(0, 20).map((text) => text.slice(0, 160)),
+        answer: { index: "number|null", confidence: "number" },
+      }),
+      schema: z.object({ index: z.number().int().nullable(), confidence: z.number().min(0).max(1) }),
+    });
+    return answer && answer.index !== null ? { index: answer.index, confidence: answer.confidence } : null;
   }
 
   /**

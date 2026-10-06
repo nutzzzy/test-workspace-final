@@ -11,6 +11,7 @@ import { PrismaService } from "../prisma/prisma.service";
 import { ConfigService } from "@nestjs/config";
 import { encryptSecret, resolveEncryptionKey } from "../common/crypto.util";
 import { UiRecorderService } from "../scenario-engine/ui/ui-recorder.service";
+import { UiSessionStore } from "../scenario-engine/ui/saved-sessions";
 import { publicUiConfig, readUiConfig, sealUiConfig } from "../scenario-engine/ui/ui-types";
 import { describeSeed, seedFromContext } from "../scenario-engine/ui/browser-session";
 import { SESSION_KEY, uiSessionState } from "../scenario-engine/executors/ui-flow.executor";
@@ -81,6 +82,7 @@ export class ScenariosService {
     private readonly connectors: DatabaseConnectorsService,
     private readonly recorder: UiRecorderService,
     private readonly config: ConfigService,
+    private readonly savedSessions: UiSessionStore,
   ) {}
 
   private encrypt = (plain: string) => encryptSecret(plain, resolveEncryptionKey(this.config.get<string>("SECRETS_ENCRYPTION_KEY")));
@@ -192,6 +194,18 @@ export class ScenariosService {
 
   discardRecording(id: string) {
     return this.recorder.discard(id);
+  }
+
+  /**
+   * Save the recording browser's session (cookies, and page storage unless
+   * `cookiesOnly`) as a named profile — or over an existing one (`replaceId`).
+   * Only a summary comes back; the values stay encrypted on the server.
+   */
+  async saveRecordingSession(id: string, body: { name?: unknown; cookiesOnly?: unknown; replaceId?: unknown }) {
+    const state = await this.recorder.storageState(id);
+    const cookiesOnly = body.cookiesOnly === true;
+    if (typeof body.replaceId === "string" && body.replaceId) return this.savedSessions.replace(body.replaceId, state, { cookiesOnly });
+    return this.savedSessions.create(typeof body.name === "string" ? body.name : "", state, { cookiesOnly });
   }
 
   /**

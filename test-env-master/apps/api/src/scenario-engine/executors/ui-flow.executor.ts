@@ -2,8 +2,10 @@ import type { Browser, BrowserContext, Frame, Locator, Page } from "playwright-c
 import { lookup } from "../auto-bind";
 import type { ExecutionContext, StepExecutionResult, StepExecutor } from "../types";
 import { pageErrorsMain } from "../ui/recorder-script";
-import { describeCandidate, launchBrowser, locate, type Located } from "../ui/ui-browser";
-import { applySeed, describeSeed, learnTokenPlace, seedFromContext, type StorageSeed } from "../ui/browser-session";
+import { randomUUID } from "crypto";
+import { describeCandidate, launchBrowser, locate, UiLocateError, type AiResolver, type Located } from "../ui/ui-browser";
+import { applySeed, describeSeed, learnTokenPlace, seedFromContext } from "../ui/browser-session";
+import { sessionStatus, type StorageState } from "../ui/saved-sessions";
 import { hasDynamicParts, sameRoute } from "../ui/replay-smarts";
 import { describeAction, readUiConfig, type LocatorCandidate, type UiAction, type UiFlowConfig } from "../ui/ui-types";
 
@@ -19,7 +21,24 @@ export type UiActionResult = {
   /** Found another way than last time: the new way is remembered. */
   healed?: boolean;
   error?: string;
+  /** ELEMENT_NOT_FOUND, AMBIGUOUS_LOCATOR, AUTHENTICATION_STATE_EXPIRED. */
+  code?: string;
+  /** What the replay saw (rows, matches, identities that no longer match). */
+  diagnostics?: Record<string, unknown>;
   optional?: boolean;
+};
+
+/** Thrown when the saved session the step starts from no longer signs in. */
+export const AUTH_EXPIRED = "AUTHENTICATION_STATE_EXPIRED";
+
+/** Pages a signed-out user is sent to. */
+const SIGN_IN_URL = /\/(login|log-in|signin|sign-in|sign_in|auth|sso|account\/login)(\/|\?|#|$)/i;
+
+export type UiFlowDeps = {
+  /** A saved session's storageState (decrypted), or null when it is gone. */
+  loadSession?: (id: string) => Promise<StorageState | null>;
+  /** Asked only when the page alone cannot tell which element or row was meant. */
+  ai?: AiResolver;
 };
 
 /** A locator that worked better than the remembered one, to save on the step. */
@@ -44,7 +63,10 @@ const MAX_SCREENSHOT_BYTES = 450_000;
 export class UiFlowExecutor implements StepExecutor {
   readonly type = "UI_FLOW";
 
-  constructor(private readonly decrypt: (payload: string) => string) {}
+  constructor(
+    private readonly decrypt: (payload: string) => string,
+    private readonly deps: UiFlowDeps = {},
+  ) {}
 
   async execute(config: Record<string, unknown>, context: ExecutionContext): Promise<StepExecutionResult> {
     const parsed = readUiConfig(config);
@@ -54,15 +76,37 @@ export class UiFlowExecutor implements StepExecutor {
     const results: UiActionResult[] = [];
     const learned: UiLearning[] = [];
 
+    // A saved session (cookies and storage) to start from: loaded before anything opens.
+    const saved = flow.session?.useSavedSession && flow.session.savedSessionId ? flow.session.savedSessionId : null;
+    let savedState: StorageState | null = null;
+    if (saved) {
+      savedState = (await this.deps.loadSession?.(saved).catch(() => null)) ?? null;
+      const why = !savedState ? "the saved session no longer exists" : sessionStatus(savedState) === "expired" ? "every cookie of the saved session has expired" : null;
+      if (why) return { status: "FAILED", error: `${AUTH_EXPIRED}: ${why}; sign in and save the session again`, output: { kind: "ui", errorCode: AUTH_EXPIRED, actions: [] } };
+      // Its values are secrets: redacted wherever they could show up.
+      for (const cookie of savedState!.cookies) context.markSecret(cookie.value);
+      for (const origin of savedState!.origins) for (const item of origin.localStorage) context.markSecret(item.value);
+    }
+
     let session: Session;
     try {
-      session = await this.session(context, flow);
+      session = await this.session(context, flow, savedState);
     } catch (error) {
       return { status: "FAILED", error: error instanceof Error ? error.message : "Could not start the browser" };
     }
+    // Answers of the AI fallback, per run: the same question is never asked twice.
+    const asked = new Map<string, Promise<{ index: number; confidence: number } | null>>();
+    const ai: AiResolver | undefined = this.deps.ai
+      ? (question) => {
+          const key = JSON.stringify(question);
+          if (!asked.has(key)) asked.set(key, this.deps.ai!(question));
+          return asked.get(key)!;
+        }
+      : undefined;
     const stopOnCancel = context.onAbort(() => void session.page.close().catch(() => undefined));
 
     let failure: string | undefined;
+    let failureCode: string | undefined;
     let page = session.page;
     let signedIn: ReturnType<typeof describeSeed> | undefined;
     let seeded: { token?: string; guessed?: string[] } = {};
@@ -76,6 +120,17 @@ export class UiFlowExecutor implements StepExecutor {
       seeded = { token: seed.token, guessed: seed.guessed };
       await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: Math.max(timeout, 30_000) });
       await settle(page);
+      if (savedState) {
+        const expired = await signedOut(page, startUrl, flow.session ?? {}, timeout);
+        if (expired) {
+          const screenshot = await shot(page);
+          return {
+            status: "FAILED",
+            error: `${AUTH_EXPIRED}: ${expired}; sign in and save the session again`,
+            output: { kind: "ui", errorCode: AUTH_EXPIRED, url: page.url(), actions: [], ...(screenshot ? { screenshot } : {}) },
+          };
+        }
+      }
 
       // Errors already on the page before the final submit are not caused by it.
       const submit = lastSubmit(flow.actions);
@@ -98,6 +153,7 @@ export class UiFlowExecutor implements StepExecutor {
           page = await pageFor(session, action.tab ?? 0, timeout);
           if (action === submit) errorsBefore = new Set(await page.evaluate(pageErrorsMain).catch(() => [] as string[]));
           const located = await this.perform(page, action, context, timeout, {
+            ai,
             previous: order[position - 1],
             // Pages the next actions were recorded on: the app may skip ahead to one of them.
             upcoming: order.slice(position + 1, position + 6).map((item) => item.url).filter((url): url is string => Boolean(url)),
@@ -129,10 +185,12 @@ export class UiFlowExecutor implements StepExecutor {
             continue;
           }
           const message = context.isCancelled() ? "Cancelled" : error instanceof Error ? firstLine(error.message) : "Action failed";
-          results.push({ id: action.id, kind: action.kind, label, status: "FAILED", durationMs: Date.now() - started, error: message, ...(action.optional ? { optional: true } : {}) });
+          const coded = error instanceof UiLocateError ? { code: error.code, diagnostics: error.diagnostics } : {};
+          results.push({ id: action.id, kind: action.kind, label, status: "FAILED", durationMs: Date.now() - started, error: message, ...coded, ...(action.optional ? { optional: true } : {}) });
           if (context.isCancelled()) return { status: "CANCELLED", error: "Cancelled during UI step" };
           if (!action.optional) {
             failure = `${label}: ${message}`;
+            failureCode = error instanceof UiLocateError ? error.code : undefined;
             break;
           }
         }
@@ -161,6 +219,7 @@ export class UiFlowExecutor implements StepExecutor {
           url: page.url(),
           title: await page.title().catch(() => ""),
           actions: results,
+          ...(failureCode ? { errorCode: failureCode } : {}),
           ...(signedIn && (signedIn.cookies.length || signedIn.headers.length || signedIn.storage.length || signedIn.missing) ? { signedIn } : {}),
           ...(pageErrors.length ? { pageErrors } : {}),
           ...(screenshot ? { screenshot } : {}),
@@ -185,15 +244,20 @@ export class UiFlowExecutor implements StepExecutor {
     }
   }
 
-  /** The run's browser session: the previous UI step's, or a new one. */
-  private async session(context: ExecutionContext, flow: UiFlowConfig): Promise<Session> {
+  /**
+   * The run's browser session: the previous UI step's, or a new one. A step
+   * that starts from a saved session always gets a new browser with it loaded
+   * (cookies and storage in place before the first page opens).
+   */
+  private async session(context: ExecutionContext, flow: UiFlowConfig, savedState: StorageState | null = null): Promise<Session> {
     const existing = context.resources.get(SESSION_KEY) as Session | undefined;
-    if (existing && !flow.newSession && existing.browser.isConnected() && !existing.page.isClosed()) return existing;
+    if (existing && !flow.newSession && !savedState && existing.browser.isConnected() && !existing.page.isClosed()) return existing;
     if (existing) await existing.browser.close().catch(() => undefined);
     const browser = await launchBrowser({ headless: true });
     const browserContext = await browser.newContext({
       viewport: flow.viewport ?? { width: 1366, height: 860 },
       ignoreHTTPSErrors: false,
+      ...(savedState ? { storageState: savedState } : {}),
     });
     browserContext.on("page", track);
     const page = await browserContext.newPage();
@@ -211,7 +275,7 @@ export class UiFlowExecutor implements StepExecutor {
     action: UiAction,
     context: ExecutionContext,
     timeout: number,
-    around: { previous?: UiAction; upcoming: string[] } = { upcoming: [] },
+    around: { previous?: UiAction; upcoming: string[]; ai?: AiResolver } = { upcoming: [] },
   ): Promise<Located | null> {
     const scope = await frameFor(page, action.frameUrl, timeout);
     const value = () => {
@@ -225,7 +289,7 @@ export class UiFlowExecutor implements StepExecutor {
     };
     const find = async () => {
       if (!action.target) throw new Error("This action has no element");
-      return locate(scope, action.target, timeout, () => context.isCancelled());
+      return locate(scope, action.target, timeout, () => context.isCancelled(), { ai: around.ai });
     };
 
     switch (action.kind) {
@@ -237,8 +301,9 @@ export class UiFlowExecutor implements StepExecutor {
         const caused = Boolean(around.previous && around.previous.kind !== "assertText" && around.previous.kind !== "assertUrl" && around.previous.kind !== "waitForText");
         const routes = [target, ...around.upcoming];
         const arrived = () => routes.some((route) => sameRoute(page.url(), route));
-        const deadline = Date.now() + (caused ? (hasDynamicParts(target) ? Math.max(timeout, 30_000) : Math.min(timeout, 6_000)) : 0);
-        while (!arrived() && Date.now() < deadline && !context.isCancelled()) await page.waitForTimeout(250);
+        const wait = caused ? (hasDynamicParts(target) ? Math.max(timeout, 30_000) : Math.min(timeout, 6_000)) : 0;
+        // The app's own navigation: wait for the URL itself, not a fixed time.
+        if (!arrived() && wait > 0) await page.waitForURL((url) => routes.some((route) => sameRoute(url.href, route)), { timeout: wait, waitUntil: "commit" }).catch(() => undefined);
         if (arrived()) {
           await settle(page);
           return null;
@@ -333,12 +398,28 @@ export class UiFlowExecutor implements StepExecutor {
       }
       case "assertUrl": {
         const part = value();
-        const deadline = Date.now() + timeout;
-        while (!page.url().includes(part)) {
-          if (Date.now() > deadline) throw new Error(`The URL is ${page.url()}, expected it to contain "${part}"`);
-          await page.waitForTimeout(200);
-        }
+        await page.waitForURL((url) => url.href.includes(part), { timeout, waitUntil: "commit" }).catch(() => {
+          throw new Error(`The URL is ${page.url()}, expected it to contain "${part}"`);
+        });
         return null;
+      }
+      case "hover": {
+        const located = await find();
+        await located.locator.hover({ timeout });
+        return located;
+      }
+      case "waitForElement": {
+        // Explicit condition: the element is there and visible (locate waits for exactly that).
+        return find();
+      }
+      case "upload": {
+        const located = await find();
+        // The recording keeps names and types only: the same names are uploaded with placeholder content.
+        const files = (action.files ?? []).map((file) => ({ name: file.name, mimeType: file.type || "application/octet-stream", buffer: Buffer.from(`QA Workbench test file: ${file.name}\n`) }));
+        if (files.length === 0) throw new Error("No file was recorded for this upload");
+        await located.locator.setInputFiles(files, { timeout });
+        await settle(page);
+        return { ...located, how: `${located.how} (placeholder content)` };
       }
     }
   }
@@ -386,9 +467,18 @@ export class UiFlowExecutor implements StepExecutor {
   }
 }
 
-/** {{variables}} in a recorded value. */
+/** Values made fresh for each run, for what must not be the same twice (a new user's email, an order note). */
+const GENERATED: Record<string, () => string> = {
+  $uuid: () => randomUUID(),
+  $timestamp: () => String(Date.now()),
+  $now: () => new Date().toISOString(),
+  $random: () => Math.random().toString(36).slice(2, 10),
+};
+
+/** {{variables}} in a recorded value, and the generated {{$uuid}}, {{$timestamp}}, {{$now}}, {{$random}}. */
 function fill(template: string, context: ExecutionContext): string {
-  return template.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (_match, key: string) => {
+  return template.replace(/\{\{\s*(\$?[A-Za-z0-9_.-]+)\s*\}\}/g, (_match, key: string) => {
+    if (GENERATED[key]) return GENERATED[key]!();
     const value = lookup(key, context);
     if (value === undefined) throw new Error(`Unresolved variable: {{${key}}}`);
     return value;
@@ -545,4 +635,36 @@ async function selection(locator: Locator): Promise<boolean | null> {
       return radios.length === 1 ? read(radios[0]!) : null;
     })
     .catch(() => null);
+}
+
+/**
+ * After opening the start URL with a saved session: why it looks signed out,
+ * or null. Sent to a sign-in page (that the start URL is not), the text the
+ * step expects when signed in is missing, or a password field asks to sign in.
+ */
+async function signedOut(page: Page, startUrl: string, session: { signedInText?: string; signInUrlPattern?: string }, timeout: number): Promise<string | null> {
+  const pattern = (() => {
+    try {
+      return session.signInUrlPattern ? new RegExp(session.signInUrlPattern, "i") : SIGN_IN_URL;
+    } catch {
+      return SIGN_IN_URL;
+    }
+  })();
+  const startIsSignIn = pattern.test(startUrl);
+  if (!startIsSignIn && pattern.test(page.url())) return `the app sent the browser to its sign-in page (${page.url().split("?")[0]})`;
+  if (session.signedInText) {
+    const shown = await page
+      .getByText(session.signedInText, { exact: false })
+      .first()
+      .waitFor({ state: "visible", timeout: Math.min(timeout, 8_000) })
+      .then(() => true)
+      .catch(() => false);
+    if (!shown) return `the page does not show "${session.signedInText.slice(0, 60)}"`;
+    return null;
+  }
+  if (!startIsSignIn) {
+    const password = page.locator('input[type="password"]');
+    if ((await password.count().catch(() => 0)) > 0 && (await password.first().isVisible().catch(() => false))) return "the page asks for a password";
+  }
+  return null;
 }

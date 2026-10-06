@@ -5,19 +5,28 @@ import { z } from "zod";
 import { launchBrowser } from "./ui-browser";
 import { applySeed, type SessionSeed } from "./browser-session";
 import { recorderMain } from "./recorder-script";
-import { describeAction, FingerprintSchema, LocatorCandidateSchema, SECRET_PLACEHOLDER, type UiAction } from "./ui-types";
+import type { StorageState } from "./saved-sessions";
+import { describeAction, FingerprintSchema, LocatorCandidateSchema, RowScopeSchema, SECRET_PLACEHOLDER, type UiAction } from "./ui-types";
 
 /** What the page script sends for one user action (untrusted: the recorded page could send anything). */
 const EventSchema = z.object({
-  kind: z.enum(["click", "fill", "select", "check", "uncheck", "press", "assertText", "__stop", "__activity"]),
+  kind: z.enum(["click", "fill", "select", "check", "uncheck", "press", "upload", "assertText", "__stop", "__activity"]),
   value: z.string().max(10_000).optional(),
   optionLabel: z.string().max(300).optional(),
   secret: z.boolean().optional(),
   url: z.string().max(4000).optional(),
   frame: z.boolean().optional(),
   textField: z.boolean().optional(),
+  files: z.array(z.object({ name: z.string().max(300), type: z.string().max(200).optional() })).max(20).optional(),
+  dynamicValue: z.enum(["uuid", "timestamp", "random"]).optional(),
   target: z
-    .object({ candidates: z.array(LocatorCandidateSchema).max(12), fingerprint: FingerprintSchema })
+    .object({
+      candidates: z.array(LocatorCandidateSchema).max(12),
+      fingerprint: FingerprintSchema,
+      // A malformed row description is dropped, not the whole action.
+      scope: RowScopeSchema.optional().catch(undefined),
+      context: z.object({ role: z.string().max(40).optional(), name: z.string().max(300).optional() }).optional().catch(undefined),
+    })
     .optional(),
 });
 
@@ -43,6 +52,8 @@ type Session = {
   lastUrl: string;
   error?: string;
   idleTimer?: ReturnType<typeof setTimeout>;
+  /** The browser's cookies and storage when it was closed, so the session can still be saved after stopping. */
+  finalState?: StorageState;
 };
 
 const MAX_SESSIONS = 2;
@@ -105,6 +116,7 @@ export class UiRecorderService implements OnModuleDestroy {
     await context.addInitScript(`(${recorderMain.toString()})()`);
     context.on("page", (page) => this.watch(session, page));
     browser.on("disconnected", () => this.finish(session));
+    // A browser the user closes keeps nothing; one stopped by the app keeps its session (see close).
 
     const page = await context.newPage();
     try {
@@ -127,8 +139,28 @@ export class UiRecorderService implements OnModuleDestroy {
   async stop(id: string) {
     const session = this.get(id);
     this.finish(session);
-    await session.browser.close().catch(() => undefined);
+    await this.close(session);
     return this.view(session);
+  }
+
+  /**
+   * The recording browser's session (cookies and page storage, as Playwright
+   * storageState): live while it is open, as it was when it closed otherwise.
+   * Never includes what was typed into fields (passwords are not part of it).
+   */
+  async storageState(id: string): Promise<StorageState> {
+    const session = this.get(id);
+    if (session.browser.isConnected()) {
+      const state = await session.context.storageState().catch(() => null);
+      if (state) return state;
+    }
+    if (session.finalState) return session.finalState;
+    throw new BadRequestException("The recording browser is closed and its session was not kept");
+  }
+
+  private async close(session: Session) {
+    if (session.browser.isConnected()) session.finalState = (await session.context.storageState().catch(() => undefined)) ?? session.finalState;
+    await session.browser.close().catch(() => undefined);
   }
 
   /** The recorded actions with their secret values, once, for saving into a step. */
@@ -136,6 +168,7 @@ export class UiRecorderService implements OnModuleDestroy {
     const session = this.get(id);
     if (session.state !== "stopped") throw new BadRequestException("Stop the recording first");
     this.sessions.delete(id);
+    session.finalState = undefined;
     return { scenarioId: session.scenarioId, stepId: session.stepId, startUrl: session.startUrl, range: session.range, actions: tidy(session.actions) };
   }
 
@@ -144,6 +177,7 @@ export class UiRecorderService implements OnModuleDestroy {
     if (!session) return { ok: true };
     this.finish(session);
     await session.browser.close().catch(() => undefined);
+    session.finalState = undefined;
     this.sessions.delete(id);
     return { ok: true };
   }
@@ -224,6 +258,8 @@ export class UiRecorderService implements OnModuleDestroy {
       ...(event.value !== undefined ? { value: event.value } : {}),
       ...(event.optionLabel ? { optionLabel: event.optionLabel } : {}),
       ...(event.secret ? { secret: true } : {}),
+      ...(event.files?.length ? { files: event.files } : {}),
+      ...(event.dynamicValue && !event.secret ? { dynamicValue: event.dynamicValue } : {}),
       ...(event.url ? { url: event.url } : {}),
       tab: tabOf(session, source.page),
       ...(inFrame ? { frameUrl: source.frame.url() } : {}),

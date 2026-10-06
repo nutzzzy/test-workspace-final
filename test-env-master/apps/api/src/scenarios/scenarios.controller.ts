@@ -19,6 +19,12 @@ export class ScenariosController {
     return (await this.scenariosService.list()).map(publicScenario);
   }
 
+  /** Save the recording browser's cookies and storage as a named session (values are never returned). */
+  @Post("ui-recordings/:recordingId/session")
+  saveRecordingSession(@Param("recordingId") id: string, @Body() body: { name?: unknown; cookiesOnly?: unknown; replaceId?: unknown }) {
+    return this.scenariosService.saveRecordingSession(id, body ?? {});
+  }
+
   /** Open a browser on this machine at the URL and record what the user does there. */
   @Post(":id/ui-recordings")
   startRecording(

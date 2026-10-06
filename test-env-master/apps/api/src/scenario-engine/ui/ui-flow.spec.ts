@@ -248,7 +248,7 @@ describeUi("UI steps: record in a browser, replay in the background", () => {
     expect(role).toMatchObject({ value: "qa", optionLabel: "QA engineer" });
     expect(submit!.target!.candidates[0]).toMatchObject({ kind: "role", value: "button", name: "Sign in" });
     // A select without a label or role name: its name attribute, never a CSS path.
-    expect(role!.target!.candidates).toEqual([{ kind: "name", value: 'select[name="role"]', unique: true }]);
+    expect(role!.target!.candidates).toEqual([{ kind: "name", value: 'select[name="role"]', unique: true, confidence: expect.any(Number) }]);
     for (const action of recorded.actions) expect(action.target!.candidates.some((candidate) => candidate.kind === "css")).toBe(false);
     // The page change caused by the click is not a separate "open URL".
     expect(kinds).not.toContain("navigate");
