@@ -5,6 +5,7 @@ import { CheckSquare, Forward, Play, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AttemptHistory } from "@/components/scenarios/attempt-history";
 import {
+  ACTIVE_RUN,
   NEEDS_REVIEW,
   httpSummary,
   outputOf,
@@ -23,7 +24,7 @@ import { MappingPanel } from "@/components/scenarios/mapping-panel";
 import type { ListPickHelp } from "@/components/scenarios/list-pick-editor";
 import type { ResponseSource } from "@/components/scenarios/builder-types";
 import { ResponseErrorCard } from "@/components/scenarios/response-error";
-import { UiActionsTab, UiResultTab, type EarlierValue, type UiOutput } from "@/components/scenarios/ui-step";
+import { UiActionsTab, UiLiveProgressView, UiResultTab, type EarlierValue, type UiOutput } from "@/components/scenarios/ui-step";
 import { RequestEditor, RequestView } from "@/components/scenarios/request-tab";
 import { ResponseExplorer } from "@/components/scenarios/response-explorer";
 import { AssertionsTab, StepSettings } from "@/components/scenarios/step-settings";
@@ -154,6 +155,12 @@ export function StepPanel({
           </p>
         ) : null}
       </header>
+
+      {ui && run?.live?.stepId === step.id && run.live.ui && ACTIVE_RUN.has(run.status) ? (
+        <div className="border-b border-border p-3">
+          <UiLiveProgressView progress={run.live.ui} />
+        </div>
+      ) : null}
 
       {awaitingInput ? (
         <div className="border-b border-border p-3">

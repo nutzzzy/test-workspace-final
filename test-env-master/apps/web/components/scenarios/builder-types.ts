@@ -24,6 +24,14 @@ export type StepRun = {
   output?: unknown;
 };
 
+/** Mirrors the API's UiLiveProgress (scenario-engine/types.ts). */
+export type UiLiveProgress = {
+  phase: "starting" | "signingIn" | "opening" | "actions" | "finishing";
+  current: number;
+  total: number;
+  actions: Array<{ id: string; kind: string; label: string; status: "pending" | "running" | "passed" | "failed" | "skipped" }>;
+};
+
 export type ScenarioRun = {
   id: string;
   status: string;
@@ -42,6 +50,8 @@ export type ScenarioRun = {
     max?: number;
     awaitingInput: boolean;
     stepRunId: string | null;
+    /** A UI step: which of its actions is running. */
+    ui?: UiLiveProgress;
   } | null;
 };
 

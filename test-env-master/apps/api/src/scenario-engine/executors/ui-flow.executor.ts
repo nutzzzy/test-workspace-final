@@ -1,6 +1,6 @@
 import type { Browser, BrowserContext, Frame, Locator, Page } from "playwright-core";
 import { lookup } from "../auto-bind";
-import type { ExecutionContext, StepExecutionResult, StepExecutor } from "../types";
+import type { ExecutionContext, StepExecutionResult, StepExecutor, UiLiveAction, UiLiveProgress } from "../types";
 import { pageErrorsMain } from "../ui/recorder-script";
 import { randomUUID } from "crypto";
 import { describeCandidate, launchBrowser, locate, UiLocateError, type AiResolver, type Located } from "../ui/ui-browser";
@@ -76,6 +76,22 @@ export class UiFlowExecutor implements StepExecutor {
     const results: UiActionResult[] = [];
     const learned: UiLearning[] = [];
 
+    // Live view: every action with its state, and what the step is doing now.
+    const live: UiLiveAction[] = flow.actions.map((action) => ({ id: action.id, kind: action.kind, label: action.label || describeAction(action), status: "pending" }));
+    let phase: UiLiveProgress["phase"] = "starting";
+    const report = (next?: UiLiveProgress["phase"]) => {
+      if (next) phase = next;
+      const running = live.findIndex((item) => item.status === "running");
+      const current = running >= 0 ? running + 1 : live.filter((item) => item.status !== "pending").length;
+      context.reportUi?.({ phase, current, total: live.length, actions: live.map((item) => ({ ...item })) });
+    };
+    const mark = (id: string, status: UiLiveAction["status"]) => {
+      const item = live.find((entry) => entry.id === id);
+      if (item) item.status = status;
+      report();
+    };
+    report("starting");
+
     // A saved session (cookies and storage) to start from: loaded before anything opens.
     const saved = flow.session?.useSavedSession && flow.session.savedSessionId ? flow.session.savedSessionId : null;
     let savedState: StorageState | null = null;
@@ -89,6 +105,7 @@ export class UiFlowExecutor implements StepExecutor {
     }
 
     let session: Session;
+    if (savedState) report("signingIn");
     try {
       session = await this.session(context, flow, savedState);
     } catch (error) {
@@ -118,6 +135,7 @@ export class UiFlowExecutor implements StepExecutor {
       await applySeed(session.context, seed);
       signedIn = describeSeed(seed);
       seeded = { token: seed.token, guessed: seed.guessed };
+      report("opening");
       await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: Math.max(timeout, 30_000) });
       await settle(page);
       if (savedState) {
@@ -149,6 +167,8 @@ export class UiFlowExecutor implements StepExecutor {
         const action = order[position]!;
         const started = Date.now();
         const label = action.label || describeAction(action);
+        phase = "actions";
+        mark(action.id, "running");
         try {
           page = await pageFor(session, action.tab ?? 0, timeout);
           if (action === submit) errorsBefore = new Set(await page.evaluate(pageErrorsMain).catch(() => [] as string[]));
@@ -170,6 +190,7 @@ export class UiFlowExecutor implements StepExecutor {
             ...(located ? { how: located.how, healed: located.healed } : {}),
             ...(action.optional ? { optional: true } : {}),
           });
+          mark(action.id, "passed");
         } catch (error) {
           // The app already went where this click leads (the page the next action was recorded on): nothing left to click.
           const after = order[position + 1];
@@ -182,11 +203,13 @@ export class UiFlowExecutor implements StepExecutor {
             sameRoute(page.url(), after.url)
           ) {
             results.push({ id: action.id, kind: action.kind, label, status: "PASSED", durationMs: Date.now() - started, how: "the app was already on the page this click leads to" });
+            mark(action.id, "passed");
             continue;
           }
           const message = context.isCancelled() ? "Cancelled" : error instanceof Error ? firstLine(error.message) : "Action failed";
           const coded = error instanceof UiLocateError ? { code: error.code, diagnostics: error.diagnostics } : {};
           results.push({ id: action.id, kind: action.kind, label, status: "FAILED", durationMs: Date.now() - started, error: message, ...coded, ...(action.optional ? { optional: true } : {}) });
+          mark(action.id, "failed");
           if (context.isCancelled()) return { status: "CANCELLED", error: "Cancelled during UI step" };
           if (!action.optional) {
             failure = `${label}: ${message}`;
@@ -199,6 +222,8 @@ export class UiFlowExecutor implements StepExecutor {
       for (const action of flow.actions.slice(results.length)) {
         results.push({ id: action.id, kind: action.kind, label: action.label || describeAction(action), status: "SKIPPED", durationMs: 0 });
       }
+      for (const item of live) if (item.status === "pending") item.status = "skipped";
+      report("finishing");
 
       await settle(page);
       const pageErrors = await page.evaluate(pageErrorsMain).catch(() => [] as string[]);

@@ -13,6 +13,7 @@ import {
   Hourglass,
   Keyboard,
   ListChecks,
+  Loader2,
   MinusCircle,
   MousePointerClick,
   Plus,
@@ -30,7 +31,7 @@ import { cn } from "@/lib/utils";
 import { BidiText } from "@/components/bidi-text";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
-import type { Step, StepOutput } from "@/components/scenarios/builder-types";
+import type { Step, StepOutput, UiLiveProgress } from "@/components/scenarios/builder-types";
 import { SaveSessionPanel, SessionPicker, type SessionChoice } from "@/components/scenarios/saved-sessions";
 
 /** Mirrors the API's UI action (apps/api/src/scenario-engine/ui/ui-types.ts). */
@@ -1059,5 +1060,68 @@ function LocatorBadge({ target, locator }: { target: NonNullable<UiAction["targe
       {locator.confidence !== undefined ? ` · ${Math.round(locator.confidence * 100)}%` : ""}
       {target.candidates.length > 1 ? ` +${n(target.candidates.length - 1)}` : ""}
     </span>
+  );
+}
+
+function LiveIcon({ status }: { status: UiLiveProgress["actions"][number]["status"] }) {
+  if (status === "running") return <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />;
+  if (status === "passed") return <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-success" />;
+  if (status === "failed") return <XCircle className="h-3.5 w-3.5 shrink-0 text-destructive" />;
+  if (status === "skipped") return <MinusCircle className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />;
+  return <Circle className="h-3.5 w-3.5 shrink-0 text-muted-foreground/50" />;
+}
+
+/**
+ * A UI step while it runs: what it is doing (opening the browser, signing in,
+ * loading the start page, or action n of N) and every action with its state —
+ * like the analysis runner's stage list. `compact`: one line for the flow list.
+ */
+export function UiLiveProgressView({ progress, compact = false }: { progress: UiLiveProgress; compact?: boolean }) {
+  const { t, n } = useI18n();
+  const listRef = useRef<HTMLOListElement | null>(null);
+  const running = progress.actions.find((item) => item.status === "running");
+  const done = progress.actions.filter((item) => item.status === "passed" || item.status === "failed" || item.status === "skipped").length;
+  const headline =
+    progress.phase === "actions" && running
+      ? t("uiStep.live.action", { current: n(progress.current), total: n(progress.total) })
+      : t(`uiStep.live.${progress.phase}`);
+
+  useEffect(() => {
+    listRef.current?.querySelector('[data-live="running"]')?.scrollIntoView({ block: "nearest" });
+  }, [progress.current]);
+
+  if (compact) {
+    return (
+      <span className="mt-0.5 flex min-w-0 items-center gap-1 text-[10px] text-primary" role="status">
+        <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden />
+        <span className="shrink-0">{headline}</span>
+        {running ? <BidiText text={`· ${running.label}`} className="min-w-0 truncate text-muted-foreground" /> : null}
+      </span>
+    );
+  }
+  return (
+    <section className="space-y-2" aria-live="polite" aria-label={t("uiStep.live.title")}>
+      <div className="flex items-center gap-2 text-xs">
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" aria-hidden />
+        <span className="font-medium">{headline}</span>
+        <span className="ms-auto text-[11px] text-muted-foreground">{t("uiStep.live.done", { done: n(done), total: n(progress.total) })}</span>
+      </div>
+      <div className="h-1 overflow-hidden rounded-full bg-muted" aria-hidden>
+        <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${progress.total ? Math.round((100 * done) / progress.total) : 0}%` }} />
+      </div>
+      <ol ref={listRef} className="max-h-60 space-y-0.5 overflow-auto">
+        {progress.actions.map((item, index) => (
+          <li
+            key={item.id}
+            data-live={item.status}
+            className={cn("flex min-w-0 items-center gap-1.5 rounded px-1 py-0.5 text-xs", item.status === "running" && "bg-primary/5", item.status === "pending" && "text-muted-foreground")}
+          >
+            <span className="w-5 shrink-0 text-end font-mono text-[10px] text-muted-foreground">{n(index + 1)}</span>
+            <LiveIcon status={item.status} />
+            <BidiText text={item.label} className="min-w-0 flex-1 truncate" />
+          </li>
+        ))}
+      </ol>
+    </section>
   );
 }

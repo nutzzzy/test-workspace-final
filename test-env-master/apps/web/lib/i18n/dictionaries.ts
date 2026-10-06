@@ -1358,6 +1358,16 @@ export const en = {
       assertUrl: "Check URL",
     },
     inRow: "in {container}, row {row}",
+    live: {
+      title: "UI step progress",
+      starting: "Opening the browser…",
+      signingIn: "Loading the saved session…",
+      opening: "Opening the start page…",
+      actions: "Running actions…",
+      action: "Action {current} of {total}",
+      finishing: "Finishing (reading the page, screenshot)…",
+      done: "{done}/{total} done",
+    },
     list: "list",
     dynamicValue: "looks generated ({kind}): consider {{$uuid}}, {{$timestamp}} or a variable",
     add: {
@@ -3255,6 +3265,16 @@ export const fa: Dictionary = {
       assertUrl: "بررسی آدرس",
     },
     inRow: "در {container}، ردیف {row}",
+    live: {
+      title: "پیشرفت گام رابط کاربری",
+      starting: "در حال باز کردن مرورگر…",
+      signingIn: "در حال بارگذاری نشست ذخیره‌شده…",
+      opening: "در حال باز کردن صفحهٔ شروع…",
+      actions: "در حال اجرای اقدام‌ها…",
+      action: "اقدام {current} از {total}",
+      finishing: "در حال پایان (خواندن صفحه، عکس صفحه)…",
+      done: "{done}/{total} انجام شد",
+    },
     list: "فهرست",
     dynamicValue: "به نظر خودکار ساخته شده ({kind}): از {{$uuid}}، {{$timestamp}} یا یک متغیر استفاده کنید",
     add: {

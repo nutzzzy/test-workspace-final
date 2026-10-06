@@ -3,6 +3,7 @@
 import { AlertTriangle, ArrowDown, ArrowUp, Copy, Link2, MonitorPlay, Play, Power, Trash2, Video } from "lucide-react";
 import { Menu } from "@/components/ui/menu";
 import {
+  ACTIVE_RUN,
   httpSummary,
   NEEDS_REVIEW,
   outputOf,
@@ -13,6 +14,7 @@ import {
   type ScenarioRun,
   type Step,
 } from "@/components/scenarios/builder-types";
+import { UiLiveProgressView } from "@/components/scenarios/ui-step";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -73,6 +75,7 @@ export function RequestFlow({
         const uiCount = ui && Array.isArray(step.config.actions) ? step.config.actions.length : 0;
         const selected = selectedId === step.id;
         const failed = state === "FAILED" || state === "BLOCKED" || state === "NEEDS_INPUT";
+        const liveUi = ui && run?.live?.stepId === step.id && run.live.ui && ACTIVE_RUN.has(run.status) ? run.live.ui : null;
         return (
           <li key={step.id} className="relative">
             <div
@@ -123,6 +126,8 @@ export function RequestFlow({
                     <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground dir-ltr" dir="ltr" title={url}>
                       {url}
                     </span>
+                  ) : liveUi ? (
+                    <UiLiveProgressView progress={liveUi} compact />
                   ) : ui ? (
                     <span className="mt-0.5 flex min-w-0 gap-1.5 text-[10px] text-muted-foreground">
                       <span className="truncate font-mono" dir="ltr" title={String(step.config.startUrl ?? "")}>

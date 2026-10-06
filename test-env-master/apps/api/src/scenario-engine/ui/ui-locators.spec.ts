@@ -1,6 +1,8 @@
 import { createServer, type Server } from "http";
 import type { AddressInfo } from "net";
 import { UiFlowExecutor, type UiActionResult, type UiFlowDeps } from "../executors/ui-flow.executor";
+import { orchestrateSteps, type LiveStepProgress } from "../orchestrate";
+import { StepExecutorRegistry } from "../step-executor.registry";
 import { ExecutionContext } from "../types";
 import { sessionStatus, summarize, type StorageState } from "./saved-sessions";
 import { browserPath, type AiResolver } from "./ui-browser";
@@ -370,5 +372,39 @@ describeUi("saved sessions", () => {
     // Turned off on the step: not used even though one is chosen.
     const off = await replay("/app", actions, { loadSession: async () => state }, { session: { savedSessionId: "customer", useSavedSession: false } });
     expect(off.errorCode).not.toBe("AUTHENTICATION_STATE_EXPIRED");
+  });
+});
+
+describeUi("live progress of a running UI step", () => {
+  it("reports the browser start, the start page and each action as it runs, through the run's live view", async () => {
+    layout = { order: [0, 1, 2, 3, 4], restyled: false, dynamicIds: false, extraSara: false };
+    const actions = await record("/users", [editIn(1), editIn(2)]);
+    const registry = new StepExecutorRegistry();
+    registry.register(new UiFlowExecutor((value) => value));
+    const seen: LiveStepProgress[] = [];
+    const context = new ExecutionContext();
+    try {
+      await orchestrateSteps(
+        [{ id: "ui-1", name: "Edit users", type: "UI_FLOW", enabled: true, orderIndex: 0, config: { startUrl: `${base}/users`, actions } }],
+        registry,
+        context,
+        { stopOnFailure: true, onProgress: (progress) => void seen.push(progress) },
+      );
+    } finally {
+      await context.dispose();
+    }
+    const ui = seen.filter((item) => item.ui).map((item) => item.ui!);
+    expect(seen[0]).toMatchObject({ stepId: "ui-1", state: "RUNNING" });
+    expect(ui[0]).toMatchObject({ phase: "starting", current: 0, total: 2 });
+    expect(ui.map((item) => item.phase)).toEqual(expect.arrayContaining(["starting", "opening", "actions", "finishing"]));
+    // Action 1 runs, then passes while action 2 runs.
+    const first = ui.find((item) => item.actions[0]!.status === "running")!;
+    expect(first).toMatchObject({ current: 1, total: 2 });
+    expect(first.actions[1]!.status).toBe("pending");
+    const second = ui.find((item) => item.actions[1]!.status === "running")!;
+    expect(second).toMatchObject({ current: 2 });
+    expect(second.actions[0]!.status).toBe("passed");
+    expect(ui.at(-1)!.actions.map((item) => item.status)).toEqual(["passed", "passed"]);
+    expect(first.actions[0]!.label).toBe("Click «Edit» in row «Ali»");
   });
 });

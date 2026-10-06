@@ -59,6 +59,18 @@ export type HttpExchange = {
   setCookies: Record<string, string>;
 };
 
+/** One action of a UI step as the live view shows it while the step runs. */
+export type UiLiveAction = { id: string; kind: string; label: string; status: "pending" | "running" | "passed" | "failed" | "skipped" };
+
+/** Where a running UI step is: preparing the browser, or on action `current` of `total`. */
+export type UiLiveProgress = {
+  phase: "starting" | "signingIn" | "opening" | "actions" | "finishing";
+  /** 1-based position of the running action (0 before the first). */
+  current: number;
+  total: number;
+  actions: UiLiveAction[];
+};
+
 export class ExecutionContext {
   private readonly variables = new Map<string, string>();
   private readonly initialKeys = new Set<string>();
@@ -82,6 +94,8 @@ export class ExecutionContext {
   readonly exchanges: HttpExchange[] = [];
   /** The step being executed now. */
   currentStepId: string | undefined;
+  /** Set by the orchestrator while a UI step runs: where it is, for the live view. */
+  reportUi: ((progress: UiLiveProgress) => void) | undefined;
   /** Things a run keeps between steps (the UI steps' browser session), closed by dispose(). */
   readonly resources = new Map<string, unknown>();
   private readonly disposers: Array<() => Promise<void> | void> = [];

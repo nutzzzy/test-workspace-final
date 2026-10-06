@@ -29,6 +29,7 @@ import type {
   OrchestrationStep,
   OrchestrationStepResult,
   StepExecutionResult,
+  UiLiveProgress,
 } from "./types";
 
 /** What the live view shows while a step runs. */
@@ -40,6 +41,8 @@ export type LiveStepProgress = {
   attempt?: number;
   max?: number;
   trying?: Array<{ target: string; value: string; source: string }>;
+  /** A UI step: which of its actions is running. */
+  ui?: UiLiveProgress;
 };
 
 /** A step waiting for the user in Manual Recovery. */
@@ -127,7 +130,15 @@ export async function orchestrateSteps(
         result = outcome.result;
         pausedMs = outcome.pausedMs;
       } else {
-        result = await executor.execute(step.config ?? {}, context);
+        const live = { orderIndex: step.orderIndex, stepId: step.id, stepName: step.name };
+        options.onProgress?.({ ...live, state: "RUNNING" });
+        // A UI step tells which action it is on, as it goes.
+        if (executor instanceof UiFlowExecutor) context.reportUi = (ui) => options.onProgress?.({ ...live, state: "RUNNING", ui });
+        try {
+          result = await executor.execute(step.config ?? {}, context);
+        } finally {
+          context.reportUi = undefined;
+        }
         if (executor instanceof ExtractVariableExecutor && result.status === "PASSED") markExtraction(result, context);
         if (executor instanceof UiFlowExecutor) result = await afterUiStep(step, result, context, options);
       }
