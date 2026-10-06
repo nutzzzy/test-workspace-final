@@ -1,4 +1,5 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, Put } from "@nestjs/common";
+import { resolveQualityConfig } from "../analysis/studio/quality/config";
 import { AIService, type ConnectionInput } from "./ai.service";
 
 @Controller("ai")
@@ -62,8 +63,21 @@ export class AiController {
   }
 
   @Put("limits")
-  saveLimits(@Body() body: { runBudgetMs?: unknown }) {
+  saveLimits(@Body() body: { runBudgetMs?: unknown; providerTimeoutMs?: unknown }) {
     return this.ai.saveRunBudget(body ?? {});
+  }
+
+  /** Test-case quality model: the effective settings (defaults + saved overrides). */
+  @Get("quality")
+  async quality() {
+    const saved = await this.ai.getQualitySettings();
+    return { ...resolveQualityConfig(saved), compareProviders: saved.compareProviders !== false };
+  }
+
+  @Put("quality")
+  async saveQuality(@Body() body: Record<string, unknown>) {
+    const saved = await this.ai.saveQualitySettings(body ?? {});
+    return { ...resolveQualityConfig(saved), compareProviders: saved.compareProviders !== false };
   }
 
   @Get("status")

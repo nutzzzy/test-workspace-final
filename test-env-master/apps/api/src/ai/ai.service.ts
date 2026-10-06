@@ -86,7 +86,12 @@ const MAX_WAIT_MS = 30_000;
 const HOSTED_CONCURRENCY = 3;
 const RATE_LIMIT_ATTEMPTS = 6;
 const RUN_BUDGET_KEY = "ai.runBudgetMs";
-const DEFAULT_RUN_BUDGET_MS = 180_000;
+/** Five minutes: enough for every stage and several providers side by side on hosted services. */
+export const DEFAULT_RUN_BUDGET_MS = 300_000;
+const PROVIDER_TIMEOUT_KEY = "ai.providerTimeoutMs";
+/** One provider's share for its test cases; the others go on without it. */
+export const DEFAULT_PROVIDER_TIMEOUT_MS = 180_000;
+const QUALITY_KEY = "ai.quality";
 const LEGACY_KEYS = ["ai.provider", "ai.baseUrl", "ai.model", "ai.temperature", "ai.timeoutMs", "ai.apiKeyEnc", "ai.allowExternal", "ai.deepAnalysis"];
 
 @Injectable()
@@ -256,18 +261,62 @@ export class AIService {
     ) as Routing;
   }
 
-  /** Longest time one analysis run may take (ms); at the limit it keeps what is done. 0 = no limit. */
-  async getRunBudget(): Promise<{ runBudgetMs: number }> {
-    const row = await this.prisma.systemSetting.findUnique({ where: { key: RUN_BUDGET_KEY } });
-    const value = Number(row?.value);
-    return { runBudgetMs: row && Number.isFinite(value) ? value : DEFAULT_RUN_BUDGET_MS };
+  /**
+   * Longest time one analysis run may take (ms); at the limit it keeps what is done. 0 = no limit.
+   * `providerTimeoutMs`: longest time one provider may take for its test cases when providers are compared.
+   */
+  async getRunBudget(): Promise<{ runBudgetMs: number; providerTimeoutMs: number }> {
+    const rows = await Promise.all([RUN_BUDGET_KEY, PROVIDER_TIMEOUT_KEY].map((key) => this.prisma.systemSetting.findUnique({ where: { key } })));
+    const read = (row: { value: string } | null | undefined, fallback: number) => {
+      const value = Number(row?.value);
+      return row && Number.isFinite(value) ? value : fallback;
+    };
+    return { runBudgetMs: read(rows[0], DEFAULT_RUN_BUDGET_MS), providerTimeoutMs: read(rows[1], DEFAULT_PROVIDER_TIMEOUT_MS) };
   }
 
-  async saveRunBudget(input: { runBudgetMs?: unknown }): Promise<{ runBudgetMs: number }> {
-    const runBudgetMs = Math.round(clamp(Number(input.runBudgetMs ?? DEFAULT_RUN_BUDGET_MS) || 0, 0, MAX_TIMEOUT_MS));
-    const value = String(runBudgetMs);
-    await this.prisma.systemSetting.upsert({ where: { key: RUN_BUDGET_KEY }, create: { key: RUN_BUDGET_KEY, value }, update: { value } });
-    return { runBudgetMs };
+  async saveRunBudget(input: { runBudgetMs?: unknown; providerTimeoutMs?: unknown }): Promise<{ runBudgetMs: number; providerTimeoutMs: number }> {
+    const current = await this.getRunBudget();
+    const runBudgetMs = input.runBudgetMs === undefined ? current.runBudgetMs : Math.round(clamp(Number(input.runBudgetMs) || 0, 0, MAX_TIMEOUT_MS));
+    const providerTimeoutMs =
+      input.providerTimeoutMs === undefined ? current.providerTimeoutMs : Math.round(clamp(Number(input.providerTimeoutMs) || 0, 0, MAX_TIMEOUT_MS));
+    for (const [key, value] of [
+      [RUN_BUDGET_KEY, String(runBudgetMs)],
+      [PROVIDER_TIMEOUT_KEY, String(providerTimeoutMs)],
+    ] as const) {
+      await this.prisma.systemSetting.upsert({ where: { key }, create: { key, value }, update: { value } });
+    }
+    return { runBudgetMs, providerTimeoutMs };
+  }
+
+  /** Saved overrides of the test-case quality model (thresholds, merge rules); the defaults fill the rest. */
+  async getQualitySettings(): Promise<Record<string, unknown>> {
+    const row = await this.prisma.systemSetting.findUnique({ where: { key: QUALITY_KEY } });
+    try {
+      const saved = row ? (JSON.parse(row.value) as unknown) : {};
+      return saved && typeof saved === "object" && !Array.isArray(saved) ? (saved as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  async saveQualitySettings(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const value = JSON.stringify(input ?? {}).slice(0, 10_000);
+    await this.prisma.systemSetting.upsert({ where: { key: QUALITY_KEY }, create: { key: QUALITY_KEY, value }, update: { value } });
+    return this.getQualitySettings();
+  }
+
+  /**
+   * The connections routed to a stage group that can be used now, in routing
+   * order. Two or more routed to test cases are compared side by side.
+   */
+  async routedConnections(group: StageGroup): Promise<CallOrigin[]> {
+    await this.ensureMigrated();
+    const rows = (await this.prisma.aiConnection.findMany({ orderBy: [{ priority: "asc" }, { createdAt: "asc" }] })).filter((row) => this.blocked(row) === null);
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    return (await this.getRouting())[group]
+      .map((id) => byId.get(id))
+      .filter((row): row is AiConnection => Boolean(row))
+      .map((row) => ({ connectionId: row.id, name: row.name, model: row.model }));
   }
 
   async saveRouting(input: Partial<Record<string, unknown>>): Promise<Routing> {
@@ -345,10 +394,13 @@ export class AIService {
       onTokens?: (count: number) => void;
       /** The answer was stopped at the connection's writing time limit (partial). */
       onCut?: (reason: "time" | "length") => void;
+      /** Use only this connection, without falling back (one provider of a comparison). */
+      only?: string;
     } = {},
   ): Promise<{ data: T; origin: CallOrigin }> {
-    const chain = await this.chainFor(group);
-    if (chain.length === 0) throw new Error("AI analysis is not available: none");
+    const full = await this.chainFor(group);
+    const chain = options.only ? full.filter((row) => row.id === options.only) : full;
+    if (chain.length === 0) throw new Error(options.only ? "AI analysis is not available: this connection is not usable" : "AI analysis is not available: none");
     const failures: string[] = [];
     for (const row of chain) {
       if (options.signal?.aborted) throw new Error("AI analysis was cancelled");

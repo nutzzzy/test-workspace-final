@@ -1,5 +1,6 @@
 import type { StageGroup } from "../../ai/ai.service";
-import { chunk, isGrounded, runStudio, type StudioLlm, type StudioSource } from "./pipeline";
+import { chunk, isGrounded, runStudio, type StudioLlm, type StudioResult, type StudioSource } from "./pipeline";
+import { DEFAULT_QUALITY_CONFIG } from "./quality/config";
 
 /** A scripted model: answers by stage, records which group (connection route) was asked and the prompts. */
 function scripted(answers: Partial<Record<string, unknown | ((prompt: string) => unknown)>>, failing: string[] = []) {
@@ -220,5 +221,163 @@ describe("answer shapes", () => {
       testCases: [{ criterionKeys: "AC-01", title: "t", preconditions: "بایکر وارد شده است.", steps: [{ action: "a", expected: "e" }], expectedResult: "r" }],
     });
     expect(parsed.testCases[0]).toMatchObject({ criterionKeys: ["AC-01"], preconditions: ["بایکر وارد شده است."] });
+  });
+});
+
+describe("test-case quality across providers", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  /** Every stage answers from the script; the cases stage answers per provider (connection). */
+  function providers(behaviour: Record<string, (prompt: string, call: { signal?: AbortSignal; deadlineAt?: number }) => Promise<unknown>>) {
+    const { llm: base } = scripted(answers);
+    const inFlight = new Set<string>();
+    let overlapSeen = 0;
+    const llm: StudioLlm = async (group, stage, call) => {
+      if (stage !== "cases" || !call.connectionId) return base(group, stage, call);
+      inFlight.add(call.connectionId);
+      overlapSeen = Math.max(overlapSeen, inFlight.size);
+      try {
+        const data = await behaviour[call.connectionId]!(call.prompt, call);
+        return { data: call.schema.parse(data), origin: { connectionId: call.connectionId, name: call.connectionId, model: "m" } };
+      } finally {
+        inFlight.delete(call.connectionId);
+      }
+    };
+    return { llm, overlap: () => overlapSeen };
+  }
+  const good = async (prompt: string) => {
+    await sleep(80);
+    return answers.cases(prompt);
+  };
+  /** Another provider's shape for the same scenarios (snake_case keys, steps as text, P1 priority). */
+  const otherShape = async (prompt: string) => {
+    await sleep(80);
+    return {
+      test_cases: [...prompt.matchAll(/"key":"(AI-\d+)"/g)].map((match) => ({
+        name: `Reject request without description for ${match[1]}`,
+        requirement_ids: match[1],
+        severity: "P1",
+        test_type: "Negative",
+        preconditions: "بایکر وارد شده است.",
+        test_data: '{"reasonId": 5}',
+        steps: "1. POST /mobile/need-for-call/accounting/create را بدون description بفرستید.",
+        expected: "پاسخ 400 برمی‌گردد و رکوردی در need_for_call_accounting ساخته نمی‌شود.",
+      })),
+    };
+  };
+  const hang = (_prompt: string, call: { signal?: AbortSignal; deadlineAt?: number }) =>
+    new Promise((_resolve, reject) => {
+      call.signal?.addEventListener("abort", () => reject(new Error("AI analysis was cancelled")));
+      if (call.deadlineAt) setTimeout(() => reject(new Error("The model did not answer in time")), Math.max(0, call.deadlineAt - Date.now()));
+    });
+  const three = [
+    { id: "A", name: "A", model: "m" },
+    { id: "B", name: "B", model: "m" },
+    { id: "C", name: "C", model: "m" },
+  ];
+
+  it("single provider: the route's answer is normalized, scored and gated, with timings", async () => {
+    const { llm } = scripted(answers);
+    const result = await runStudio({ source: NFC, locale: "fa", stages: [...all], llm, guidance: () => "", budgetChars: 50_000 });
+    const quality = result.quality!;
+    expect(quality.providers).toHaveLength(1);
+    expect(quality.providers[0]).toMatchObject({ provider: "default", status: "ok" });
+    expect(quality.selection.reasons[0]!.code).toBe("singleProvider");
+    expect(quality.final!.overallScore).toBeGreaterThan(0);
+    expect(quality.final!.overallScore).toBeLessThanOrEqual(100);
+    // The criterion the review dropped is no longer a requirement of the final report.
+    expect(quality.final!.untracedRequirements).not.toContain("AI-03");
+    expect(Object.keys(quality.timing)).toEqual(
+      expect.arrayContaining(["taskParsingMs", "requirementExtractionMs", "providers", "normalizationMs", "scoringMs", "deduplicationMs", "selectionMs", "qualityGateMs", "totalMs"]),
+    );
+    // Final cases keep the stored test-case contract and carry their ISTQB techniques.
+    expect(result.cases!.every((item) => typeof item.technique === "string" && item.criterionKeys.length > 0)).toBe(true);
+  });
+
+  it("runs providers at the same time, normalizes a different answer shape, and survives a failing provider", async () => {
+    const { llm, overlap } = providers({
+      A: good,
+      B: otherShape,
+      C: async () => {
+        throw new Error("C is down");
+      },
+    });
+    const reports: Array<NonNullable<StudioResult["quality"]>> = [];
+    const started = Date.now();
+    const result = await runStudio({
+      source: NFC,
+      locale: "fa",
+      stages: ["understand", "criteria", "assessment", "cases"],
+      llm,
+      guidance: () => "",
+      budgetChars: 50_000,
+      caseProviders: three,
+      onQuality: (report) => reports.push(report),
+    });
+    // Two 80 ms providers side by side, not one after the other.
+    expect(overlap()).toBeGreaterThanOrEqual(2);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    const byName = Object.fromEntries(result.quality!.providers.map((item) => [item.name, item]));
+    expect(byName.A!.status).toBe("ok");
+    expect(byName.B!.status).toBe("ok");
+    expect(byName.B!.caseCount).toBeGreaterThan(0);
+    expect(byName.C).toMatchObject({ status: "failed", caseCount: 0 });
+    expect(result.errors.cases).toMatch(/C: failed/);
+    expect(result.cases!.length).toBeGreaterThan(0);
+    // The same scenario from A and B is one case, credited to both — not two.
+    expect(result.quality!.final!.duplicatesRemoved).toBeGreaterThan(0);
+    // Results are exposed as providers finish: an early report already has a finished provider while C/others still run or failed.
+    expect(reports[0]!.providers.every((item) => item.status === "running")).toBe(true);
+    expect(reports.some((report) => report.final === null && report.providers.some((item) => item.status !== "running"))).toBe(true);
+    expect(reports.at(-1)!.final).not.toBeNull();
+  });
+
+  it("marks a slow provider as timed out at its own limit and continues with the others", async () => {
+    const { llm } = providers({ A: good, B: otherShape, C: hang });
+    const started = Date.now();
+    const result = await runStudio({
+      source: NFC,
+      locale: "fa",
+      stages: ["understand", "criteria", "cases"],
+      llm,
+      guidance: () => "",
+      budgetChars: 50_000,
+      caseProviders: three,
+      providerTimeoutMs: 300,
+      deadline: started + 300_000,
+    });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    const c = result.quality!.providers.find((item) => item.name === "C")!;
+    expect(c.status).toBe("timeout");
+    expect(result.quality!.selection.reasons).toEqual(expect.arrayContaining([{ code: "providerUnavailable", values: { provider: "C", status: "timeout" } }]));
+    expect(result.cases!.length).toBeGreaterThan(0);
+  });
+
+  it("stops waiting for a straggler once another provider covered every requirement", async () => {
+    const { llm } = providers({ A: good, B: hang });
+    const started = Date.now();
+    const result = await runStudio({
+      source: NFC,
+      locale: "fa",
+      stages: ["understand", "criteria", "cases"],
+      llm,
+      guidance: () => "",
+      budgetChars: 50_000,
+      caseProviders: three.slice(0, 2),
+      quality: { ...DEFAULT_QUALITY_CONFIG, stragglerGraceMs: 100 },
+    });
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(result.quality!.providers.find((item) => item.name === "B")!.status).toBe("timeout");
+    expect(result.quality!.selection.base).toBe("A");
+  });
+
+  it("reports the stage as failed but keeps the rest of the run when no provider answers", async () => {
+    const down = async () => {
+      throw new Error("down");
+    };
+    const { llm } = providers({ A: down, B: down });
+    const result = await runStudio({ source: NFC, locale: "fa", stages: ["understand", "criteria", "assessment", "cases"], llm, guidance: () => "", budgetChars: 50_000, caseProviders: three.slice(0, 2) });
+    expect(result.errors.cases).toMatch(/No provider produced test cases/);
+    expect(result.cases).toBeNull();
+    expect(result.assessment).not.toBeNull();
   });
 });

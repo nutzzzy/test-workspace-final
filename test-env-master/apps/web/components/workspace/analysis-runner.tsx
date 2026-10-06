@@ -5,6 +5,7 @@ import Link from "next/link";
 import { AlertTriangle, CheckCircle2, Circle, Languages, Loader2, MinusCircle, Sparkles, Square, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { AnalysisStatus, StageState, StudioStage } from "@/components/workspace/use-analysis-run";
+import { QualityReport } from "@/components/workspace/quality-report";
 import { useI18n, type Locale } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -156,6 +157,12 @@ export function AnalysisRunner({
             : ""}
           {!last.current ? ` · ${t("studio.runner.outdated")}` : ""}
         </p>
+      ) : null}
+      {/* The live comparison while a run goes; afterwards the report of the last run in this language. */}
+      {job?.quality && (running || job.locale === locale) ? (
+        <QualityReport report={job.quality} running={running} />
+      ) : !running && last?.quality ? (
+        <QualityReport report={last.quality} running={false} />
       ) : null}
       {error ? <p className="text-xs text-destructive">{err(error)}</p> : null}
     </section>

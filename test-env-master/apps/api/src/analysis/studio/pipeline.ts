@@ -1,4 +1,4 @@
-import { maskSecrets } from "@qa-workbench/shared";
+import { maskSecrets, type NormalizedTestCase, type ProviderEvaluation, type QualityReport, type QualityTiming } from "@qa-workbench/shared";
 import type { z } from "zod";
 import type { AppLocale } from "../../ai/localize-fa";
 import { TIME_LIMIT } from "../../ai/ai-provider";
@@ -7,7 +7,6 @@ import * as P from "./prompts";
 import {
   AssessmentSchema,
   AutomationSchema,
-  CasesSchema,
   CriteriaSchema,
   DigestSchema,
   EdgesSchema,
@@ -20,6 +19,12 @@ import {
   type Translation,
   type Understanding,
 } from "./schemas";
+import { isGrounded, norm, similarity } from "./text";
+import { DEFAULT_QUALITY_CONFIG, qualityLevel, type QualityConfig } from "./quality/config";
+import { describe as describeSet, evaluateSet } from "./quality/evaluate";
+import { normalizeCases, ProviderCasesSchema, rescore, toStudioCase } from "./quality/normalize";
+import { evaluateProvider, qualityGate, selectAndMerge, type ProviderRun } from "./quality/select";
+import { analyzeTask, type TaskProfile } from "./quality/task-profile";
 
 /**
  * The analysis studio pipeline. A model does the reading and writing; this
@@ -54,8 +59,21 @@ export type GuidanceScope = "criteria" | "questions" | "testCases" | "edgeCases"
 export type StudioLlm = <T>(
   group: StageGroup,
   stage: StudioStage,
-  call: { system: string; prompt: string; schema: z.ZodType<T>; locale: AppLocale; deadlineAt?: number },
+  call: {
+    system: string;
+    prompt: string;
+    schema: z.ZodType<T>;
+    locale: AppLocale;
+    deadlineAt?: number;
+    /** Ask exactly this connection (no fallback) — one provider of a comparison. */
+    connectionId?: string;
+    /** Stops this call (a provider that timed out or is no longer needed). */
+    signal?: AbortSignal;
+  },
 ) => Promise<{ data: T; origin: CallOrigin }>;
+
+/** A connection that generates test cases on its own, to be compared with the others. */
+export type CaseProvider = { id: string; name: string; model: string };
 
 export type SourceCriterion = { key: string; text: string; origin: string };
 export type StudioSource = {
@@ -80,7 +98,8 @@ export type ProposedCriterion = {
   rationale: string;
 };
 
-export type CaseWithKeys = GeneratedCase & { criterionKeys: string[]; reviewNote?: string };
+/** `qualityId`: the normalized case this one was made from (quality evaluation). */
+export type CaseWithKeys = GeneratedCase & { criterionKeys: string[]; reviewNote?: string; qualityId?: string };
 
 export type StudioResult = {
   understanding: StudioUnderstanding | null;
@@ -96,6 +115,8 @@ export type StudioResult = {
   /** Which connection answered each stage. */
   origins: Partial<Record<StudioStage, CallOrigin[]>>;
   errors: Partial<Record<StudioStage, string>>;
+  /** Provider comparison and the quality of the final test cases (when cases were generated). */
+  quality: QualityReport | null;
 };
 
 export type StudioProgress = { stage: StudioStage; state: "running" | "done" | "failed" | "skipped"; detail?: string; origin?: CallOrigin };
@@ -118,6 +139,16 @@ export type StudioRunInput = {
   isCancelled?: () => boolean;
   /** Epoch ms the whole run must finish by; each stage gets its share and what is done is kept. */
   deadline?: number;
+  /**
+   * Connections that each write the test cases, run side by side and compared
+   * (two or more); otherwise the test-case route's fallback chain answers.
+   */
+  caseProviders?: CaseProvider[];
+  /** Longest time one provider may take for its test cases (ms); 0/undefined = the stage's share of the run. */
+  providerTimeoutMs?: number;
+  quality?: QualityConfig;
+  /** The provider comparison as it fills in: each provider is reported as soon as it is done. */
+  onQuality?: (report: QualityReport) => void;
 };
 
 /**
@@ -154,37 +185,7 @@ export function detectLanguage(value: string): AppLocale {
   return persian > latin * 0.35 ? "fa" : "en";
 }
 
-export function norm(value: string) {
-  return value
-    .toLowerCase()
-    .replace(/[‌‏‎]/g, " ")
-    .replace(/ي/g, "ی")
-    .replace(/ك/g, "ک")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim();
-}
-
-/** The quote is in the source: verbatim after normalisation, or ≥70% of its words (min. 3). */
-export function isGrounded(evidence: string, corpus: string): boolean {
-  const quote = norm(evidence);
-  if (quote.length < 3) return false;
-  const haystack = norm(corpus);
-  if (haystack.includes(quote)) return true;
-  const words = quote.split(" ").filter((word) => word.length > 1);
-  if (words.length < 3) return false;
-  const present = new Set(haystack.split(" "));
-  return words.filter((word) => present.has(word)).length / words.length >= 0.7;
-}
-
-/** Word-set overlap (Jaccard) of two texts. */
-export function similarity(left: string, right: string) {
-  const a = new Set(norm(left).split(" ").filter((word) => word.length > 2));
-  const b = new Set(norm(right).split(" ").filter((word) => word.length > 2));
-  if (a.size === 0 || b.size === 0) return 0;
-  let shared = 0;
-  for (const word of a) if (b.has(word)) shared += 1;
-  return shared / (a.size + b.size - shared);
-}
+export { norm, isGrounded, similarity };
 
 export const isOfficial = (origin: string) => origin !== "ai" && origin !== "derived";
 
@@ -255,19 +256,39 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
     dropped: { criteria: 0, cases: 0, edges: 0 },
     origins: {},
     errors: {},
+    quality: null,
   };
   const progress = (stage: StudioStage, state: StudioProgress["state"], extra: Partial<StudioProgress> = {}) => {
     if (input.isCancelled?.()) throw new Error("AI analysis was cancelled");
     input.onProgress?.({ stage, state, ...extra });
   };
   const startedAt = Date.now();
+  const timing: QualityTiming = {
+    taskParsingMs: 0,
+    requirementExtractionMs: 0,
+    providers: {},
+    normalizationMs: 0,
+    scoringMs: 0,
+    deduplicationMs: 0,
+    selectionMs: 0,
+    qualityGateMs: 0,
+    totalMs: 0,
+  };
   const deadlineOf = (stage: StudioStage) =>
     input.deadline ? startedAt + Math.round((input.deadline - startedAt) * STAGE_DEADLINE[stage]) : undefined;
-  const ask = async <T>(stage: StudioStage, prompt: string, schema: z.ZodType<T>) => {
+  const ask = async <T>(stage: StudioStage, prompt: string, schema: z.ZodType<T>, only?: { connectionId: string; signal: AbortSignal; deadlineAt?: number }) => {
     if (input.isCancelled?.()) throw new Error("AI analysis was cancelled");
-    const deadlineAt = deadlineOf(stage);
+    const stageDeadline = deadlineOf(stage);
+    const deadlineAt = stageDeadline && only?.deadlineAt ? Math.min(stageDeadline, only.deadlineAt) : (stageDeadline ?? only?.deadlineAt);
     if (deadlineAt && Date.now() >= deadlineAt) throw new Error(TIME_LIMIT);
-    const answer = await llm(GROUP[stage], stage, { system: P.SYSTEM, prompt, schema, locale, deadlineAt });
+    const answer = await llm(GROUP[stage], stage, {
+      system: P.SYSTEM,
+      prompt,
+      schema,
+      locale,
+      deadlineAt,
+      ...(only ? { connectionId: only.connectionId, signal: only.signal } : {}),
+    });
     (result.origins[stage] ??= []).push(answer.origin);
     progress(stage, "running", { origin: answer.origin });
     return answer.data;
@@ -290,6 +311,7 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
   };
 
   // Source material, condensed by the model when it does not fit the context.
+  const parsingStart = Date.now();
   let material = sourceMaterial(source);
   if (material.length > input.budgetChars) {
     const parts = chunk(material, Math.max(4000, Math.floor(input.budgetChars * 0.8)));
@@ -306,7 +328,9 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
   } else {
     progress("digest", "skipped");
   }
+  timing.taskParsingMs = Date.now() - parsingStart;
 
+  const extractionStart = Date.now();
   const needsUnderstanding = !result.understanding || wanted.has("understand");
   if (needsUnderstanding) {
     progress("understand", "running");
@@ -362,6 +386,15 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
     });
   }
   const criteriaText = targets.map((item) => `${item.key}: ${item.text}`).join("\n");
+  timing.requirementExtractionMs = Date.now() - extractionStart;
+
+  // The requirements the test cases are judged against, extracted once and reused by every provider's evaluation.
+  const config = input.quality ?? DEFAULT_QUALITY_CONFIG;
+  const categories = new Map((result.proposed ?? []).map((item) => [item.key, item.category]));
+  const requirements = targets.map((item) => ({ key: item.key, text: item.text, category: categories.get(item.key) }));
+  const profileOf = () =>
+    analyzeTask({ understanding, requirements, risks: result.assessment?.risks, corpus }, config);
+  const caseOutput: { runs: RawRun[] | null } = { runs: null };
 
   // Independent stages; each is routed to its own connections and runs in parallel.
   // Started in order of value: when a service limits concurrent requests, test cases go first.
@@ -369,35 +402,140 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
   if (wanted.has("cases") && targets.length > 0) {
     parallel.push(
       guard("cases", async () => {
-        const cases: CaseWithKeys[] = [];
         const keys = new Set(targets.map((item) => item.key));
+        // Built from what is known now (the risks come later); good enough to judge answers as they arrive.
+        const early = analyzeTask({ understanding, requirements, corpus }, config);
+        const critical = new Set(early.requirements.filter((item) => item.critical).map((item) => item.key));
+        // Critical requirements first: when a service queues requests or time runs out, they are done.
+        const ordered = targets
+          .map((item, index) => ({ item, index }))
+          .sort((a, b) => Number(critical.has(b.item.key)) - Number(critical.has(a.item.key)) || a.index - b.index)
+          .map(({ item }) => item);
         const batches: Array<typeof targets> = [];
-        for (let start = 0; start < targets.length; start += CASE_BATCH) batches.push(targets.slice(start, start + CASE_BATCH));
-        // Batches run at once on hosted services (a local model queues them); a batch
-        // that runs out of time is left out and the others are kept.
-        let finished = 0;
-        progress("cases", "running", { detail: `0/${targets.length}` });
-        const answers = await Promise.allSettled(
-          batches.map(async (batch) => {
-            const answer = await ask("cases", P.casesPrompt(context, locale, batch, input.guidance("testCases")), CasesSchema);
-            finished += batch.length;
-            progress("cases", "running", { detail: `${finished}/${targets.length}` });
-            return answer;
-          }),
-        );
-        if (input.isCancelled?.()) throw new Error("AI analysis was cancelled");
-        answers.forEach((settled, index) => {
-          if (settled.status !== "fulfilled") return;
-          for (const item of settled.value.testCases) {
-            if (!item.title || item.steps.length === 0 || !item.expectedResult) continue;
-            const refs = item.criterionKeys.filter((key) => keys.has(key));
-            cases.push({ ...item, criterionKeys: refs.length ? refs : [batches[index]![0]!.key] });
+        for (let start = 0; start < ordered.length; start += CASE_BATCH) batches.push(ordered.slice(start, start + CASE_BATCH));
+        // Each batch's prompt is built once and sent unchanged to every provider (same prefix → prompt cache).
+        const prompts = batches.map((batch) => P.casesPrompt(context, locale, batch, input.guidance("testCases")));
+        const collect = (answers: Array<PromiseSettledResult<{ testCases: GeneratedCase[] }>>) => {
+          const cases: CaseWithKeys[] = [];
+          answers.forEach((settled, index) => {
+            if (settled.status !== "fulfilled") return;
+            for (const item of settled.value.testCases) {
+              if (!item.title || item.steps.length === 0 || !item.expectedResult) continue;
+              const refs = item.criterionKeys.filter((key) => keys.has(key));
+              cases.push({ ...item, criterionKeys: refs.length ? refs : [batches[index]![0]!.key] });
+            }
+          });
+          return cases;
+        };
+        const providers = input.caseProviders && input.caseProviders.length >= 2 ? input.caseProviders : null;
+
+        if (!providers) {
+          // One route: the test-case connections are tried in order (fallback), as before.
+          // Batches run at once on hosted services (a local model queues them); a batch
+          // that runs out of time is left out and the others are kept.
+          const started = Date.now();
+          let finished = 0;
+          progress("cases", "running", { detail: `0/${targets.length}` });
+          const answers = await Promise.allSettled(
+            batches.map(async (batch, index) => {
+              const answer = await ask("cases", prompts[index]!, ProviderCasesSchema);
+              finished += batch.length;
+              progress("cases", "running", { detail: `${finished}/${targets.length}` });
+              return answer;
+            }),
+          );
+          if (input.isCancelled?.()) throw new Error("AI analysis was cancelled");
+          const cases = collect(answers);
+          const missed = answers.find((settled) => settled.status === "rejected");
+          if (missed && cases.length === 0) throw missed.reason;
+          if (missed) result.errors.cases = partialNote(missed.reason, answers.filter((settled) => settled.status === "rejected").length, batches.length);
+          result.cases = cases;
+          const names = [...new Set((result.origins.cases ?? []).map((origin) => origin.name))];
+          const models = [...new Set((result.origins.cases ?? []).map((origin) => origin.model))];
+          caseOutput.runs = [
+            { provider: "default", name: names.join(" + ") || "AI", model: models.join(", "), status: missed ? "partial" : "ok", processingMs: Date.now() - started, raws: cases },
+          ];
+          return;
+        }
+
+        // Several providers: each writes the whole set on its own, all at once; a slow or
+        // failing provider never holds up the others.
+        const runs = new Map<string, RawRun>(providers.map((provider) => [provider.id, { provider: provider.id, name: provider.name, model: provider.model, status: "running", processingMs: 0, raws: [] }]));
+        const stops = new Map<string, (reason: "timeout" | "lowQuality") => void>();
+        const timers: Array<ReturnType<typeof setTimeout>> = [];
+        const report = () => input.onQuality?.(provisionalReport([...runs.values()], early, config, timing));
+        let doneProviders = 0;
+        progress("cases", "running", { detail: `0/${providers.length}` });
+        report();
+
+        const runProvider = async (provider: CaseProvider) => {
+          const run = runs.get(provider.id)!;
+          const started = Date.now();
+          const controller = new AbortController();
+          let stopped: "timeout" | "lowQuality" | null = null;
+          stops.set(provider.id, (reason) => {
+            if (stopped || run.status !== "running") return;
+            stopped = reason;
+            controller.abort();
+          });
+          const limitAt = input.providerTimeoutMs ? started + input.providerTimeoutMs : undefined;
+          // The deadline stops a call by itself; this catches a call that does not honour it.
+          if (input.providerTimeoutMs) timers.push(setTimeout(() => stops.get(provider.id)!("timeout"), input.providerTimeoutMs + 1_000));
+          // A stopped provider is let go at once, even if its service does not honour the abort.
+          const released = new Promise<never>((_resolve, reject) => controller.signal.addEventListener("abort", () => reject(new Error(TIME_LIMIT)), { once: true }));
+          released.catch(() => undefined);
+          let answered = 0;
+          let usable = 0;
+          const answers = await Promise.allSettled(
+            prompts.map(async (prompt) => {
+              const answer = await Promise.race([
+                ask("cases", prompt, ProviderCasesSchema, { connectionId: provider.id, signal: controller.signal, deadlineAt: limitAt }),
+                released,
+              ]);
+              if (stopped) throw new Error(TIME_LIMIT);
+              // Stop a provider early when what it writes cannot be used at all.
+              answered += 1;
+              usable += normalizeCases(answer.testCases, provider.name, early).filter((item) => item.qualityScore >= config.gateMinCaseQuality).length;
+              if (answered >= 2 && usable === 0 && answered < prompts.length) stops.get(provider.id)!("lowQuality");
+              return answer;
+            }),
+          );
+          run.processingMs = Date.now() - started;
+          run.raws = collect(answers);
+          const failures = answers.filter((settled): settled is PromiseRejectedResult => settled.status === "rejected");
+          const outOfTime =
+            stopped === "timeout" ||
+            failures.some((settled) => String((settled.reason as Error)?.message ?? settled.reason).includes(TIME_LIMIT)) ||
+            Boolean(limitAt && Date.now() >= limitAt - 1_000);
+          if (failures.length === 0) run.status = "ok";
+          else if (run.raws.length > 0) run.status = "partial";
+          else run.status = stopped === "lowQuality" ? "failed" : outOfTime ? "timeout" : "failed";
+          if (stopped === "lowQuality") run.error = "Stopped early: the answers could not be used";
+          else if (failures.length) run.error = maskSecrets(String((failures[0]!.reason as Error)?.message ?? failures[0]!.reason)).slice(0, 300);
+          timing.providers[provider.name] = run.processingMs;
+          doneProviders += 1;
+          progress("cases", "running", { detail: `${doneProviders}/${providers.length}` });
+          // One provider covering every requirement: the others get a grace period, then are cut off.
+          if (run.status === "ok" && keys.size > 0 && [...keys].every((key) => run.raws.some((item) => item.criterionKeys.includes(key)))) {
+            for (const [id, stop] of stops) if (id !== provider.id) timers.push(setTimeout(() => stop("timeout"), config.stragglerGraceMs));
           }
-        });
-        const missed = answers.find((settled) => settled.status === "rejected");
-        if (missed && cases.length === 0) throw missed.reason;
-        if (missed) result.errors.cases = partialNote(missed.reason, answers.filter((settled) => settled.status === "rejected").length, batches.length);
-        result.cases = cases;
+          report();
+        };
+
+        try {
+          await Promise.allSettled(providers.map(runProvider));
+        } finally {
+          for (const timer of timers) clearTimeout(timer);
+        }
+        if (input.isCancelled?.()) throw new Error("AI analysis was cancelled");
+        const caseRuns = [...runs.values()];
+        const answered = caseRuns.filter((run) => run.raws.length > 0);
+        // Nothing to compare: the stage fails and the stored test cases stay as they are.
+        if (answered.length === 0) throw new Error(`No provider produced test cases — ${caseRuns.map((run) => `${run.name}: ${run.status}${run.error ? ` (${run.error})` : ""}`).join(" | ")}`);
+        caseOutput.runs = caseRuns;
+        const missing = caseRuns.filter((run) => run.status !== "ok");
+        if (missing.length) result.errors.cases = maskSecrets(`${missing.map((run) => `${run.name}: ${run.status}`).join(", ")} — continued with ${answered.map((run) => run.name).join(", ")}`).slice(0, 600);
+        result.cases = answered.flatMap((run) => run.raws);
       }),
     );
   }
@@ -430,6 +568,30 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
 
   await Promise.all(parallel);
 
+  // Normalize → score → compare → select and merge → quality gate. Deterministic: no model call, no tokens.
+  let quality: { profile: TaskProfile; finalCases: NormalizedTestCase[]; selection: ReturnType<typeof selectAndMerge>; gate: ReturnType<typeof qualityGate>; runs: ProviderRun[] } | null = null;
+  if (caseOutput.runs) {
+    const runs = caseOutput.runs;
+    const profile = profileOf();
+    let mark = performance.now();
+    const normalized: ProviderRun[] = runs.map(({ raws, ...run }) => ({ ...run, cases: normalizeCases(raws, run.name, profile) }));
+    timing.normalizationMs = Math.round(performance.now() - mark);
+    mark = performance.now();
+    const scored = normalized.map((run) => evaluateProvider(run, profile, config));
+    timing.scoringMs = Math.round(performance.now() - mark);
+    const selection = selectAndMerge(scored, profile, config);
+    timing.deduplicationMs = Math.round(selection.timing.deduplicationMs);
+    timing.selectionMs = Math.round(selection.timing.selectionMs);
+    mark = performance.now();
+    const gate = qualityGate(selection.cases, profile, config);
+    timing.qualityGateMs = Math.round(performance.now() - mark);
+    for (const run of runs) timing.providers[run.name] ??= run.processingMs;
+    // Nothing passed: the stored test cases are kept instead of being replaced by nothing.
+    if (gate.cases.length === 0) result.errors.cases ??= "Every generated test case failed the quality gate";
+    result.cases = gate.cases.length ? gate.cases.map((item) => toStudioCase(item)) : null;
+    quality = { profile, finalCases: gate.cases, selection, gate, runs: normalized };
+  }
+
   // A different model checks the drafts (the review chain prefers one).
   const reviewable = (result.proposed?.length ?? 0) + (result.cases?.length ?? 0) + (result.edges?.length ?? 0);
   if (wanted.has("review") && reviewable > 0) {
@@ -446,6 +608,51 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
       const review = await ask("review", P.reviewPrompt(context, locale, payload), ReviewSchema);
       applyReview(result, review);
     });
+  }
+
+  if (quality) {
+    // The reviewer's fixes go through the same gate, then the final report is made against the
+    // requirements that are still in force (a criterion the review dropped is no longer one).
+    const alive = new Set(result.proposed ? [...written.map((item) => item.key), ...result.proposed.map((item) => item.key)] : targets.map((item) => item.key));
+    const profile = analyzeTask({ understanding, requirements: requirements.filter((item) => alive.has(item.key)), risks: result.assessment?.risks, corpus }, config);
+    const byId = new Map(quality.finalCases.map((item) => [item.id, item]));
+    const notes = new Map<string, string>();
+    const reviewed = (result.cases ?? []).flatMap((item) => {
+      const base = item.qualityId ? byId.get(item.qualityId) : undefined;
+      if (!base) return [];
+      if (item.reviewNote) notes.set(base.id, item.reviewNote);
+      const expectedResults = item.expectedResult.split("\n").map((line) => line.trim()).filter(Boolean);
+      return [rescore({ ...base, title: item.title, steps: item.steps, expectedResults, requirementIds: item.criterionKeys.filter((key) => alive.has(key)) }, profile)];
+    });
+    const mark = performance.now();
+    const gate = qualityGate(reviewed, profile, config);
+    timing.qualityGateMs += Math.round(performance.now() - mark);
+    if (result.cases) result.cases = gate.cases.map((item) => toStudioCase(item, notes.get(item.id)));
+    const evaluation = evaluateSet(gate.cases, profile, config);
+    result.quality = {
+      applicableTechniques: profile.techniques,
+      weights: roundWeights(profile.weights),
+      emphasis: profile.kinds,
+      providers: quality.runs.map((run) => evaluateProvider(run, profile, config).report),
+      selection: { base: quality.selection.base?.name ?? null, merged: quality.selection.merged, reasons: quality.selection.reasons },
+      final: {
+        overallScore: evaluation.overallScore,
+        qualityLevel: qualityLevel(evaluation.overallScore, config),
+        caseCount: gate.cases.length,
+        requirementCoverage: evaluation.requirementCoverage,
+        istqbCoverage: evaluation.istqbCoverage,
+        riskCoverage: evaluation.riskCoverage,
+        negativeCoverage: evaluation.negativeCoverage,
+        dimensionScores: evaluation.dimensionScores,
+        duplicatesRemoved: quality.selection.duplicatesRemoved + quality.gate.duplicatesRemoved + gate.duplicatesRemoved,
+        rejected: [...quality.gate.rejected, ...gate.rejected].slice(0, 50),
+        improved: quality.gate.improved + gate.improved,
+        untracedRequirements: gate.untracedRequirements,
+        missingScenarios: evaluation.missingScenarios,
+      },
+      timing: { ...timing, totalMs: Date.now() - startedAt },
+    };
+    input.onQuality?.(result.quality);
   }
 
   if (wanted.has("automation")) {
@@ -482,7 +689,54 @@ export async function runStudio(input: StudioRunInput): Promise<StudioResult> {
     }
   }
 
+  if (result.quality) result.quality.timing.totalMs = Date.now() - startedAt;
   return result;
+}
+
+/** One provider's raw answers, before normalization. */
+type RawRun = Omit<ProviderRun, "cases"> & { raws: CaseWithKeys[] };
+
+function roundWeights(weights: Partial<Record<string, number>>) {
+  return Object.fromEntries(Object.entries(weights).map(([key, value]) => [key, Math.round(value! * 100) / 100]));
+}
+
+/** The comparison while providers are still running: finished ones are scored, the rest show their status. */
+function provisionalReport(runs: RawRun[], profile: TaskProfile, config: QualityConfig, timing: QualityTiming): QualityReport {
+  const providers: ProviderEvaluation[] = runs.map(({ raws, ...run }) => {
+    if (run.status !== "running") return evaluateProvider({ ...run, cases: normalizeCases(raws, run.name, profile) }, profile, config).report;
+    const empty = evaluateSet([], profile, config);
+    return {
+      provider: run.provider,
+      name: run.name,
+      model: run.model,
+      status: "running",
+      processingMs: 0,
+      caseCount: 0,
+      overallScore: 0,
+      qualityLevel: describeSet(empty, config).qualityLevel,
+      dimensionScores: {},
+      requirementCoverage: 0,
+      istqbCoverage: null,
+      riskCoverage: null,
+      negativeCoverage: null,
+      duplicateCount: 0,
+      detectedRisks: [],
+      missingScenarios: [],
+      applicableISTQBTechniques: profile.techniques.map((entry) => entry.technique),
+      strengths: [],
+      weaknesses: [],
+      recommendations: [],
+    };
+  });
+  return {
+    applicableTechniques: profile.techniques,
+    weights: roundWeights(profile.weights),
+    emphasis: profile.kinds,
+    providers,
+    selection: { base: null, merged: [], reasons: [] },
+    final: null,
+    timing: { ...timing, providers: { ...timing.providers } },
+  };
 }
 
 function applyReview(result: StudioResult, review: z.infer<typeof ReviewSchema>) {

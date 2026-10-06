@@ -145,3 +145,28 @@ describe("learning guidance", () => {
     expect(guidance("risks")).not.toContain("Start titles");
   });
 });
+
+describe("provider comparison support", () => {
+  const local = (id: string, port: string) => ({ id, name: id, kind: "ollama", baseUrl: `http://127.0.0.1:${port}`, model: "m" });
+
+  it("asks exactly one connection when told to, without falling back to another", async () => {
+    const ai = service([local("a", "1001"), local("b", "1002")], { testCases: ["a", "b"] });
+    const seen = serve({ "1002": [ok({ answer: "from b" })] });
+    const result = await ai.call("testCases", { system: "s", prompt: "p", schema }, { only: "b" });
+    expect(result.origin.connectionId).toBe("b");
+    expect(seen).toEqual(["1002"]);
+    // b fails → the call fails; a (first in the route) is not asked in its place.
+    serve({ "1001": [ok({ answer: "from a" })] });
+    await expect(ai.call("testCases", { system: "s", prompt: "p", schema }, { only: "b", attemptsPerConnection: 1 })).rejects.toThrow(/b/);
+  });
+
+  it("lists the usable connections routed to test cases, in routing order", async () => {
+    const ai = service([local("a", "1001"), local("b", "1002"), { ...local("c", "1003"), enabled: false }], { testCases: ["b", "c", "a"] });
+    expect((await ai.routedConnections("testCases")).map((item) => item.connectionId)).toEqual(["b", "a"]);
+  });
+
+  it("allows 5 minutes per analysis by default, with a separate provider limit", async () => {
+    const ai = service([local("a", "1001")]);
+    expect(await ai.getRunBudget()).toEqual({ runBudgetMs: 300_000, providerTimeoutMs: 180_000 });
+  });
+});

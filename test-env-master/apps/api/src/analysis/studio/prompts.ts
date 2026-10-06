@@ -1,3 +1,4 @@
+import { ISTQB_TECHNIQUES } from "@qa-workbench/shared";
 import type { AppLocale } from "../../ai/localize-fa";
 import { CASE_TYPES, CRITERION_CATEGORIES } from "./schemas";
 
@@ -131,6 +132,8 @@ export function casesPrompt(context: string, locale: AppLocale, batch: Array<{ k
     "- expectedResult: the verifiable end state: response status and body fields, database rows/columns, log entries, state changes.",
     "Never use vague phrases such as 'works correctly', 'is handled', 'check the result'. Do not invent messages or codes the source does not give.",
     `type: one of ${CASE_TYPES.join("|")}. criterionKeys: keys from the list above. ruleRefs: R-ids from <understanding>.`,
+    `technique: the ISTQB technique(s) the case applies, from: ${ISTQB_TECHNIQUES.join(", ")}; empty when none applies — never force one.`,
+    "Do not restate criteria or rules (refer to them by key and R-id) and write no explanation outside the JSON.",
     languageRule(locale),
     'Return {"testCases":[{criterionKeys,ruleRefs,title,objective,preconditions,testData,steps:[{action,expected}],expectedResult,priority,type,technique}]}.',
     guidanceBlock(guidance),

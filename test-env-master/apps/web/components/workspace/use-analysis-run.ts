@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { QualityReport } from "@qa-workbench/shared";
 import { api } from "@/lib/api";
 import type { Locale } from "@/lib/i18n";
 
@@ -27,6 +28,8 @@ export type AnalysisStatus = {
     error?: string;
     warnings: Array<{ stage: StudioStage; message: string }>;
     dropped?: { criteria: number; cases: number; edges: number };
+    /** Provider comparison, filled in while the run goes. */
+    quality?: QualityReport | null;
   } | null;
   runs: Partial<
     Record<
@@ -38,6 +41,7 @@ export type AnalysisStatus = {
         current: boolean;
         dropped: { criteria: number; cases: number; edges: number };
         stages: Partial<Record<StudioStage, { state: string; origins: Array<{ name: string; model: string }>; error?: string }>>;
+        quality?: QualityReport;
       }
     >
   >;

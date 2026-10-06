@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
 import { createHash } from "crypto";
-import { maskSecrets } from "@qa-workbench/shared";
+import { maskSecrets, type QualityReport } from "@qa-workbench/shared";
 import { AIService, type CallOrigin } from "../ai/ai.service";
 import { normalizeLocale, type AppLocale } from "../ai/localize-fa";
 import { PrismaService } from "../prisma/prisma.service";
@@ -16,6 +16,7 @@ import {
   type IssueForApply,
 } from "./studio/apply";
 import { cleanDocumentText, extractDocumentText } from "./studio/documents";
+import { resolveQualityConfig } from "./studio/quality/config";
 import { LearningService, type Artifact } from "./studio/learning";
 import { isOfficial, runStudio, type StudioProgress, type StudioStage, type StudioUnderstanding } from "./studio/pipeline";
 
@@ -48,6 +49,8 @@ export type AnalysisJob = {
   /** Stages that failed while the others completed. */
   warnings: Array<{ stage: StudioStage; message: string }>;
   dropped?: { criteria: number; cases: number; edges: number };
+  /** Provider comparison and final test-case quality; filled in as providers finish. */
+  quality?: QualityReport | null;
 };
 
 type RunMeta = {
@@ -57,6 +60,7 @@ type RunMeta = {
   sourceHash: string;
   stages: Partial<Record<StudioStage, { state: string; origins: Array<{ name: string; model: string }>; error?: string }>>;
   dropped: { criteria: number; cases: number; edges: number };
+  quality?: QualityReport;
 };
 
 type StudioMemory = {
@@ -202,8 +206,17 @@ export class AnalysisService {
     if (!previous && !stages.includes("understand")) {
       job.stages = { understand: { state: "pending", origins: [] }, ...job.stages };
     }
-    const { runBudgetMs } = await this.ai.getRunBudget();
+    const { runBudgetMs, providerTimeoutMs } = await this.ai.getRunBudget();
+    const qualitySettings = await this.ai.getQualitySettings();
+    // Two or more connections routed to test cases are compared side by side (unless turned off).
+    const routed = qualitySettings.compareProviders === false ? [] : await this.ai.routedConnections("testCases");
     const result = await runStudio({
+      caseProviders: routed.length >= 2 ? routed.map((origin) => ({ id: origin.connectionId, name: origin.name, model: origin.model })) : undefined,
+      providerTimeoutMs,
+      quality: resolveQualityConfig(qualitySettings),
+      onQuality: (report) => {
+        job.quality = report;
+      },
       deadline: runBudgetMs > 0 ? started + runBudgetMs : undefined,
       source: {
         issueKey: issue.key,
@@ -230,7 +243,8 @@ export class AnalysisService {
       isCancelled: () => job.cancel.signal.aborted,
       llm: (group, stage, call) =>
         this.ai.call(group, call, {
-          signal: job.cancel.signal,
+          signal: call.signal ? AbortSignal.any([job.cancel.signal, call.signal]) : job.cancel.signal,
+          only: call.connectionId,
           onConnection: (origin) => {
             const entry = (job.stages[stage] ??= { state: "running", origins: [] });
             entry.detail = `${origin.name} · ${origin.model}`;
@@ -294,6 +308,8 @@ export class AnalysisService {
               scope,
               sourceHash,
               dropped: result.dropped,
+              // A run that made no test cases keeps the report of the cases that are still there.
+              ...((result.quality ?? memory.runs?.[locale]?.quality) ? { quality: result.quality ?? memory.runs?.[locale]?.quality } : {}),
               stages: Object.fromEntries(
                 Object.entries(job.stages).map(([stage, entry]) => [
                   stage,

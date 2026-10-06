@@ -94,11 +94,47 @@ const isExternalUrl = (url: string) => {
   }
 };
 
+type QualitySettings = {
+  compareProviders: boolean;
+  closeEnough: number;
+  levels: Array<{ min: number; level: "Excellent" | "Very Good" | "Good" | "Needs Improvement" | "Poor" }>;
+};
+const LEVEL_KEY: Record<QualitySettings["levels"][number]["level"], string> = {
+  Excellent: "excellent",
+  "Very Good": "veryGood",
+  Good: "good",
+  "Needs Improvement": "needsImprovement",
+  Poor: "poor",
+};
+
+/** Only the settings this page edits are saved as overrides; the API keeps the defaults for the rest. */
+function qualityOverrides(quality: QualitySettings | null) {
+  return quality ? { compareProviders: quality.compareProviders, closeEnough: quality.closeEnough, levels: quality.levels } : {};
+}
+
+/** A small number input that saves when it loses focus. */
+function NumberField({ value, onSave }: { value: number; onSave: (value: number) => unknown }) {
+  const [text, setText] = useState(String(value));
+  useEffect(() => setText(String(value)), [value]);
+  return (
+    <input
+      className={cn(input, "w-16 font-mono")}
+      dir="ltr"
+      inputMode="numeric"
+      value={text}
+      onChange={(event) => setText(event.target.value.replace(/[^0-9]/g, ""))}
+      onBlur={() => Number(text) !== value && void onSave(Number(text || 0))}
+    />
+  );
+}
+
 export function AiSettings() {
   const { t, n, err } = useI18n();
   const [connections, setConnections] = useState<Connection[]>([]);
   const [routing, setRouting] = useState<Routing>({});
   const [runBudget, setRunBudget] = useState("");
+  const [providerTimeout, setProviderTimeout] = useState("");
+  const [quality, setQuality] = useState<QualitySettings | null>(null);
   const [form, setForm] = useState<Form | null>(null);
   const [models, setModels] = useState<Record<string, string[]>>({});
   const [pull, setPull] = useState<{ id: string; model: string; status: string; completed: number; total: number; state: string; error?: string } | null>(null);
@@ -109,11 +145,13 @@ export function AiSettings() {
     const [list, route, limits] = await Promise.all([
       api<Connection[]>("/ai/connections"),
       api<Routing>("/ai/routing"),
-      api<{ runBudgetMs: number }>("/ai/limits"),
+      api<{ runBudgetMs: number; providerTimeoutMs: number }>("/ai/limits"),
     ]);
     setConnections(list);
     setRouting(route);
     setRunBudget(String(Math.round(limits.runBudgetMs / 1000)));
+    setProviderTimeout(String(Math.round(limits.providerTimeoutMs / 1000)));
+    setQuality(await api<QualitySettings>("/ai/quality"));
   }, []);
   useEffect(() => {
     void load().catch(() => undefined);
@@ -310,6 +348,66 @@ export function AiSettings() {
           />
           <span className="block text-[11px] text-muted-foreground">{t("aiSettings.runBudgetHint")}</span>
         </label>
+
+        <section className="space-y-2 rounded-md border border-border p-3 text-xs" aria-labelledby="quality-settings-title">
+          <label className="flex items-start gap-2">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={quality?.compareProviders ?? true}
+              onChange={(event) => void run(() => api("/ai/quality", { method: "PUT", body: JSON.stringify({ ...qualityOverrides(quality), compareProviders: event.target.checked }) }))}
+            />
+            <span>
+              <span id="quality-settings-title" className="font-medium">
+                {t("aiSettings.compareProviders")}
+              </span>
+              <span className="block text-[11px] text-muted-foreground">{t("aiSettings.compareProvidersHint")}</span>
+            </span>
+          </label>
+          <label className="block space-y-1">
+            <span className="font-medium">{t("aiSettings.providerTimeout")}</span>
+            <input
+              className={cn(input, "w-32 font-mono")}
+              dir="ltr"
+              inputMode="numeric"
+              value={providerTimeout}
+              onChange={(event) => setProviderTimeout(event.target.value.replace(/[^0-9]/g, ""))}
+              onBlur={() => void run(() => api("/ai/limits", { method: "PUT", body: JSON.stringify({ providerTimeoutMs: Number(providerTimeout || 0) * 1000 }) }))}
+            />
+            <span className="block text-[11px] text-muted-foreground">{t("aiSettings.providerTimeoutHint")}</span>
+          </label>
+          {quality ? (
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="space-y-1">
+                <span className="block font-medium">{t("aiSettings.closeEnough")}</span>
+                <NumberField value={quality.closeEnough} onSave={(value) => run(() => api("/ai/quality", { method: "PUT", body: JSON.stringify({ ...qualityOverrides(quality), closeEnough: value }) }))} />
+              </label>
+              <fieldset className="space-y-1">
+                <legend className="font-medium">{t("aiSettings.levels")}</legend>
+                <div className="flex flex-wrap gap-2">
+                  {quality.levels
+                    .filter((item) => item.level !== "Poor")
+                    .map((item) => (
+                      <label key={item.level} className="flex items-center gap-1">
+                        <span className="text-muted-foreground">{t(`quality.levels.${LEVEL_KEY[item.level]}`)}</span>
+                        <NumberField
+                          value={item.min}
+                          onSave={(value) =>
+                            run(() =>
+                              api("/ai/quality", {
+                                method: "PUT",
+                                body: JSON.stringify({ ...qualityOverrides(quality), levels: quality.levels.map((level) => (level.level === item.level ? { ...level, min: value } : level)) }),
+                              }),
+                            )
+                          }
+                        />
+                      </label>
+                    ))}
+                </div>
+              </fieldset>
+            </div>
+          ) : null}
+        </section>
 
         {connections.length > 1 ? (
           <section className="space-y-2 rounded-md border border-border p-3" aria-labelledby="routing-title">
