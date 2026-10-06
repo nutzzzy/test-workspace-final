@@ -1,6 +1,6 @@
 "use client";
 
-import { AlertTriangle, ArrowDown, ArrowUp, Copy, Link2, MonitorPlay, Play, Power, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, Copy, Link2, MonitorPlay, Play, Power, Trash2, Video } from "lucide-react";
 import { Menu } from "@/components/ui/menu";
 import {
   httpSummary,
@@ -33,6 +33,7 @@ export function RequestFlow({
   onDuplicate,
   onToggle,
   onDelete,
+  onRerecord,
 }: {
   steps: Step[];
   run: ScenarioRun | null;
@@ -45,6 +46,8 @@ export function RequestFlow({
   onDuplicate: (step: Step) => void;
   onToggle: (step: Step) => void;
   onDelete: (step: Step) => void;
+  /** Record a UI step again (all of it, or the part whose page changed). */
+  onRerecord: (step: Step) => void;
 }) {
   const { t, n, label } = useI18n();
 
@@ -162,6 +165,7 @@ export function RequestFlow({
                   label={t("builder.flow.actions")}
                   items={[
                     { label: t("builder.flow.runUntil"), icon: <Play className="h-3.5 w-3.5" />, disabled: busy, onSelect: () => onRunUntil(step) },
+                    ...(ui ? [{ label: t("builder.flow.rerecord"), icon: <Video className="h-3.5 w-3.5" />, disabled: busy, onSelect: () => onRerecord(step) }] : []),
                     { label: t("builder.flow.moveUp"), icon: <ArrowUp className="h-3.5 w-3.5" />, disabled: index === 0 || busy, onSelect: () => onMove(step, -1) },
                     {
                       label: t("builder.flow.moveDown"),

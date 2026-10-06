@@ -41,7 +41,7 @@ export function recorderMain() {
     if (tag === "input" && type === "checkbox") return "checkbox";
     if (tag === "input" && type === "radio") return "radio";
     if (tag === "select") return element.hasAttribute("multiple") ? "listbox" : "combobox";
-    if (tag === "textarea" || (tag === "input" && ["", "text", "email", "search", "tel", "url", "password", "number"].includes(type))) return type === "search" ? "searchbox" : "textbox";
+    if (tag === "textarea" || (tag === "input" && ["", "text", "email", "search", "tel", "url", "number"].includes(type))) return type === "search" ? "searchbox" : type === "number" ? "spinbutton" : "textbox";
     if (tag === "summary") return "button";
     if (/^h[1-6]$/.test(tag)) return "heading";
     if (tag === "option") return "option";
@@ -79,6 +79,8 @@ export function recorderMain() {
       if (["button", "submit", "reset"].includes(input.type)) return clean(input.value);
       return clean(input.getAttribute("title") ?? input.placeholder ?? "");
     }
+    // A field's content (typed text, a select's options) is not its name.
+    if (tag === "select" || tag === "textarea") return clean(element.getAttribute("title") ?? element.getAttribute("placeholder") ?? "");
     if (tag === "img") return clean(element.getAttribute("alt"));
     return clean((element as HTMLElement).innerText ?? element.textContent, 80);
   };
@@ -118,53 +120,63 @@ export function recorderMain() {
     return parts.join(" > ");
   };
 
-  const textMatches = (text: string, selector: string) => {
+  /** Elements a text locator would match, like getByText: any tag, the innermost element with that text. */
+  const textMatches = (text: string) => {
     let found = 0;
-    for (const element of document.querySelectorAll(selector)) {
-      if (clean((element as HTMLElement).innerText ?? element.textContent, 200) === text) found += 1;
+    for (const element of document.body?.querySelectorAll("*") ?? []) {
+      if (clean(element.textContent, 200) !== text) continue;
+      if ([...element.children].some((child) => clean(child.textContent, 200) === text)) continue;
+      found += 1;
       if (found > 1) break;
     }
     return found;
   };
 
-  /** Every way to find this element again, strongest first. */
+  /**
+   * How to find this element again, by what the user sees: its role and name
+   * ("button «Sign in»"), its label, placeholder or text; a test id comes
+   * last. Only an element with none of these falls back to its name or id
+   * attribute or, last, a CSS path.
+   */
   const describe = (element: Element) => {
     const candidates: Array<{ kind: string; value: string; name?: string; unique?: boolean }> = [];
     const tag = element.tagName.toLowerCase();
-    for (const attribute of ["data-testid", "data-test-id", "data-test", "data-qa", "data-cy", "data-automation-id"]) {
-      const value = element.getAttribute(attribute);
-      if (value) {
-        const selector = `[${attribute}=${quote(value)}]`;
-        candidates.push({ kind: "testid", value: selector, unique: count(selector) === 1 });
-      }
-    }
-    const id = element.getAttribute("id");
-    if (id && !unstable(id)) {
-      const selector = `#${cssEscape(id)}`;
-      candidates.push({ kind: "id", value: selector, unique: count(selector) === 1 });
-    }
+    const field = ["input", "textarea", "select"].includes(tag);
     const role = implicitRole(element);
     const name = nameOf(element);
     if (role && name && role !== "heading") candidates.push({ kind: "role", value: role, name, unique: true });
     const label = labelOf(element);
-    if (label && ["input", "textarea", "select"].includes(tag)) candidates.push({ kind: "label", value: label });
+    if (label && field) candidates.push({ kind: "label", value: label });
     const placeholder = element.getAttribute("placeholder");
-    if (placeholder) candidates.push({ kind: "placeholder", value: clean(placeholder) });
-    const nameAttr = element.getAttribute("name");
-    if (nameAttr) {
-      const selector = `${tag}[name=${quote(nameAttr)}]`;
-      candidates.push({ kind: "name", value: selector, unique: count(selector) === 1 });
-    }
+    if (placeholder && clean(placeholder)) candidates.push({ kind: "placeholder", value: clean(placeholder) });
     const visible = clean((element as HTMLElement).innerText ?? element.textContent, 80);
-    if (visible && visible.length <= 60 && !["input", "textarea", "select"].includes(tag) && textMatches(visible, tag) === 1) {
+    if (visible && visible.length <= 60 && !field && textMatches(visible) === 1) {
       candidates.push({ kind: "text", value: visible, unique: true });
     }
-    const path = cssPath(element);
-    candidates.push({ kind: "css", value: path, unique: count(path) === 1 });
-    // Unique ones first, keeping the strength order within each group.
-    const ordered = [...candidates.filter((item) => item.unique !== false), ...candidates.filter((item) => item.unique === false)];
+    const id = element.getAttribute("id");
+    const nameAttr = element.getAttribute("name");
+    // A test id is kept as the last way in any case (what the page shows can change with its language).
+    for (const attribute of ["data-testid", "data-test-id", "data-test", "data-qa", "data-cy", "data-automation-id"]) {
+      const value = element.getAttribute(attribute);
+      const selector = `[${attribute}=${quote(value ?? "")}]`;
+      if (value && count(selector) === 1) {
+        candidates.push({ kind: "testid", value: selector, unique: true });
+        break;
+      }
+    }
+    if (candidates.length === 0) {
+      const fallbacks: Array<{ kind: string; value: string }> = [];
+      if (nameAttr) fallbacks.push({ kind: "name", value: `${tag}[name=${quote(nameAttr)}]` });
+      if (id && !unstable(id)) fallbacks.push({ kind: "id", value: `#${cssEscape(id)}` });
+      const fallback = fallbacks.find((item) => count(item.value) === 1);
+      if (fallback) candidates.push({ ...fallback, unique: true });
+      else {
+        const path = cssPath(element);
+        candidates.push({ kind: "css", value: path, unique: count(path) === 1 });
+      }
+    }
     return {
-      candidates: ordered.slice(0, 8),
+      candidates: candidates.slice(0, 8),
       fingerprint: {
         tag,
         type: element.getAttribute("type") ?? undefined,
@@ -230,6 +242,10 @@ export function recorderMain() {
     },
     true,
   );
+  // Actions replayed before recording starts are not recorded: drop what they typed.
+  w.__qaRecorderReset = () => {
+    pending = null;
+  };
   document.addEventListener("focusout", (event) => {
     if (pending && event.target === pending.element) flush();
   }, true);

@@ -21,7 +21,10 @@ export class ScenariosController {
 
   /** Open a browser on this machine at the URL and record what the user does there. */
   @Post(":id/ui-recordings")
-  startRecording(@Param("id") id: string, @Body() body: { startUrl?: unknown; stepId?: unknown; signedIn?: unknown; fromSteps?: unknown }) {
+  startRecording(
+    @Param("id") id: string,
+    @Body() body: { startUrl?: unknown; stepId?: unknown; signedIn?: unknown; fromSteps?: unknown; fromActionId?: unknown; toActionId?: unknown },
+  ) {
     return this.scenariosService.startRecording(id, body ?? {});
   }
 

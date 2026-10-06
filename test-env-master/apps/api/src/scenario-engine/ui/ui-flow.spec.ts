@@ -159,6 +159,14 @@ beforeAll(async () => {
             "Paid with " + document.querySelector('[data-is-selected="true"]').dataset.testid);
         </script>`);
       }
+      // An admin sidebar: the list link is inside a closed submenu under a parent with a similar name.
+      if (url.pathname === "/admin") {
+        return html(`<ul class="page-sidebar-menu"><li class="nav-item">
+          <a href="javascript:;" class="nav-link nav-toggle" onclick="this.nextElementSibling.style.display = 'block'">Restaurants</a>
+          <ul class="sub-menu" style="display:none"><li class="nav-item"><a class="nav-link" href="/vendors">Restaurants list</a></li></ul>
+          </li></ul>`);
+      }
+      if (url.pathname === "/vendors") return html(`<input name="q[where][v.id][eq][int]" class="search-inp"><p>Vendors</p>`);
       if (url.pathname === "/api/orders") {
         return req.headers.authorization === "Bearer tok-ui-123456789" ? json(200, { orders: [] }) : json(401, { message: "invalid token" });
       }
@@ -230,11 +238,18 @@ describeUi("UI steps: record in a browser, replay in the background", () => {
     expect(kinds).toEqual(["fill", "fill", "check", "select", "click"]);
     const [email, password, , role, submit] = recorded.actions as UiAction[];
     expect(email).toMatchObject({ value: "qa@example.test" });
-    expect(email!.target!.candidates[0]).toMatchObject({ kind: "testid", value: '[data-testid="email"]' });
+    // Found by what the user sees: role and name, label; the test id only last; no CSS path.
+    expect(email!.target!.candidates[0]).toMatchObject({ kind: "role", value: "textbox", name: "Email" });
+    expect(email!.target!.candidates.map((candidate) => candidate.kind)).toEqual(["role", "label", "testid"]);
+    expect(password!.target!.candidates[0]).toMatchObject({ kind: "label", value: "Password" });
+    expect(email!.label).toBe('Type "qa@example.test" into «Email»');
     expect(password).toMatchObject({ secret: true, value: "s3cret!" });
     expect(password!.label).not.toContain("s3cret!");
     expect(role).toMatchObject({ value: "qa", optionLabel: "QA engineer" });
-    expect(submit!.target!.candidates.some((candidate) => candidate.kind === "role" && candidate.name === "Sign in")).toBe(true);
+    expect(submit!.target!.candidates[0]).toMatchObject({ kind: "role", value: "button", name: "Sign in" });
+    // A select without a label or role name: its name attribute, never a CSS path.
+    expect(role!.target!.candidates).toEqual([{ kind: "name", value: 'select[name="role"]', unique: true }]);
+    for (const action of recorded.actions) expect(action.target!.candidates.some((candidate) => candidate.kind === "css")).toBe(false);
     // The page change caused by the click is not a separate "open URL".
     expect(kinds).not.toContain("navigate");
   });
@@ -293,9 +308,17 @@ describeUi("UI steps: record in a browser, replay in the background", () => {
       const { results } = await run([uiStep({ ...sealed, actionTimeoutMs: 6000 })], learned);
       expect(results[0]).toMatchObject({ status: "PASSED" });
       const actions = (results[0]!.output as { actions: UiActionResult[] }).actions;
-      expect(actions[0]).toMatchObject({ healed: true }); // email: by id instead of test id
-      expect(actions[4]).toMatchObject({ healed: true }); // button: by similarity or another locator
+      expect(actions[0]).toMatchObject({ healed: false }); // email: its label did not change
+      expect(actions[4]).toMatchObject({ healed: true }); // button: renamed, found by similarity
       expect(learned[0]?.stepId).toBe("ui-0");
+      // …and remembered by its new role and name, not by a CSS path.
+      const lessons = learned[0]!.learned as Array<{ actionId: string; healedCandidate?: unknown }>;
+      expect(lessons.find((lesson) => lesson.actionId === recorded.actions[4]!.id)?.healedCandidate).toEqual({
+        kind: "role",
+        value: "button",
+        name: "Sign in now",
+        unique: true,
+      });
     } finally {
       variant = 1;
     }
@@ -443,6 +466,68 @@ describeUi("UI steps open signed in with what earlier (cURL) steps obtained", ()
     expect(await started.page.textContent("h1")).toBe("Hello QA");
     await recorder.discard(started.id);
     await context.dispose();
+  });
+});
+
+describeUi("an element inside a closed menu", () => {
+  const link = { candidates: [{ kind: "role" as const, value: "link", name: "Restaurants list" }, { kind: "text" as const, value: "Restaurants list" }], fingerprint: { tag: "a", role: "link", text: "Restaurants list" } };
+  const flow = () =>
+    uiStep({
+      startUrl: `${base}/admin`,
+      actionTimeoutMs: 4000,
+      actions: [
+        { id: "menu", kind: "click", url: `${base}/admin`, target: link },
+        { id: "id", kind: "fill", value: "9618", target: { candidates: [{ kind: "name", value: 'input[name="q[where][v.id][eq][int]"]' }], fingerprint: { tag: "input" } } },
+      ],
+    });
+
+  it("opens the menu and clicks the item itself, not its look-alike parent", async () => {
+    const learned: Array<{ stepId: string; learned: unknown }> = [];
+    const { results } = await run([flow()], learned);
+    expect(results[0]).toMatchObject({ status: "PASSED" });
+    const output = results[0]!.output as { url: string; actions: UiActionResult[] };
+    expect(output.url).toBe(`${base}/vendors`);
+    expect(output.actions[0]).toMatchObject({ healed: false });
+    expect(learned).toEqual([]);
+  });
+});
+
+describeUi("re-recording part of a UI step", () => {
+  it("replays the actions before the part first, then records only what the user does", async () => {
+    variant = 1;
+    const recorded = await recordLogin();
+    const sealed = sealUiConfig({ startUrl: recorded.startUrl, actions: recorded.actions }, null, encrypt);
+    const actions = sealed.actions as UiAction[];
+    // Re-record from the checkbox (action 3) to the select (action 4).
+    const context = new ExecutionContext();
+    const recorder = new UiRecorderService();
+    const started = await recorder.start(
+      { scenarioId: "s", stepId: "ui-0", startUrl: recorded.startUrl, range: { fromActionId: actions[2]!.id, toActionId: actions[3]!.id } },
+      {
+        headless: true,
+        prepare: async (parts) => {
+          context.resources.set("ui-session", parts);
+          const result = await registry().resolve("UI_FLOW").execute({ ...sealed, actions: actions.slice(0, 2) }, context);
+          return result.status === "PASSED" ? undefined : result.error;
+        },
+      },
+    );
+    expect(started.state).toBe("preparing");
+    const page = started.page;
+    while (recorder.status(started.id).state === "preparing") await page.waitForTimeout(100);
+    expect(recorder.status(started.id).error).toBeNull();
+    // The replay typed the email and password; none of it is recorded.
+    expect(await page.inputValue("#email")).toBe("qa@example.test");
+    expect(recorder.status(started.id).actions).toEqual([]);
+    await page.click('input[name="remember"]');
+    await page.selectOption('select[name="role"]', "dev");
+    await page.waitForTimeout(300);
+    await recorder.stop(started.id);
+    const taken = recorder.take(started.id);
+    expect(taken.range).toEqual({ fromActionId: actions[2]!.id, toActionId: actions[3]!.id });
+    expect(taken.actions.map((action) => action.kind)).toEqual(["check", "select"]);
+    expect(taken.actions[0]!.target!.candidates[0]).toMatchObject({ kind: "role", value: "checkbox", name: "Remember me" });
+    expect(taken.actions[1]).toMatchObject({ value: "dev" });
   });
 });
 

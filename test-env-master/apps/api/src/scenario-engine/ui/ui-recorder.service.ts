@@ -21,12 +21,20 @@ const EventSchema = z.object({
     .optional(),
 });
 
+export type RecordRange = { fromActionId: string; toActionId: string };
+
+/** Brings the recording browser to where recording starts (replays earlier actions); returns an error to show, if any. */
+export type PrepareRecording = (parts: { browser: Browser; context: BrowserContext; page: Page }) => Promise<string | undefined>;
+
 type Session = {
   id: string;
   scenarioId: string;
   stepId: string | null;
   startUrl: string;
-  state: "recording" | "stopped";
+  /** Actions of the step this recording replaces (first and last, inclusive). */
+  range: RecordRange | null;
+  /** "preparing": the step's earlier actions are being replayed; nothing is recorded yet. */
+  state: "preparing" | "recording" | "stopped";
   browser: Browser;
   context: BrowserContext;
   actions: UiAction[];
@@ -55,12 +63,17 @@ export class UiRecorderService implements OnModuleDestroy {
 
   /** `headless` is for tests: the page is then driven by the test instead of a person. */
   async start(
-    input: { scenarioId: string; stepId?: string | null; startUrl: unknown },
-    options: { headless?: boolean; seed?: SessionSeed; storageState?: Awaited<ReturnType<BrowserContext["storageState"]>> } = {},
+    input: { scenarioId: string; stepId?: string | null; startUrl: unknown; range?: RecordRange | null },
+    options: {
+      headless?: boolean;
+      seed?: SessionSeed;
+      storageState?: Awaited<ReturnType<BrowserContext["storageState"]>>;
+      prepare?: PrepareRecording;
+    } = {},
   ) {
     const startUrl = typeof input.startUrl === "string" ? input.startUrl.trim() : "";
     if (!/^https?:\/\//i.test(startUrl)) throw new BadRequestException("Enter the start URL (http:// or https://)");
-    const active = [...this.sessions.values()].filter((session) => session.state === "recording");
+    const active = [...this.sessions.values()].filter((session) => session.state !== "stopped");
     if (active.length >= MAX_SESSIONS) throw new BadRequestException("Another recording is still open; stop it first");
 
     let browser: Browser;
@@ -77,7 +90,8 @@ export class UiRecorderService implements OnModuleDestroy {
       scenarioId: input.scenarioId,
       stepId: input.stepId ?? null,
       startUrl,
-      state: "recording",
+      range: input.range ?? null,
+      state: options.prepare ? "preparing" : "recording",
       browser,
       context,
       actions: [],
@@ -99,6 +113,8 @@ export class UiRecorderService implements OnModuleDestroy {
       session.error = error instanceof Error ? error.message.split("\n")[0] : "Could not open the start URL";
     }
     await page.bringToFront().catch(() => undefined);
+    // Replaying the earlier actions can take a while: the status shows "preparing" until it is done.
+    if (options.prepare) void this.prepare(session, options.prepare, page);
     this.touch(session);
     return { ...this.view(session), page };
   }
@@ -118,9 +134,9 @@ export class UiRecorderService implements OnModuleDestroy {
   /** The recorded actions with their secret values, once, for saving into a step. */
   take(id: string) {
     const session = this.get(id);
-    if (session.state === "recording") throw new BadRequestException("Stop the recording first");
+    if (session.state !== "stopped") throw new BadRequestException("Stop the recording first");
     this.sessions.delete(id);
-    return { scenarioId: session.scenarioId, stepId: session.stepId, startUrl: session.startUrl, actions: tidy(session.actions) };
+    return { scenarioId: session.scenarioId, stepId: session.stepId, startUrl: session.startUrl, range: session.range, actions: tidy(session.actions) };
   }
 
   async discard(id: string) {
@@ -140,6 +156,22 @@ export class UiRecorderService implements OnModuleDestroy {
     const session = this.sessions.get(id);
     if (!session) throw new NotFoundException("Recording not found");
     return session;
+  }
+
+  private async prepare(session: Session, prepare: PrepareRecording, page: Page) {
+    const error = await prepare({ browser: session.browser, context: session.context, page }).catch((cause: unknown) =>
+      cause instanceof Error ? cause.message : String(cause),
+    );
+    if (session.state !== "preparing") return;
+    if (error) session.error = error.split("\n")[0];
+    // What the replay typed is not the user's: forget it, and start from the page it reached.
+    for (const open of session.context.pages()) {
+      for (const frame of open.frames()) await frame.evaluate("window.__qaRecorderReset && window.__qaRecorderReset()").catch(() => undefined);
+    }
+    session.actions = [];
+    session.lastUrl = session.context.pages().find((item) => !item.isClosed())?.url() ?? session.lastUrl;
+    session.state = "recording";
+    this.touch(session);
   }
 
   private finish(session: Session) {
@@ -214,6 +246,7 @@ export class UiRecorderService implements OnModuleDestroy {
       stepId: session.stepId,
       startUrl: session.startUrl,
       state: session.state,
+      range: session.range,
       error: session.error ?? null,
       startedAt: new Date(session.startedAt).toISOString(),
       actions: tidy(session.actions).map((action) => ({

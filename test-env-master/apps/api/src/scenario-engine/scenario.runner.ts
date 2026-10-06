@@ -385,7 +385,10 @@ export class ScenarioRunner implements OnModuleInit {
         const lesson = learned.find((item) => item.actionId === action.id);
         if (!lesson || !action.target) return action;
         if (lesson.healedCandidate) {
-          const candidates = [lesson.healedCandidate, ...action.target.candidates.filter((item) => item.value !== lesson.healedCandidate!.value)].slice(0, 10);
+          // Only the same locator is replaced: another link or button with the same role keeps its own name.
+          const same = (item: { kind: string; value: string; name?: string }) =>
+            item.kind === lesson.healedCandidate!.kind && item.value === lesson.healedCandidate!.value && (item.name ?? "") === (lesson.healedCandidate!.name ?? "");
+          const candidates = [lesson.healedCandidate, ...action.target.candidates.filter((item) => !same(item))].slice(0, 10);
           return { ...action, target: { ...action.target, candidates, learned: 0 } };
         }
         return { ...action, target: { ...action.target, learned: lesson.candidateIndex } };

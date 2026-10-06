@@ -51,8 +51,8 @@ export type StepActions = {
   listPickHelp: (stepId: string, source: ResponseSource) => Promise<ListPickHelp>;
   /** Save one mapping as it is (e.g. its list item choice). */
   saveBinding: (stepId: string, binding: StepBinding) => Promise<void>;
-  /** Record more actions into a UI step (or re-record it). */
-  recordUi: (step: Step) => void;
+  /** Record more actions into a UI step (or re-record it, or only part of it from one action). */
+  recordUi: (step: Step, fromActionId?: string) => void;
 };
 
 /** Focused details of one step: request, response, mappings, assertions, attempts, advanced settings. */
@@ -332,6 +332,7 @@ export function StepPanel({
               .slice(0, 200)}
             onSave={(config) => actions.saveStep(step.id, { config })}
             onRecordMore={() => actions.recordUi(step)}
+            onRerecord={(actionId) => actions.recordUi(step, actionId)}
           />
         ) : null}
 

@@ -5,6 +5,7 @@ import {
   ArrowDown,
   ArrowUp,
   CheckCircle2,
+  RotateCcw,
   Circle,
   Eye,
   Globe,
@@ -70,7 +71,8 @@ type SignedIn = { cookies: string[]; headers: string[]; storage: string[]; guess
 
 type Recording = {
   id: string;
-  state: "recording" | "stopped";
+  /** "preparing": the step's earlier actions are replayed before recording starts. */
+  state: "preparing" | "recording" | "stopped";
   error: string | null;
   startUrl: string;
   actions: Array<{ id: string; kind: UiAction["kind"]; label: string; secret?: boolean }>;
@@ -121,11 +123,15 @@ export function uiActions(config: Record<string, unknown>): UiAction[] {
 /**
  * Record a UI step: a browser opens on this computer at the start URL; what
  * the user does there is listed here live. Saved as a new step, or into the
- * step it was started from (added to the end, or replacing its actions).
+ * step it was started from (added to the end, or replacing its actions). With
+ * `fromActionId`, only a part of the step is re-recorded: the actions before it
+ * are replayed first, and the recording replaces the chosen actions.
  */
 export function UiRecordDialog({
   scenarioId,
   step,
+  fromActionId,
+  initialMode,
   earlierSteps,
   steps,
   onClose,
@@ -133,6 +139,10 @@ export function UiRecordDialog({
 }: {
   scenarioId: string;
   step?: Step | null;
+  /** Re-record the step's actions from this one (up to one chosen in the dialog). */
+  fromActionId?: string;
+  /** How the recording goes into the step it was started from. */
+  initialMode?: "append" | "replace" | "part";
   /** Steps that run before this one (they can sign the browser in). */
   earlierSteps: number;
   /** All steps of the precondition, for choosing which supply the session. */
@@ -145,7 +155,12 @@ export function UiRecordDialog({
   const lastUrl = [...existing].reverse().find((action) => action.url)?.url;
   const [name, setName] = useState("");
   const [startUrl, setStartUrl] = useState(String(step?.config.startUrl ?? ""));
-  const [mode, setMode] = useState<"append" | "replace">("append");
+  const [mode, setMode] = useState<"append" | "replace" | "part">(fromActionId ? "part" : (initialMode ?? "append"));
+  const [fromId, setFromId] = useState(fromActionId ?? existing[0]?.id ?? "");
+  const [toActionId, setToActionId] = useState(fromActionId ?? existing[0]?.id ?? "");
+  const fromIndex = Math.max(0, existing.findIndex((action) => action.id === fromId));
+  const toIndex = Math.max(fromIndex, existing.findIndex((action) => action.id === toActionId));
+  const partial = mode === "part" && existing.length > 0;
   const [signedIn, setSignedIn] = useState(true);
   const sources = sessionSources(steps, step ? step.orderIndex : null);
   const savedFrom = ((step?.config.session ?? {}) as { fromSteps?: string[] }).fromSteps;
@@ -156,17 +171,18 @@ export function UiRecordDialog({
   const listRef = useRef<HTMLOListElement | null>(null);
   const recordingId = recording?.id;
   const active = recording?.state === "recording";
+  const open = Boolean(recording && recording.state !== "stopped");
 
   // Live list while recording; stops by itself when the browser is closed or the badge's stop is pressed.
   useEffect(() => {
-    if (!recordingId || !active) return;
+    if (!recordingId || !open) return;
     const timer = setInterval(() => {
       void api<Recording>(`/scenarios/ui-recordings/${recordingId}`)
         .then(setRecording)
         .catch(() => undefined);
     }, 800);
     return () => clearInterval(timer);
-  }, [recordingId, active]);
+  }, [recordingId, open]);
 
   useEffect(() => {
     listRef.current?.lastElementChild?.scrollIntoView({ block: "nearest" });
@@ -196,6 +212,7 @@ export function UiRecordDialog({
             signedIn: earlierSteps > 0 && signedIn,
             fromSteps,
             ...(step ? { stepId: step.id } : {}),
+            ...(partial ? { fromActionId: existing[fromIndex]!.id, toActionId: existing[toIndex]!.id } : {}),
           }),
         }),
       );
@@ -222,8 +239,8 @@ export function UiRecordDialog({
   return (
     <Dialog
       open
-      title={step ? t("uiStep.recordMoreTitle") : t("uiStep.recordTitle")}
-      description={t("uiStep.recordHint")}
+      title={partial ? t("uiStep.rerecordTitle") : step ? t("uiStep.recordMoreTitle") : t("uiStep.recordTitle")}
+      description={partial ? t("uiStep.rerecordHint") : t("uiStep.recordHint")}
       closeLabel={t("builder.panel.close")}
       onClose={close}
       footer={
@@ -236,14 +253,14 @@ export function UiRecordDialog({
               <Video className="h-3.5 w-3.5" />
               {t("uiStep.start")}
             </Button>
-          ) : active ? (
+          ) : open ? (
             <Button variant="destructive" disabled={busy} onClick={() => void stop()}>
               <Square className="h-3.5 w-3.5" />
               {t("uiStep.stop")}
             </Button>
           ) : (
             <Button disabled={busy || count === 0} onClick={() => void save()}>
-              {step ? t("uiStep.saveInto") : t("uiStep.save", { count: n(count) })}
+              {partial ? t("uiStep.rerecordSave", { count: n(toIndex - fromIndex + 1) }) : step ? t("uiStep.saveInto") : t("uiStep.save", { count: n(count) })}
             </Button>
           )}
         </>
@@ -266,7 +283,7 @@ export function UiRecordDialog({
                 }}
               />
             </label>
-            {step && lastUrl && lastUrl !== startUrl ? (
+            {step && !partial && lastUrl && lastUrl !== startUrl ? (
               <button type="button" className="text-[11px] text-primary hover:underline" onClick={() => setStartUrl(lastUrl)}>
                 {t("uiStep.continueFrom")} <span className="font-mono" dir="ltr">{lastUrl}</span>
               </button>
@@ -277,16 +294,63 @@ export function UiRecordDialog({
                 <input className={input} value={name} placeholder={t("uiStep.namePlaceholder")} onChange={(event) => setName(event.target.value)} />
               </label>
             ) : (
-              <fieldset className="flex flex-wrap gap-3 text-xs">
-                <label className="flex items-center gap-1.5">
-                  <input type="radio" checked={mode === "append"} onChange={() => setMode("append")} />
-                  {t("uiStep.append", { count: n(existing.length) })}
-                </label>
-                <label className="flex items-center gap-1.5">
-                  <input type="radio" checked={mode === "replace"} onChange={() => setMode("replace")} />
-                  {t("uiStep.replace")}
-                </label>
-              </fieldset>
+              <>
+                <fieldset className="flex flex-wrap gap-3 text-xs">
+                  <label className="flex items-center gap-1.5">
+                    <input type="radio" checked={mode === "append"} onChange={() => setMode("append")} />
+                    {t("uiStep.append", { count: n(existing.length) })}
+                  </label>
+                  <label className="flex items-center gap-1.5">
+                    <input type="radio" checked={mode === "replace"} onChange={() => setMode("replace")} />
+                    {t("uiStep.replace")}
+                  </label>
+                  {existing.length > 0 ? (
+                    <label className="flex items-center gap-1.5">
+                      <input type="radio" checked={mode === "part"} onChange={() => setMode("part")} />
+                      {t("uiStep.replacePart")}
+                    </label>
+                  ) : null}
+                </fieldset>
+                {partial ? (
+              <div className="space-y-1.5 rounded-md border border-border p-2 text-xs">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span>{t("uiStep.rerecordFromLabel")}</span>
+                  <select
+                    className={cn(input, "h-7 w-auto max-w-60")}
+                    aria-label={t("uiStep.rerecordFromLabel")}
+                    value={existing[fromIndex]!.id}
+                    onChange={(event) => {
+                      setFromId(event.target.value);
+                      if (toIndex < existing.findIndex((action) => action.id === event.target.value)) setToActionId(event.target.value);
+                    }}
+                  >
+                    {existing.map((action, index) => (
+                      <option key={action.id} value={action.id}>
+                        {n(index + 1)} · {action.label ?? t(`uiStep.kinds.${action.kind}`)}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="text-muted-foreground">{t("uiStep.rerecordTo")}</span>
+                  <select className={cn(input, "h-7 w-auto max-w-60")} aria-label={t("uiStep.rerecordTo")} value={existing[toIndex]!.id} onChange={(event) => setToActionId(event.target.value)}>
+                    {existing.slice(fromIndex).map((action, offset) => (
+                      <option key={action.id} value={action.id}>
+                        {n(fromIndex + offset + 1)} · {action.label ?? t(`uiStep.kinds.${action.kind}`)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <ol className="max-h-32 space-y-0.5 overflow-auto ps-1 text-[11px]">
+                  {existing.slice(fromIndex, toIndex + 1).map((action, offset) => (
+                    <li key={action.id} className="flex gap-1.5 text-muted-foreground line-through">
+                      <span className="font-mono">{n(fromIndex + offset + 1)}</span>
+                      <BidiText text={action.label ?? ""} className="min-w-0 truncate" />
+                    </li>
+                  ))}
+                </ol>
+                {fromIndex > 0 ? <p className="text-[11px] text-muted-foreground">{t("uiStep.rerecordReplays", { count: n(fromIndex) })}</p> : null}
+              </div>
+                ) : null}
+              </>
             )}
             {earlierSteps > 0 ? (
               <label className="flex items-start gap-2 rounded-md border border-border p-2 text-xs">
@@ -309,8 +373,8 @@ export function UiRecordDialog({
         ) : (
           <>
             <p className={cn("flex items-center gap-2 text-xs", active ? "text-destructive" : "text-muted-foreground")} role="status">
-              {active ? <span className="h-2 w-2 animate-pulse rounded-full bg-destructive" aria-hidden /> : null}
-              {active ? t("uiStep.recording") : t("uiStep.stopped", { count: n(count) })}
+              {open ? <span className={cn("h-2 w-2 animate-pulse rounded-full", active ? "bg-destructive" : "bg-primary")} aria-hidden /> : null}
+              {active ? t("uiStep.recording") : open ? t("uiStep.preparing") : t("uiStep.stopped", { count: n(count) })}
             </p>
             {recording.error ? <p className="text-xs text-warning">{err(recording.error)}</p> : null}
             {recording.prepared ? <PreparedNote prepared={recording.prepared} /> : null}
@@ -456,6 +520,7 @@ export function UiActionsTab({
   earlierValues,
   onSave,
   onRecordMore,
+  onRerecord,
 }: {
   step: Step;
   steps: Step[];
@@ -463,6 +528,8 @@ export function UiActionsTab({
   earlierValues: EarlierValue[];
   onSave: (config: Record<string, unknown>) => Promise<void>;
   onRecordMore: () => void;
+  /** Re-record the saved step's actions from this one (its page changed). */
+  onRerecord: (actionId: string) => void;
 }) {
   const { t, n } = useI18n();
   const [startUrl, setStartUrl] = useState(String(step.config.startUrl ?? ""));
@@ -564,6 +631,9 @@ export function UiActionsTab({
                     onChange={(event) => patch(index, { label: event.target.value })}
                   />
                   <span className="flex shrink-0">
+                    <IconButton label={t("uiStep.rerecordFrom")} disabled={dirty} onClick={() => onRerecord(action.id)}>
+                      <RotateCcw className="h-3.5 w-3.5" />
+                    </IconButton>
                     <IconButton label={t("builder.flow.moveUp")} disabled={index === 0} onClick={() => move(index, -1)}>
                       <ArrowUp className="h-3.5 w-3.5" />
                     </IconButton>

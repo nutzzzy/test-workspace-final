@@ -13,7 +13,8 @@ import { encryptSecret, resolveEncryptionKey } from "../common/crypto.util";
 import { UiRecorderService } from "../scenario-engine/ui/ui-recorder.service";
 import { publicUiConfig, readUiConfig, sealUiConfig } from "../scenario-engine/ui/ui-types";
 import { describeSeed, seedFromContext } from "../scenario-engine/ui/browser-session";
-import { uiSessionState } from "../scenario-engine/executors/ui-flow.executor";
+import { SESSION_KEY, uiSessionState } from "../scenario-engine/executors/ui-flow.executor";
+import type { PrepareRecording, RecordRange } from "../scenario-engine/ui/ui-recorder.service";
 import {
   isBinding,
   isResponseSource,
@@ -100,8 +101,15 @@ export class ScenariosService {
    * the UI step run first — in memory, no run is saved — and the browser opens
    * with what they obtained: an earlier UI step's session, the cookies and
    * credential headers of earlier requests, and the storage entries the step names.
+   *
+   * With `fromActionId` / `toActionId` (a part of the step whose page changed),
+   * the step's actions before that part are replayed in the recording browser
+   * first; what is recorded then replaces that part when saved.
    */
-  async startRecording(scenarioId: string, body: { startUrl?: unknown; stepId?: unknown; signedIn?: unknown; fromSteps?: unknown }) {
+  async startRecording(
+    scenarioId: string,
+    body: { startUrl?: unknown; stepId?: unknown; signedIn?: unknown; fromSteps?: unknown; fromActionId?: unknown; toActionId?: unknown },
+  ) {
     const scenario = await this.get(scenarioId);
     const stepId = typeof body.stepId === "string" ? body.stepId : null;
     const step = stepId ? scenario.steps.find((item) => item.id === stepId && item.type === "UI_FLOW") : undefined;
@@ -109,27 +117,69 @@ export class ScenariosService {
     const before = step ? step.orderIndex : Number.MAX_SAFE_INTEGER;
     const earlier = scenario.steps.filter((item) => item.enabled && item.orderIndex < before && item.type !== "ASSERTION");
     const startUrl = typeof body.startUrl === "string" ? body.startUrl.trim() : "";
+    const saved = step ? readUiConfig(asRecord(step.config)) : null;
+    const range = this.recordRange(saved?.ok ? saved.value.actions : null, body.fromActionId, body.toActionId);
+    const replayFirst = range && saved?.ok ? saved.value.actions.slice(0, range.from) : [];
     let prepared: Awaited<ReturnType<ScenarioRunner["runBefore"]>> | null = null;
-    if (body.signedIn !== false && earlier.length > 0 && /^https?:\/\//i.test(startUrl)) {
-      prepared = await this.runner.runBefore(scenarioId, before);
-    }
+    const signIn = body.signedIn !== false && earlier.length > 0 && /^https?:\/\//i.test(startUrl);
+    if (signIn) prepared = await this.runner.runBefore(scenarioId, before);
+    // Replaying actions needs the environment's variables even when no earlier step runs.
+    else if (replayFirst.length) prepared = await this.runner.runBefore(scenarioId, Number.MIN_SAFE_INTEGER);
+    let handedOver = false;
     try {
-      const saved = step ? readUiConfig(asRecord(step.config)) : null;
       // The dialog's choice wins over the step's saved one: a list, or null for every earlier step.
       const chosen = Array.isArray(body.fromSteps) ? body.fromSteps.filter((id): id is string => typeof id === "string") : body.fromSteps === null ? null : undefined;
       const session = { ...(saved?.ok ? saved.value.session : {}), ...(chosen !== undefined ? { fromSteps: chosen ?? undefined } : {}) };
       const seed = prepared ? seedFromContext(prepared.context, startUrl, session) : undefined;
       // An earlier UI step's browser session counts only when that step is among the chosen ones.
       const uiChosen = !session.fromSteps || earlier.some((item) => item.type === "UI_FLOW" && session.fromSteps!.includes(item.id));
-      const storageState = prepared && uiChosen ? await uiSessionState(prepared.context) : undefined;
-      const { page: _page, ...view } = await this.recorder.start({ scenarioId, stepId, startUrl: body.startUrl }, { seed, storageState });
+      const storageState = prepared && signIn && uiChosen ? await uiSessionState(prepared.context) : undefined;
+      let prepare: PrepareRecording | undefined;
+      if (prepared && replayFirst.length && saved?.ok) {
+        const context = prepared.context;
+        const flow = saved.value;
+        handedOver = true;
+        // The step's actions before the part being re-recorded, played in the recording browser.
+        prepare = async (parts) => {
+          try {
+            context.resources.set(SESSION_KEY, parts);
+            const result = await this.runner
+              .getRegistry()
+              .resolve("UI_FLOW")
+              .execute({ ...asRecord(step!.config), startUrl: flow.startUrl, actions: replayFirst, newSession: false, failOnPageError: false }, context);
+            context.resources.delete(SESSION_KEY);
+            return result.status === "PASSED" ? undefined : `Replaying actions 1–${replayFirst.length} failed: ${result.error ?? result.status}. Do the rest by hand, then record.`;
+          } finally {
+            await context.dispose();
+          }
+        };
+      }
+      const recordRange: RecordRange | null = range ? { fromActionId: range.fromId, toActionId: range.toId } : null;
+      const { page: _page, ...view } = await this.recorder.start(
+        { scenarioId, stepId, startUrl: body.startUrl, range: recordRange },
+        { seed, storageState, prepare },
+      );
       return {
         ...view,
         prepared: prepared ? { status: prepared.status, steps: prepared.ran, signedIn: seed ? describeSeed(seed) : null } : null,
       };
+    } catch (error) {
+      if (handedOver) await prepared?.context.dispose();
+      throw error;
     } finally {
-      await prepared?.context.dispose();
+      if (!handedOver) await prepared?.context.dispose();
     }
+  }
+
+  /** The part of a step's actions to re-record: from one action to another (inclusive), in step order. */
+  private recordRange(actions: Array<{ id: string }> | null, fromActionId: unknown, toActionId: unknown) {
+    if (typeof fromActionId !== "string" || !fromActionId) return null;
+    if (!actions) throw new BadRequestException("Choose a UI step to re-record part of");
+    const from = actions.findIndex((action) => action.id === fromActionId);
+    const to = typeof toActionId === "string" && toActionId ? actions.findIndex((action) => action.id === toActionId) : from;
+    if (from < 0 || to < 0) throw new NotFoundException("Action not found in this step");
+    if (to < from) throw new BadRequestException("The last action to replace comes before the first one");
+    return { from, to, fromId: actions[from]!.id, toId: actions[to]!.id };
   }
 
   recordingStatus(id: string) {
@@ -146,7 +196,8 @@ export class ScenariosService {
 
   /**
    * Save a finished recording: a new UI step at the end, or — when it was
-   * started from a step — appended to that step's actions or replacing them.
+   * started from a step — appended to that step's actions or replacing them,
+   * or replacing only the part of them it was started for.
    */
   async saveRecording(id: string, body: { name?: unknown; mode?: unknown }) {
     const recording = this.recorder.take(id);
@@ -157,10 +208,19 @@ export class ScenariosService {
         const config = asRecord(current.config);
         const existing = Array.isArray(config.actions) ? (config.actions as unknown[]) : [];
         const replace = body.mode === "replace";
+        let actions = replace ? recording.actions : [...existing, ...recording.actions];
+        if (recording.range) {
+          const ids = existing.map((action) => asRecord(action).id);
+          const from = ids.indexOf(recording.range.fromActionId);
+          const to = ids.indexOf(recording.range.toActionId);
+          // The step changed while recording (those actions were deleted): nothing safe to replace.
+          if (from < 0 || to < from) throw new BadRequestException("The actions this recording replaces are no longer in the step");
+          actions = [...existing.slice(0, from), ...recording.actions, ...existing.slice(to + 1)];
+        }
         const next = {
           ...config,
-          ...(replace ? { startUrl: recording.startUrl } : {}),
-          actions: replace ? recording.actions : [...existing, ...recording.actions],
+          ...(replace && !recording.range ? { startUrl: recording.startUrl } : {}),
+          actions,
         };
         return this.prisma.scenarioStep.update({
           where: { id: current.id },

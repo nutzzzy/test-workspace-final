@@ -75,7 +75,7 @@ export default function ScenariosPage() {
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [dbStepOpen, setDbStepOpen] = useState(false);
-  const [uiRecord, setUiRecord] = useState<{ step: Step | null } | null>(null);
+  const [uiRecord, setUiRecord] = useState<{ step: Step | null; fromActionId?: string; mode?: "append" | "replace" | "part" } | null>(null);
   const [picker, setPicker] = useState<PickerRequest | null>(null);
   const [confirm, setConfirm] = useState<{ title: string; body: string; action: () => Promise<void> } | null>(null);
   const [dismissed, setDismissed] = useState<string[]>([]);
@@ -353,7 +353,7 @@ export default function ScenariosPage() {
     accept: (suggestion) => void accept([suggestion]),
     dismiss,
     autoMap: (stepId) => void autoMap(stepId),
-    recordUi: (step) => setUiRecord({ step }),
+    recordUi: (step, fromActionId) => setUiRecord({ step, fromActionId }),
     listPickHelp: async (stepId, source) => {
       if (!detail) throw new Error("No precondition");
       return api<ListPickHelp>(`/scenarios/${detail.id}/list-pick/help`, {
@@ -592,6 +592,7 @@ export default function ScenariosPage() {
                     }
                     onToggle={(step) => void actions.saveStep(step.id, { enabled: !step.enabled })}
                     onDelete={deleteStep}
+                    onRerecord={(step) => setUiRecord({ step, mode: "replace" })}
                   />
                 )}
               </section>
@@ -640,6 +641,8 @@ export default function ScenariosPage() {
         <UiRecordDialog
           scenarioId={detail.id}
           step={uiRecord.step}
+          fromActionId={uiRecord.fromActionId}
+          initialMode={uiRecord.mode}
           steps={steps}
           earlierSteps={steps.filter((item) => item.enabled && item.type !== "ASSERTION" && (!uiRecord.step || item.orderIndex < uiRecord.step.orderIndex)).length}
           onClose={() => setUiRecord(null)}
