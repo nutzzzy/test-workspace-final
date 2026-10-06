@@ -192,6 +192,12 @@ export class ScenariosController {
     return this.scenariosService.acceptDependency(id, body ?? {});
   }
 
+  /** For a mapping that reads a list item: the list, and conditions that recognise the item. */
+  @Post(":id/list-pick/help")
+  listPickHelp(@Param("id") id: string, @Body() body: { consumerStepId?: unknown; sourceStepId?: unknown; path?: unknown }) {
+    return this.scenariosService.listPickHelp(id, body ?? {});
+  }
+
   /** Find and save the clear mappings of every unmapped field (or of one step). */
   @Post(":id/dependencies/auto")
   autoMap(@Param("id") id: string, @Body() body: { stepId?: unknown }) {

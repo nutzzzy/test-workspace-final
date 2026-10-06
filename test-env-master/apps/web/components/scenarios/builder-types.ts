@@ -59,7 +59,17 @@ export type Env = { id: string; name: string };
 
 export type ExpectedValue = { kind: "token" | "value"; key: string; alt?: string[] };
 
-export type ResponseSource = { stepId?: string; stepName?: string; orderIndex?: number; path: string; expect?: ExpectedValue };
+/** A condition that recognises one item of a list (see apps/api/src/scenario-engine/flow/list-pick.ts). */
+export type PickCondition = {
+  field: string;
+  op: "equals" | "in";
+  value: { text: string } | { source: { stepId?: string; stepName?: string; orderIndex?: number; path: string } };
+};
+
+/** Which item of a list a mapping reads: first / last, or the one the conditions single out. */
+export type ListPick = { list: string; item: string; position?: "first" | "last"; where?: PickCondition[] };
+
+export type ResponseSource = { stepId?: string; stepName?: string; orderIndex?: number; path: string; expect?: ExpectedValue; pick?: ListPick };
 
 export type StepBinding = {
   target: { location: InputLocation; field: string; key?: string };

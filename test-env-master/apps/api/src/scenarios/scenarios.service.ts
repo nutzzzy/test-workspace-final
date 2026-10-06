@@ -26,6 +26,10 @@ import {
 import type { InputLocation } from "../scenario-engine/flow/request-inputs";
 import type { DependencySuggestion, FlowHttpStep } from "../scenario-engine/flow/dependency-analyzer";
 import { detectBodyError } from "../scenario-engine/flow/body-error";
+import { splitListPath, suggestAnchors } from "../scenario-engine/flow/list-pick";
+import { collectScalarLeaves } from "../scenario-engine/flow/dependency-analyzer";
+import { normalizePath } from "../scenario-engine/flow/value-registry";
+import { parseJsonPath, readJsonPath } from "@qa-workbench/shared";
 import { flowHealth, validateFlow } from "../scenario-engine/flow/flow-validator";
 import {
   bindingFromSuggestion,
@@ -442,6 +446,15 @@ export class ScenariosService {
         throw new BadRequestException("The mapping source must run before this step");
       }
       binding.source = { ...binding.source, stepId: source.id, stepName: source.name, orderIndex: source.orderIndex };
+      // A list item chosen by a condition: the values it compares with also come from earlier steps of this scenario.
+      for (const condition of binding.source.pick?.where ?? []) {
+        if (!("source" in condition.value)) continue;
+        const other = condition.value.source.stepId ? await this.prisma.scenarioStep.findUnique({ where: { id: condition.value.source.stepId } }) : null;
+        if (!other || other.scenarioId !== step.scenarioId || other.orderIndex >= step.orderIndex) {
+          throw new BadRequestException("The mapping source must run before this step");
+        }
+        condition.value.source = { ...condition.value.source, stepId: other.id, stepName: other.name, orderIndex: other.orderIndex };
+      }
       // A changed source is a new mapping until a run confirms it.
       const previous = readBindings(config).find((item) => sameTarget(item.target, binding.target));
       if (previous && JSON.stringify(previous.source) !== JSON.stringify(binding.source)) delete binding.verifiedAt;
@@ -724,6 +737,49 @@ export class ScenariosService {
     };
   }
 
+  /**
+   * For a mapping that reads one item of a list: the list as the last run saw
+   * it, and conditions that recognise the item by data of other earlier steps
+   * (e.g. the order whose code is in the URL the UI step ended on).
+   */
+  async listPickHelp(scenarioId: string, body: { consumerStepId?: unknown; sourceStepId?: unknown; path?: unknown }) {
+    const scenario = await this.get(scenarioId);
+    const consumer = scenario.steps.find((item) => item.id === body.consumerStepId);
+    const source = scenario.steps.find((item) => item.id === body.sourceStepId);
+    if (!consumer || !source) throw new NotFoundException("Step not found");
+    const split = typeof body.path === "string" ? splitListPath(normalizePath(body.path)) : null;
+    if (!split) throw new BadRequestException("This value is not an item of a list");
+    // One run for both: the list and the values it is compared with must come from the same run.
+    const run = scenario.runs.find((item) => samplesFromRun(item).some((sample) => sample.stepId === source.id && (sample.status ?? 200) < 400));
+    const samples = run ? samplesFromRun(run) : [];
+    const sourceSample = samples.find((item) => item.stepId === source.id);
+    const list = readList(sourceSample?.body, split.list);
+    const chosen = list?.[split.index];
+    const others = scenario.steps
+      .filter((item) => item.orderIndex < consumer.orderIndex && item.id !== source.id)
+      .flatMap((item) => {
+        const sample = samples.find((entry) => entry.stepId === item.id);
+        if (!sample) return [];
+        return collectScalarLeaves(sample.body, 400)
+          .filter((leaf) => leaf.value.length >= 4 && leaf.value !== "***")
+          .map((leaf) => ({ stepId: item.id, stepName: item.name, orderIndex: item.orderIndex, path: normalizePath(leaf.path), text: leaf.value }));
+      });
+    return {
+      list: split.list,
+      item: split.item,
+      index: split.index,
+      count: list?.length ?? 0,
+      // A short look at the first items, to see what "first" means in this list.
+      preview: (list ?? []).slice(0, 5).map((item, index) => ({ index, value: summarize(item, split.item) })),
+      // Conditions that single out exactly this item first; ones that many items meet do not identify it.
+      anchors: chosen === undefined
+        ? []
+        : suggestAnchors(chosen, others)
+            .map((anchor) => ({ ...anchor, matches: (list ?? []).filter((item) => itemMeets(item, anchor.condition.field, anchor.condition.op, anchor.preview.otherValue)).length }))
+            .sort((a, b) => Number(a.matches !== 1) - Number(b.matches !== 1) || Number(a.condition.op === "equals") - Number(b.condition.op === "equals") || a.preview.otherPath.length - b.preview.otherPath.length),
+    };
+  }
+
   listRuns(scenarioId?: string) {
     return this.prisma.scenarioRun.findMany({
       where: scenarioId ? { scenarioId } : undefined,
@@ -885,4 +941,37 @@ function hostAndPath(url: string) {
   } catch {
     return url.slice(0, 80);
   }
+}
+
+function readList(body: unknown, list: string): unknown[] | null {
+  const inner = list.replace(/^response\.body\.?/, "");
+  if (!inner) return Array.isArray(body) ? body : null;
+  const parsed = parseJsonPath(`$.${inner}`);
+  if (!parsed.ok) return null;
+  const found = readJsonPath(body, parsed.segments);
+  return found.found && Array.isArray(found.value) ? found.value : null;
+}
+
+/** "id 69462 · code p47l5j · created 18:37" — the few fields that tell items apart. */
+function summarize(item: unknown, field: string) {
+  if (!item || typeof item !== "object") return String(item).slice(0, 80);
+  const record = item as Record<string, unknown>;
+  const parts: string[] = [];
+  const own = field.split(".").reduce<unknown>((value, key) => (value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined), record);
+  if (own !== undefined) parts.push(`${field} ${String(own)}`);
+  for (const key of ["code", "status", "created_at", "createdAt", "date", "name", "title"]) {
+    const value = record[key];
+    if (value === undefined || key === field) continue;
+    const text = typeof value === "object" && value ? String((value as Record<string, unknown>).date ?? JSON.stringify(value)) : String(value);
+    parts.push(`${key} ${text.slice(0, 30)}`);
+    if (parts.length >= 4) break;
+  }
+  return parts.join(" · ");
+}
+
+function itemMeets(item: unknown, field: string, op: "equals" | "in", other: string) {
+  const own = field.split(".").reduce<unknown>((value, key) => (value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined), item);
+  if (own === undefined || own === null || typeof own === "object") return false;
+  const text = String(own);
+  return op === "equals" ? text === other : text.length >= 3 && other.includes(text);
 }

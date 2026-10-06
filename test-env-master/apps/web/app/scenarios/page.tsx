@@ -24,6 +24,7 @@ import {
 import { CurlImportDialog } from "@/components/scenarios/curl-import-dialog";
 import { DatabaseStepDialog } from "@/components/scenarios/database-step-dialog";
 import { UiRecordDialog } from "@/components/scenarios/ui-step";
+import type { ListPickHelp } from "@/components/scenarios/list-pick-editor";
 import type { ConnectorChoice } from "@/components/scenarios/database-step-form";
 import type { ManualChoice } from "@/components/scenarios/manual-recovery";
 import { RequestFlow } from "@/components/scenarios/request-flow";
@@ -353,6 +354,23 @@ export default function ScenariosPage() {
     dismiss,
     autoMap: (stepId) => void autoMap(stepId),
     recordUi: (step) => setUiRecord({ step }),
+    listPickHelp: async (stepId, source) => {
+      if (!detail) throw new Error("No precondition");
+      return api<ListPickHelp>(`/scenarios/${detail.id}/list-pick/help`, {
+        method: "POST",
+        body: JSON.stringify({ consumerStepId: stepId, sourceStepId: source.stepId, path: source.path }),
+      });
+    },
+    saveBinding: async (stepId, binding) => {
+      try {
+        await saveBinding(stepId, binding);
+        await refresh();
+        toast.notify("success", t("listPick.saved"));
+      } catch (error) {
+        fail(error);
+        throw error;
+      }
+    },
     addAssertion: (step, path, value) =>
       guarded(async () => {
         if (!detail) return;

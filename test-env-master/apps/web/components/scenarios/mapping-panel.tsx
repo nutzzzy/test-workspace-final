@@ -9,10 +9,12 @@ import {
   type InputField,
   type MappingReview,
   type MappingStatus,
+  type ResponseSource,
   type StepBinding,
   type Suggestion,
 } from "@/components/scenarios/builder-types";
 import type { PickerRequest } from "@/components/scenarios/value-picker";
+import { ListPickEditor, pickPath, splitListPath, type ListPickHelp } from "@/components/scenarios/list-pick-editor";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -122,6 +124,8 @@ export function MappingPanel({
   onAccept,
   onDismiss,
   onAutoMap,
+  onListPickHelp,
+  onSaveBinding,
 }: {
   stepId: string;
   reviews: MappingReview[];
@@ -134,6 +138,9 @@ export function MappingPanel({
   onAccept: (suggestion: Suggestion) => void;
   onDismiss: (suggestion: Suggestion) => void;
   onAutoMap: () => void;
+  /** The list a mapping reads and conditions that recognise its item. */
+  onListPickHelp: (source: ResponseSource) => Promise<ListPickHelp>;
+  onSaveBinding: (binding: StepBinding) => Promise<void>;
 }) {
   const { t, n } = useI18n();
   const targetLabel = useTargetLabel(fields);
@@ -169,7 +176,7 @@ export function MappingPanel({
             const source = binding.source;
             const from = isResponseSource(source)
               ? source.path
-                ? t("builder.mapping.source", { n: n(review.sourceStep ?? stepNumber(source.stepId)), path: shortPath(source.path) })
+                ? t("builder.mapping.source", { n: n(review.sourceStep ?? stepNumber(source.stepId)), path: source.pick ? pickPath(source.path, source.pick) : shortPath(source.path) })
                 : t("builder.mapping.sourceExpected", { n: n(review.sourceStep ?? stepNumber(source.stepId)), key: source.expect?.key ?? "" })
               : `${t("builder.mapping.fixedValue")}: ${source.value}`;
             return (
@@ -210,6 +217,13 @@ export function MappingPanel({
                     </Button>
                   </span>
                 </div>
+                {isResponseSource(source) && source.path && splitListPath(source.path) ? (
+                  <ListPickEditor
+                    binding={{ ...binding, source }}
+                    load={() => onListPickHelp(source)}
+                    onSave={onSaveBinding}
+                  />
+                ) : null}
               </li>
             );
           })}

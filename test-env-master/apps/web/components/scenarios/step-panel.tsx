@@ -20,6 +20,8 @@ import {
 import type { ConnectorChoice } from "@/components/scenarios/database-step-form";
 import { ManualRecovery, type ManualChoice } from "@/components/scenarios/manual-recovery";
 import { MappingPanel } from "@/components/scenarios/mapping-panel";
+import type { ListPickHelp } from "@/components/scenarios/list-pick-editor";
+import type { ResponseSource } from "@/components/scenarios/builder-types";
 import { ResponseErrorCard } from "@/components/scenarios/response-error";
 import { UiActionsTab, UiResultTab, type EarlierValue, type UiOutput } from "@/components/scenarios/ui-step";
 import { RequestEditor, RequestView } from "@/components/scenarios/request-tab";
@@ -45,6 +47,10 @@ export type StepActions = {
   skipInput: () => Promise<void>;
   /** Detect and save the clear mappings of this step's unmapped fields. */
   autoMap: (stepId?: string) => void;
+  /** The list a mapping reads, and conditions that recognise its item. */
+  listPickHelp: (stepId: string, source: ResponseSource) => Promise<ListPickHelp>;
+  /** Save one mapping as it is (e.g. its list item choice). */
+  saveBinding: (stepId: string, binding: StepBinding) => Promise<void>;
   /** Record more actions into a UI step (or re-record it). */
   recordUi: (step: Step) => void;
 };
@@ -286,6 +292,8 @@ export function StepPanel({
             onAccept={actions.accept}
             onDismiss={actions.dismiss}
             onAutoMap={() => actions.autoMap(step.id)}
+            onListPickHelp={(source) => actions.listPickHelp(step.id, source)}
+            onSaveBinding={(binding) => actions.saveBinding(step.id, binding)}
           />
         ) : null}
 

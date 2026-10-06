@@ -1,3 +1,4 @@
+import { lookup } from "./auto-bind";
 import { AssertionExecutor } from "./executors/assertion.executor";
 import { ExtractVariableExecutor } from "./executors/extract-variable.executor";
 import { expectedStatuses as expectedStatusOf, HttpRequestExecutor } from "./executors/http-request.executor";
@@ -256,7 +257,22 @@ async function runHttpStep(
 
   const prepared = http.prepare(config, context);
   let bindings = readBindings(config);
-  const bound = applyBindings({ ...prepared.request, method: prepared.request.method ?? "GET" }, bindings, context.registry);
+  const bound = applyBindings({ ...prepared.request, method: prepared.request.method ?? "GET" }, bindings, context.registry, {
+    // The newest successful response of the source step, whole (a list item is chosen from all of it).
+    bodyOf: (source) =>
+      [...context.history].reverse().find((entry) => (source.stepId ? entry.stepId === source.stepId : entry.orderIndex === source.orderIndex))?.response.body,
+    fill: (template) => {
+      try {
+        return template.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (_match, key: string) => {
+          const value = lookup(key, context);
+          if (value === undefined) throw new Error(key);
+          return value;
+        });
+      } catch {
+        return undefined;
+      }
+    },
+  });
   const request = { ...prepared.request, ...bound.request };
   const consumed = [...prepared.consumed, ...bound.consumed];
   if (bound.missing.length > 0) {

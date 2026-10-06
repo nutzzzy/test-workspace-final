@@ -1,5 +1,8 @@
 import type { ConsumedVar } from "../auto-bind";
-import { setInput, type HttpRequestSpec, type InputAddress, type InputLocation } from "./request-inputs";
+import { z } from "zod";
+import { isDynamicSegment } from "../ui/replay-smarts";
+import { resolvePick, type ListPick } from "./list-pick";
+import { readInput, setInput, type HttpRequestSpec, type InputAddress, type InputLocation } from "./request-inputs";
 import { isTokenKey, normKey, type RegistryEntry, type ValueRegistry } from "./value-registry";
 
 /**
@@ -30,6 +33,8 @@ export type ResponseSource = {
   /** response.body.data.token · response.headers.x-request-id · "" while only `expect` is known. */
   path: string;
   expect?: ExpectedValue;
+  /** Which item of a list to read (by position or by a condition), instead of the fixed index in `path`. */
+  pick?: ListPick;
 };
 
 export type BindingSource = ResponseSource | { value: string };
@@ -76,11 +81,34 @@ export function isBinding(value: unknown): value is StepBinding {
   if (enabled !== undefined && typeof enabled !== "boolean") return false;
   if (!source || typeof source !== "object") return false;
   if ("value" in source) return typeof source.value === "string" && source.value.length <= 10_000;
-  const { path, expect } = source as Partial<ResponseSource>;
+  const { path, expect, pick } = source as Partial<ResponseSource>;
   if (typeof path !== "string" || path.length > 500) return false;
   if (expect !== undefined && !isExpected(expect)) return false;
+  if (pick !== undefined && !ListPickSchema.safeParse(pick).success) return false;
   return path.length > 0 || isExpected(expect);
 }
+
+const SourceRefSchema = z.object({
+  stepId: z.string().max(100).optional(),
+  stepName: z.string().max(300).optional(),
+  orderIndex: z.number().int().optional(),
+  path: z.string().min(1).max(500),
+});
+const ListPickSchema = z.object({
+  list: z.string().min(1).max(500),
+  item: z.string().max(300),
+  position: z.enum(["first", "last"]).optional(),
+  where: z
+    .array(
+      z.object({
+        field: z.string().min(1).max(300),
+        op: z.enum(["equals", "in"]),
+        value: z.union([z.object({ text: z.string().max(2000) }), z.object({ source: SourceRefSchema })]),
+      }),
+    )
+    .max(5)
+    .optional(),
+});
 
 export function readBindings(config: Record<string, unknown>): StepBinding[] {
   return Array.isArray(config.bindings) ? config.bindings.filter(isBinding) : [];
@@ -164,6 +192,8 @@ export function applyBindings(
   request: HttpRequestSpec,
   bindings: StepBinding[],
   registry: ValueRegistry,
+  /** Full responses of earlier steps (the registry keeps only part of a long list). */
+  bodies: { bodyOf: (source: ResponseSource) => unknown; fill: (template: string) => string | undefined } = { bodyOf: () => undefined, fill: () => undefined },
 ): {
   request: HttpRequestSpec;
   consumed: ConsumedVar[];
@@ -184,6 +214,25 @@ export function applyBindings(
       continue;
     }
     const source = binding.source;
+    if (source.pick) {
+      const picked = resolvePick(source.pick, bodies.bodyOf(source), registry, bodies.fill);
+      if (!picked.ok) {
+        missing.push({
+          target: location,
+          sourceStep: source.orderIndex !== undefined ? `Step ${source.orderIndex + 1}${source.stepName ? ` (${source.stepName})` : ""}` : (source.stepName ?? "step"),
+          path: picked.detail,
+          reason: picked.reason === "list_missing" ? "source_not_run" : "no_value",
+        });
+        continue;
+      }
+      next = setInput(next, binding.target, intoCurrent(readInput(next, binding.target), picked.value as string | number | boolean), { keepSourceType: true });
+      consumed.push({
+        variable: binding.target.key ?? binding.target.field,
+        location,
+        source: { stepId: source.stepId, stepName: source.stepName ?? "", orderIndex: source.orderIndex ?? -1, path: `response.body.${picked.path.replace(/^response\.body\.?/, "")}` },
+      });
+      continue;
+    }
     const found = resolveSource(source, registry);
     if (!found.ok) {
       missing.push({
@@ -196,7 +245,7 @@ export function applyBindings(
     }
     const entry = found.entry;
     if (!source.path || source.path !== entry.path) resolvedPaths.push({ target: binding.target, path: entry.path });
-    next = setInput(next, binding.target, entry.value, { keepSourceType: true });
+    next = setInput(next, binding.target, intoCurrent(readInput(next, binding.target), entry.value), { keepSourceType: true });
     consumed.push({
       variable: entry.semanticKey,
       location,
@@ -240,4 +289,31 @@ export function verifyBindings(
     };
   });
   return changed ? next : null;
+}
+
+/**
+ * A mapped id goes where the old id was. When the field holds a whole URL
+ * (Referer: https://host/order/69438) and the value is just the id, only the
+ * id part of the URL is replaced — not the URL with a bare number.
+ */
+export function intoCurrent(current: string | undefined, value: string | number | boolean): string | number | boolean {
+  if (current === undefined || (typeof value !== "string" && typeof value !== "number")) return value;
+  const text = String(value);
+  if (text.includes("/") || !/^(https?:\/\/|\/)/i.test(current.trim())) return value;
+  let url: URL;
+  try {
+    url = new URL(current.trim(), "http://relative.invalid");
+  } catch {
+    return value;
+  }
+  const segments = url.pathname.split("/");
+  for (let at = segments.length - 1; at >= 0; at -= 1) {
+    if (segments[at] && isDynamicSegment(segments[at]!)) {
+      segments[at] = encodeURIComponent(text);
+      url.pathname = segments.join("/");
+      const out = url.toString();
+      return current.trim().startsWith("/") ? out.replace(/^http:\/\/relative\.invalid/, "") : out;
+    }
+  }
+  return value;
 }
