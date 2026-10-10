@@ -23,6 +23,7 @@ import {
 } from "@/components/scenarios/builder-types";
 import { CurlImportDialog } from "@/components/scenarios/curl-import-dialog";
 import { DatabaseStepDialog } from "@/components/scenarios/database-step-dialog";
+import { ExportDialog } from "@/components/scenarios/export/export-dialog";
 import { UiRecordDialog } from "@/components/scenarios/ui-step";
 import type { ListPickHelp } from "@/components/scenarios/list-pick-editor";
 import type { ConnectorChoice } from "@/components/scenarios/database-step-form";
@@ -75,6 +76,7 @@ export default function ScenariosPage() {
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [dbStepOpen, setDbStepOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
   const [uiRecord, setUiRecord] = useState<{ step: Step | null; fromActionId?: string; mode?: "append" | "replace" | "part" } | null>(null);
   const [picker, setPicker] = useState<PickerRequest | null>(null);
   const [confirm, setConfirm] = useState<{ title: string; body: string; action: () => Promise<void> } | null>(null);
@@ -166,6 +168,7 @@ export default function ScenariosPage() {
     setDetail(null);
     setAnalysis(null);
     setSelectedStepId(null);
+    setExportOpen(false);
     setBusy(false);
     if (!selectedId) return;
     setDismissed(readDismissed(selectedId));
@@ -503,6 +506,7 @@ export default function ScenariosPage() {
                     if (run) await api(`/scenarios/runs/${run.id}/cancel`, { method: "POST", body: "{}" });
                   })
                 }
+                onExport={() => setExportOpen(true)}
                 onDuplicate={() =>
                   void guarded(async () => {
                     const copy = await api<Scenario>(`/scenarios/${detail.id}/duplicate`, { method: "POST", body: "{}" });
@@ -653,6 +657,8 @@ export default function ScenariosPage() {
           }}
         />
       ) : null}
+
+      {exportOpen && detail ? <ExportDialog scenarioId={detail.id} onClose={() => setExportOpen(false)} /> : null}
 
       {dbStepOpen && detail ? (
         <DatabaseStepDialog

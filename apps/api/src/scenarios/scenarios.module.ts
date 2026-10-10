@@ -8,11 +8,13 @@ import { UiSessionStore } from "../scenario-engine/ui/saved-sessions";
 import { UiSessionsController } from "./ui-sessions.controller";
 import { ScenariosController } from "./scenarios.controller";
 import { ScenariosService } from "./scenarios.service";
+import { PreconditionExportController } from "./export/precondition-export.controller";
+import { PreconditionExportService } from "./export/precondition-export.service";
 
 @Module({
   imports: [EnvironmentsModule, DatabaseConnectorsModule, AIModule],
-  controllers: [ScenariosController, UiSessionsController],
-  providers: [ScenariosService, ScenarioRunner, UiRecorderService, UiSessionStore],
+  controllers: [ScenariosController, UiSessionsController, PreconditionExportController],
+  providers: [ScenariosService, ScenarioRunner, UiRecorderService, UiSessionStore, PreconditionExportService],
   exports: [ScenariosService, ScenarioRunner],
 })
 export class ScenariosModule {}

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Copy, Play, RotateCcw, Sparkles, Square, Trash2 } from "lucide-react";
+import { Code2, Copy, Play, RotateCcw, Sparkles, Square, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Menu } from "@/components/ui/menu";
 import {
@@ -32,6 +32,7 @@ export function ScenarioOverview({
   onStop,
   onDuplicate,
   onDelete,
+  onExport,
 }: {
   scenario: Scenario;
   envs: Env[];
@@ -45,6 +46,8 @@ export function ScenarioOverview({
   onStop: () => void;
   onDuplicate: () => void;
   onDelete: () => void;
+  /** Open the export dialog (automation code for a test framework). */
+  onExport: () => void;
 }) {
   const { t, n, d, label, err } = useI18n();
   const [editingName, setEditingName] = useState(false);
@@ -135,6 +138,10 @@ export function ScenarioOverview({
               ))}
             </select>
           </label>
+          <Button variant="outline" disabled={steps.length === 0} title={t("builder.export.hint")} onClick={onExport}>
+            <Code2 className="h-3.5 w-3.5" />
+            {t("builder.export.button")}
+          </Button>
           {active ? (
             <Button variant="destructive" onClick={onStop}>
               <Square className="h-3.5 w-3.5" />

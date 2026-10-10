@@ -137,6 +137,15 @@ const EXACT: Record<string, string> = {
   "Invalid model name": "errors.invalidModel",
   "Write the guideline (up to 600 characters)": "errors.writeGuideline",
   "AI base URL must be a valid http(s) URL": "errors.aiBaseUrl",
+  "Unsupported framework": "errors.exportUnsupportedFramework",
+  "Unsupported language for this framework": "errors.exportUnsupportedLanguage",
+  "This precondition has no steps to export": "errors.exportNothing",
+  "No AI provider is available in this workspace": "errors.exportNoProvider",
+  "The selected AI provider is not available": "errors.exportProviderUnavailable",
+  "The AI provider did not answer in time": "errors.exportTimeout",
+  "The AI provider returned an empty answer": "errors.exportEmpty",
+  "The AI provider returned an invalid answer": "errors.exportInvalid",
+  "The AI provider's answer was cut off before the code was complete": "errors.exportCutOff",
 };
 
 const CURL_CODES = new Set(["missing_url", "unclosed_quote", "missing_value", "file_body", "bad_url"]);
@@ -243,6 +252,8 @@ export function localizeUserMessage(raw: string, t: Translate): string {
     [/^Jira issue (\S+) was not found/, "errors.jiraIssueMissing", "value"],
     [/^Jira returned an error \(HTTP (\d+)\)/, "errors.jiraHttp", "value"],
     [/^Invalid (?:test case field|test run|suite):\s*(.+)$/, "errors.invalidField", "value"],
+    [/^The generated code was rejected:\s*(.+)$/, "errors.exportRejected", "value"],
+    [/^Code generation failed:\s*(.+)$/, "errors.exportFailed", "value"],
   ];
   for (const [pattern, path, varName] of prefixed) {
     const match = text.match(pattern);
