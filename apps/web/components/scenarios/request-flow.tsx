@@ -1,6 +1,6 @@
 "use client";
 
-import { AlertTriangle, ArrowDown, ArrowUp, Copy, Link2, MonitorPlay, Play, Power, Trash2, Video } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, Copy, FileCode2, Link2, MonitorPlay, Play, Power, Smartphone, Trash2, Video } from "lucide-react";
 import { Menu } from "@/components/ui/menu";
 import {
   ACTIVE_RUN,
@@ -36,6 +36,8 @@ export function RequestFlow({
   onToggle,
   onDelete,
   onRerecord,
+  onRecordMobile,
+  onExport,
 }: {
   steps: Step[];
   run: ScenarioRun | null;
@@ -50,6 +52,10 @@ export function RequestFlow({
   onDelete: (step: Step) => void;
   /** Record a UI step again (all of it, or the part whose page changed). */
   onRerecord: (step: Step) => void;
+  /** Record a mobile step again through Appium. */
+  onRecordMobile: (step: Step) => void;
+  /** Export only this step as automation code. */
+  onExport: (step: Step) => void;
 }) {
   const { t, n, label } = useI18n();
 
@@ -71,11 +77,12 @@ export function RequestFlow({
         const broken = own.some((item) => NEEDS_REVIEW.includes(item.status));
         const http = step.type === "HTTP_REQUEST";
         const ui = step.type === "UI_FLOW";
+        const mobile = step.type === "MOBILE_FLOW";
         const { method, url } = httpSummary(step.config);
-        const uiCount = ui && Array.isArray(step.config.actions) ? step.config.actions.length : 0;
+        const uiCount = (ui || mobile) && Array.isArray(step.config.actions) ? step.config.actions.length : 0;
         const selected = selectedId === step.id;
         const failed = state === "FAILED" || state === "BLOCKED" || state === "NEEDS_INPUT";
-        const liveUi = ui && run?.live?.stepId === step.id && run.live.ui && ACTIVE_RUN.has(run.status) ? run.live.ui : null;
+        const liveUi = (ui || mobile) && run?.live?.stepId === step.id && run.live.ui && ACTIVE_RUN.has(run.status) ? run.live.ui : null;
         return (
           <li key={step.id} className="relative">
             <div
@@ -115,6 +122,11 @@ export function RequestFlow({
                         <MonitorPlay className="h-3 w-3" aria-hidden />
                         UI
                       </span>
+                    ) : mobile ? (
+                      <span className="inline-flex shrink-0 items-center gap-0.5 rounded border border-primary/40 px-1 text-[10px] font-semibold text-primary">
+                        <Smartphone className="h-3 w-3" aria-hidden />
+                        {t("mobileStep.badge")}
+                      </span>
                     ) : (
                       <span className="shrink-0 rounded border border-border px-1 text-[10px] text-muted-foreground">
                         {label("stepType", step.type)}
@@ -132,6 +144,14 @@ export function RequestFlow({
                     <span className="mt-0.5 flex min-w-0 gap-1.5 text-[10px] text-muted-foreground">
                       <span className="truncate font-mono" dir="ltr" title={String(step.config.startUrl ?? "")}>
                         {String(step.config.startUrl ?? "")}
+                      </span>
+                      <span className="shrink-0">· {t("uiStep.actionCount", { count: n(uiCount) })}</span>
+                    </span>
+                  ) : mobile ? (
+                    <span className="mt-0.5 flex min-w-0 gap-1.5 text-[10px] text-muted-foreground">
+                      <span className="shrink-0">{step.config.platform === "ios" ? t("mobileStep.ios") : t("mobileStep.android")}</span>
+                      <span className="truncate font-mono" dir="ltr" title={String(step.config.serverUrl ?? "")}>
+                        {String(step.config.serverUrl ?? "")}
                       </span>
                       <span className="shrink-0">· {t("uiStep.actionCount", { count: n(uiCount) })}</span>
                     </span>
@@ -171,6 +191,8 @@ export function RequestFlow({
                   items={[
                     { label: t("builder.flow.runUntil"), icon: <Play className="h-3.5 w-3.5" />, disabled: busy, onSelect: () => onRunUntil(step) },
                     ...(ui ? [{ label: t("builder.flow.rerecord"), icon: <Video className="h-3.5 w-3.5" />, disabled: busy, onSelect: () => onRerecord(step) }] : []),
+                    ...(mobile ? [{ label: t("builder.flow.rerecord"), icon: <Smartphone className="h-3.5 w-3.5" />, disabled: busy, onSelect: () => onRecordMobile(step) }] : []),
+                    { label: t("builder.flow.exportStep"), icon: <FileCode2 className="h-3.5 w-3.5" />, onSelect: () => onExport(step) },
                     { label: t("builder.flow.moveUp"), icon: <ArrowUp className="h-3.5 w-3.5" />, disabled: index === 0 || busy, onSelect: () => onMove(step, -1) },
                     {
                       label: t("builder.flow.moveDown"),

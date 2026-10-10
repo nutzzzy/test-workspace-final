@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, FileUp, Plus, Search, Wand2 } from "lucide-react";
+import { ChevronDown, FileUp, Plus, Search, Smartphone, Wand2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
@@ -25,6 +25,7 @@ import { CurlImportDialog } from "@/components/scenarios/curl-import-dialog";
 import { DatabaseStepDialog } from "@/components/scenarios/database-step-dialog";
 import { ExportDialog } from "@/components/scenarios/export/export-dialog";
 import { UiRecordDialog } from "@/components/scenarios/ui-step";
+import { MobileRecordDialog } from "@/components/scenarios/mobile-step";
 import type { ListPickHelp } from "@/components/scenarios/list-pick-editor";
 import type { ConnectorChoice } from "@/components/scenarios/database-step-form";
 import type { ManualChoice } from "@/components/scenarios/manual-recovery";
@@ -42,7 +43,7 @@ const TEMPLATES: Record<string, Record<string, unknown>> = {
   EXTRACT_VARIABLE: { variable: "name", path: "body.data.id" },
   CONDITION: { left: "{{status}}", op: "equals", right: "OK" },
 };
-const OTHER_TYPES = ["UI_FLOW", "ASSERTION", "DELAY", "DATABASE_ACTION", "SET_VARIABLE", "EXTRACT_VARIABLE", "CONDITION"];
+const OTHER_TYPES = ["UI_FLOW", "MOBILE_FLOW", "ASSERTION", "DELAY", "DATABASE_ACTION", "SET_VARIABLE", "EXTRACT_VARIABLE", "CONDITION"];
 const POLL_MS = 500;
 
 function readDismissed(scenarioId: string): string[] {
@@ -77,6 +78,10 @@ export default function ScenariosPage() {
   const [importOpen, setImportOpen] = useState(false);
   const [dbStepOpen, setDbStepOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  /** The step exported on its own (its own export dialog). */
+  const [exportStep, setExportStep] = useState<Step | null>(null);
+  /** A mobile (Appium) recording: into a new step, or into this mobile step. */
+  const [mobileRecord, setMobileRecord] = useState<{ step: Step | null } | null>(null);
   const [uiRecord, setUiRecord] = useState<{ step: Step | null; fromActionId?: string; mode?: "append" | "replace" | "part" } | null>(null);
   const [picker, setPicker] = useState<PickerRequest | null>(null);
   const [confirm, setConfirm] = useState<{ title: string; body: string; action: () => Promise<void> } | null>(null);
@@ -169,6 +174,8 @@ export default function ScenariosPage() {
     setAnalysis(null);
     setSelectedStepId(null);
     setExportOpen(false);
+    setExportStep(null);
+    setMobileRecord(null);
     setBusy(false);
     if (!selectedId) return;
     setDismissed(readDismissed(selectedId));
@@ -304,6 +311,11 @@ export default function ScenariosPage() {
       setUiRecord({ step: null });
       return;
     }
+    // A mobile step is recorded on a device through Appium first.
+    if (type === "MOBILE_FLOW") {
+      setMobileRecord({ step: null });
+      return;
+    }
     void guarded(() =>
       createStep(type, type === "HTTP_REQUEST" ? t("builder.flow.newRequestName") : label("stepType", type), TEMPLATES[type] ?? {}),
     );
@@ -357,6 +369,8 @@ export default function ScenariosPage() {
     dismiss,
     autoMap: (stepId) => void autoMap(stepId),
     recordUi: (step, fromActionId) => setUiRecord({ step, fromActionId }),
+    recordMobile: (step) => setMobileRecord({ step }),
+    exportStep: (step) => setExportStep(step),
     listPickHelp: async (stepId, source) => {
       if (!detail) throw new Error("No precondition");
       return api<ListPickHelp>(`/scenarios/${detail.id}/list-pick/help`, {
@@ -552,6 +566,10 @@ export default function ScenariosPage() {
                       <FileUp className="h-3.5 w-3.5" />
                       {t("builder.flow.importCurl")}
                     </Button>
+                    <Button size="sm" variant="outline" title={t("mobileStep.entryHint")} onClick={() => setMobileRecord({ step: null })}>
+                      <Smartphone className="h-3.5 w-3.5" />
+                      {t("mobileStep.entry")}
+                    </Button>
                     <Button size="sm" variant="outline" onClick={() => void addStep("HTTP_REQUEST")}>
                       <Plus className="h-3.5 w-3.5" />
                       {t("builder.flow.addRequest")}
@@ -576,6 +594,10 @@ export default function ScenariosPage() {
                       <Button variant="outline" onClick={() => void addStep("HTTP_REQUEST")}>
                         {t("builder.flow.addRequest")}
                       </Button>
+                      <Button variant="outline" title={t("mobileStep.entryHint")} onClick={() => setMobileRecord({ step: null })}>
+                        <Smartphone className="h-3.5 w-3.5" />
+                        {t("mobileStep.entry")}
+                      </Button>
                     </div>
                   </div>
                 ) : (
@@ -597,6 +619,8 @@ export default function ScenariosPage() {
                     onToggle={(step) => void actions.saveStep(step.id, { enabled: !step.enabled })}
                     onDelete={deleteStep}
                     onRerecord={(step) => setUiRecord({ step, mode: "replace" })}
+                    onRecordMobile={(step) => setMobileRecord({ step })}
+                    onExport={(step) => setExportStep(step)}
                   />
                 )}
               </section>
@@ -659,6 +683,23 @@ export default function ScenariosPage() {
       ) : null}
 
       {exportOpen && detail ? <ExportDialog scenarioId={detail.id} onClose={() => setExportOpen(false)} /> : null}
+
+      {exportStep && detail ? (
+        <ExportDialog key={exportStep.id} scenarioId={detail.id} step={{ id: exportStep.id, name: exportStep.name }} onClose={() => setExportStep(null)} />
+      ) : null}
+
+      {mobileRecord && detail ? (
+        <MobileRecordDialog
+          scenarioId={detail.id}
+          step={mobileRecord.step}
+          onClose={() => setMobileRecord(null)}
+          onSaved={async (saved) => {
+            toast.notify("success", t("mobileStep.saved"));
+            await refresh();
+            setSelectedStepId(saved.id);
+          }}
+        />
+      ) : null}
 
       {dbStepOpen && detail ? (
         <DatabaseStepDialog

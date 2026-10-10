@@ -51,8 +51,37 @@ export type ExportUiAction = {
   files?: string[];
 };
 
+/** One way to find a mobile element: an Appium locator strategy and its value, used verbatim. */
+export type ExportMobileLocator = { using: string; value: string };
+
+export type ExportMobileAction = {
+  /** tap | type | clear | longPress | swipe | back | assertText | assertVisible | waitForElement */
+  do: string;
+  label?: string;
+  /** Typed text or expected text; `{{name}}` is a variable. */
+  value?: string;
+  /** The typed value is secret: read it from this environment variable. */
+  secretEnv?: string;
+  /** Ways to find the element, most reliable first. */
+  locators?: ExportMobileLocator[];
+  /** Swipe direction (up moves the content up). */
+  direction?: string;
+  optional?: boolean;
+};
+
 export type ExportStep =
   | { type: "ui"; name: string; startUrl: string; newSession?: boolean; actions: ExportUiAction[] }
+  | {
+      type: "mobile";
+      name: string;
+      platform: "android" | "ios";
+      /** Appium server URL (credentials removed). */
+      server: string;
+      /** Appium capabilities as recorded (secret values masked). */
+      capabilities: Record<string, unknown>;
+      newSession?: boolean;
+      actions: ExportMobileAction[];
+    }
   | {
       type: "http";
       name: string;
@@ -84,8 +113,34 @@ export type ExportContext = {
   steps: ExportStep[];
   /** `{{variables}}` the steps use that no step produces (environment / configuration values). */
   variables: string[];
-  metadata: { environment?: string; stopOnFailure: boolean; disabledStepsLeftOut?: number };
+  metadata: {
+    environment?: string;
+    stopOnFailure: boolean;
+    disabledStepsLeftOut?: number;
+    /** Steps the chosen framework cannot drive (a browser framework and a mobile step, or the reverse), left out of the code. */
+    leftOut?: Array<{ step: string; reason: string }>;
+  };
+  /** Set when one step is exported on its own: which step, and what the caller must provide. */
+  scope?: ExportScope;
 };
+
+/** A single-step export: the step's place in the precondition and the values it needs from earlier steps or configuration. */
+export type ExportScope = {
+  kind: "step";
+  step: string;
+  /** The precondition the step belongs to. */
+  precondition: string;
+  /** 1-based position of the step in the precondition. */
+  position: number;
+  total: number;
+  /** `{{variables}}` the step reads: parameters of the exported function. */
+  inputs: string[];
+  /** An earlier step of the same kind leaves the browser or app session this step continues in. */
+  continuesSession?: boolean;
+};
+
+/** What a UI step drives: a browser page or a mobile app (through Appium). */
+export type ExportSurface = "web" | "mobile";
 
 // ── registry ─────────────────────────────────────────────────────────────
 
@@ -135,6 +190,8 @@ export type ExportFramework = {
    * client), so code for a precondition without UI steps need not use it.
    */
   browserOnly?: boolean;
+  /** The UI steps it can drive (default: browser pages). Steps of another kind are left out of its code. */
+  drives?: ExportSurface[];
 };
 
 /** The precondition's name in the shapes file and class names need. */
@@ -161,6 +218,7 @@ function robotKeywords(names: string[]): RegExp {
 export const PLAYWRIGHT: ExportFramework = {
   id: "playwright",
   label: "Playwright",
+  drives: ["web"],
   actionCalls: /\.(?:goto|click|dblclick|fill|check|uncheck|setChecked|selectOption|select_option|press|hover|setInputFiles|set_input_files)\(/g,
   instructions: [
     "Use Playwright Test. Locators: getByTestId, getByRole(role, { name }), getByLabel, getByPlaceholder, getByText; page.locator(css) only when no other locator is given.",
@@ -218,6 +276,7 @@ export const PLAYWRIGHT: ExportFramework = {
 export const SELENIUM: ExportFramework = {
   id: "selenium",
   label: "Selenium",
+  drives: ["web"],
   browserOnly: true,
   actionCalls: /\b(?:driver|browser)\.get\(|\.(?:click|send_keys|sendKeys|select_by_visible_text|selectByVisibleText|select_by_value|selectByValue|move_to_element|moveToElement)\(/g,
   instructions: [
@@ -286,6 +345,7 @@ export const SELENIUM: ExportFramework = {
 export const CYPRESS: ExportFramework = {
   id: "cypress",
   label: "Cypress",
+  drives: ["web"],
   actionCalls: /\bcy\.visit\(|\.(?:click|dblclick|type|check|uncheck|select|trigger|selectFile)\(/g,
   instructions: [
     "Use Cypress with built-in commands only (no plugins): cy.visit, cy.get, cy.contains, cy.request, cy.url, cy.location, .within, .should. describe, it and cy are globals: do not import them.",
@@ -314,8 +374,77 @@ export const CYPRESS: ExportFramework = {
   ],
 };
 
+const APPIUM_CALL = /\.(?:click|sendKeys|send_keys|setValue|addValue)\(|\bdriver\.(?:navigate\(\)\.)?back\(|['"]mobile:\s*(?:longClickGesture|swipeGesture|touchAndHold|swipe)['"]/g;
+
+export const APPIUM: ExportFramework = {
+  id: "appium",
+  label: "Appium",
+  drives: ["mobile"],
+  browserOnly: true,
+  actionCalls: APPIUM_CALL,
+  instructions: [
+    "Use Appium 2 (W3C protocol). Each mobile step gives the server and the capabilities: start a session with exactly those capabilities (secret values from environment variables), reuse the previous mobile step's session when the server and capabilities are the same and newSession is not set, and quit every session at the end.",
+    "Mobile locators are {\"using\": strategy, \"value\": …}; use the strategy and value verbatim: accessibility id, id (resource id), -android uiautomator, -ios predicate string, -ios class chain, xpath, class name. The first is the preferred one; use the others only through one small helper that tries them in order when the first finds nothing.",
+    "Wait explicitly for each element (until it is displayed) before acting. tap: click. type: clear, then send the keys. clear: clear. longPress: mobile: longClickGesture on Android, mobile: touchAndHold on iOS. swipe: mobile: swipeGesture on Android, mobile: swipe on iOS, in the given direction. back: the driver's back. assertText: the element's text contains the value. assertVisible and waitForElement: the element is displayed.",
+    "HTTP steps: the language's standard HTTP client, not the driver. No browser APIs (no page, cy, or driver.get of a URL).",
+  ].join("\n"),
+  languages: [
+    {
+      id: "java",
+      filename: (name) => `${name.pascal}Test.java`,
+      instructions:
+        "Java with JUnit 5 and the Appium java-client 9 (io.appium.java_client: AndroidDriver / IOSDriver, AppiumBy, UiAutomator2Options / XCUITestOptions or DesiredCapabilities with the given capabilities). One public class named by the file name with one @Test method; create the driver in @BeforeEach and quit it in @AfterEach. Waits: WebDriverWait. HTTP steps: java.net.http.HttpClient. Environment values: System.getenv.",
+      signature: [/io\.appium\.java_client/],
+    },
+    {
+      id: "python",
+      filename: (name) => `${name.snake}_test.py`,
+      instructions:
+        "Python with pytest and Appium-Python-Client 3+ (from appium import webdriver; from appium.options.common import AppiumOptions or the platform options class; from appium.webdriver.common.appiumby import AppiumBy; WebDriverWait). A driver fixture that quits at the end; one def test_… function. HTTP steps: requests. Environment values: os.environ.",
+      signature: [/from\s+appium\b|import\s+appium\b/],
+    },
+    {
+      id: "javascript",
+      filename: (name) => `${name.kebab}.test.js`,
+      instructions:
+        "JavaScript (no type annotations) with mocha (describe/it) and WebdriverIO in standalone mode: const { remote } = require('webdriverio'); remote({ hostname, port, path, capabilities }). Selectors: '~<accessibility id>', 'id=<resource id>' via driver.$(`id=…`) or driver.findElement('id', …), 'android=<uiautomator>', '-ios predicate string:<predicate>', '-ios class chain:<chain>', xpath as is. Waits: waitForDisplayed. HTTP steps: fetch. Environment values: process.env. deleteSession in after().",
+      signature: [/\bwebdriverio\b/],
+    },
+    {
+      id: "typescript",
+      filename: (name) => `${name.kebab}.test.ts`,
+      instructions:
+        "TypeScript with mocha (describe/it) and WebdriverIO in standalone mode: import { remote } from 'webdriverio'; remote({ hostname, port, path, capabilities }). Selectors: '~<accessibility id>', 'android=<uiautomator>', '-ios predicate string:<predicate>', '-ios class chain:<chain>', xpath as is; resource ids with driver.findElement('id', …). Waits: waitForDisplayed. HTTP steps: fetch. Environment values: process.env. deleteSession in after().",
+      signature: [/\bwebdriverio\b/],
+    },
+    {
+      id: "robot",
+      filename: (name) => `${name.snake}.robot`,
+      instructions: ROBOT_RULES,
+      frameworkInstructions: [
+        "Use AppiumLibrary: Library    AppiumLibrary. Not SeleniumLibrary or the Browser library.",
+        "Open Application    <server>    platformName=<Android|iOS>    then every capability as name=value (appium: prefix kept); Close Application in [Teardown].",
+        "Locators: accessibility_id=…, id=…, android=<uiautomator>, predicate=<ios predicate>, chain=<ios class chain>, xpath=…, class=… — the given value verbatim.",
+        "Actions: Wait Until Element Is Visible before each, then Click Element, Input Text (Input Password    <locator>    %{NAME} for secrets), Clear Text, Long Press, Swipe By Percent (directions as percentages), Go Back. Checks: Element Should Contain Text, Element Should Be Visible.",
+      ].join("\n"),
+      actionCalls: robotKeywords(["Click Element", "Click Text", "Tap", "Input Text", "Input Password", "Input Value", "Long Press", "Swipe", "Swipe By Percent", "Go Back"]),
+      browserOnly: true,
+      signature: [/^\s*Library(?:\s{2,}|\t)AppiumLibrary\b/m],
+      foreign: [
+        { pattern: /^\s*Library(?:\s{2,}|\t)SeleniumLibrary\b/m, api: "SeleniumLibrary" },
+        { pattern: /^\s*Library(?:\s{2,}|\t)Browser\b/m, api: "the Browser library (Playwright)" },
+      ],
+    },
+  ],
+  foreign: [
+    { pattern: /@playwright\/test|playwright\.sync_api|\bpage\.(?:goto|getByRole|getByTestId|get_by_role)\(/, api: "Playwright" },
+    { pattern: CYPRESS_COMMAND, api: "Cypress" },
+    { pattern: /selenium-webdriver/, api: "selenium-webdriver (browser)" },
+  ],
+};
+
 /** Every export target, in the order the export dialog lists them. Register new frameworks here. */
-export const EXPORT_FRAMEWORKS: readonly ExportFramework[] = [PLAYWRIGHT, SELENIUM, CYPRESS];
+export const EXPORT_FRAMEWORKS: readonly ExportFramework[] = [PLAYWRIGHT, SELENIUM, CYPRESS, APPIUM];
 
 export function findExportFramework(id: string): ExportFramework | undefined {
   return EXPORT_FRAMEWORKS.find((item) => item.id === id);
@@ -330,19 +459,69 @@ export type ExportFrameworkOption = {
   id: string;
   label: string;
   languages: Array<{ id: ExportLanguageId; label: string; filename: string }>;
+  /** False when the framework cannot drive any UI step of the precondition (absent: it can). */
+  available?: boolean;
+  /** Why it is not available: "mobileOnly" (its UI steps are mobile) or "noMobileSteps". */
+  unavailableReason?: ExportUnavailableReason;
 };
 
-export function exportFrameworkOptions(preconditionName: string): ExportFrameworkOption[] {
+export type ExportUnavailableReason = "mobileOnly" | "noMobileSteps";
+
+/** The kinds of UI steps a precondition (or one step) has. */
+export function exportSurfaces(steps: Array<{ type: string }>): Set<ExportSurface> {
+  const out = new Set<ExportSurface>();
+  for (const step of steps) {
+    if (step.type === "ui") out.add("web");
+    if (step.type === "mobile") out.add("mobile");
+  }
+  return out;
+}
+
+/**
+ * Whether the framework can export these steps: it drives at least one of
+ * their UI kinds — or, without UI steps, it is not a mobile-only framework
+ * (HTTP and database steps are plain code in any browser framework).
+ */
+export function frameworkAvailability(framework: ExportFramework, surfaces: Set<ExportSurface>): { available: boolean; reason?: ExportUnavailableReason } {
+  const drives = framework.drives ?? ["web"];
+  if (surfaces.size === 0) return drives.includes("web") ? { available: true } : { available: false, reason: "noMobileSteps" };
+  if (drives.some((surface) => surfaces.has(surface))) return { available: true };
+  return { available: false, reason: surfaces.has("mobile") ? "mobileOnly" : "noMobileSteps" };
+}
+
+/**
+ * The context as one framework exports it: UI steps it cannot drive are left
+ * out (and listed in metadata.leftOut), the rest is unchanged.
+ */
+export function contextForFramework(context: ExportContext, framework: ExportFramework): ExportContext {
+  const leftOut: Array<{ step: string; reason: string }> = [];
+  const steps = context.steps.filter((step) => {
+    const surface = step.type === "ui" ? "web" : step.type === "mobile" ? "mobile" : null;
+    if (!surface || (framework.drives ?? ["web"]).includes(surface)) return true;
+    leftOut.push({ step: step.name, reason: surface === "mobile" ? `${framework.label} cannot drive a mobile app` : `${framework.label} cannot drive a browser` });
+    return false;
+  });
+  if (!leftOut.length) return context;
+  return { ...context, steps, metadata: { ...context.metadata, leftOut } };
+}
+
+/** `surfaces`: the UI kinds of what is exported; when given, every framework says whether it can export them. */
+export function exportFrameworkOptions(preconditionName: string, surfaces?: Set<ExportSurface>): ExportFrameworkOption[] {
   const name = exportName(preconditionName);
-  return EXPORT_FRAMEWORKS.map((framework) => ({
-    id: framework.id,
-    label: framework.label,
-    languages: framework.languages.map((language) => ({
-      id: language.id,
-      label: EXPORT_LANGUAGE_LABELS[language.id],
-      filename: language.filename(name),
-    })),
-  }));
+  return EXPORT_FRAMEWORKS.map((framework) => {
+    const availability = surfaces ? frameworkAvailability(framework, surfaces) : null;
+    return {
+      id: framework.id,
+      label: framework.label,
+      languages: framework.languages.map((language) => ({
+        id: language.id,
+        label: EXPORT_LANGUAGE_LABELS[language.id],
+        filename: language.filename(name),
+      })),
+      ...(availability ? { available: availability.available } : {}),
+      ...(availability?.reason ? { unavailableReason: availability.reason } : {}),
+    };
+  });
 }
 
 /** File and class names from the precondition's name; "precondition" when it has no Latin letters or digits. */
@@ -394,6 +573,13 @@ const COMMON_RULES = [
 
 const DATABASE_RULE = "Database steps: call a small helper with the SQL kept verbatim, declared at the end of the file with a TODO for the connection.";
 
+/** A single step exported on its own: a reusable piece, not a whole test. These rules override the test-structure rules. */
+const STEP_RULES = [
+  "Export only the one step named in scope: write one reusable function named after the step (Robot Framework: one keyword in *** Keywords ***, no *** Test Cases ***; Java: a public class named by the file name holding one public static method) that performs exactly this step.",
+  "The caller provides the framework's page / driver / request object (do not create, open, close or quit browsers, apps or sessions; Cypress uses the global cy), every value in scope.inputs and every value the step `uses` from an earlier step, as parameters. Start the file with one comment that lists what the caller must provide.",
+  "No test case, fixture, setup or teardown. Keep the framework's usual import line (even when only a type or expect is used) and nothing unused.",
+].join("\n");
+
 /** System and user messages for one export: common rules, the framework's and language's rules, the precondition. */
 export function buildExportPrompt(context: ExportContext, framework: ExportFramework, language: ExportLanguage): { system: string; prompt: string } {
   const name = exportName(context.name);
@@ -403,6 +589,7 @@ export function buildExportPrompt(context: ExportContext, framework: ExportFrame
     context.steps.some((step) => step.type === "db") ? `${COMMON_RULES}\n${DATABASE_RULE}` : COMMON_RULES,
     language.frameworkInstructions ?? framework.instructions,
     language.instructions,
+    ...(context.scope ? [STEP_RULES] : []),
   ].join("\n\n");
   const prompt = [
     `Framework: ${framework.label}. Language: ${EXPORT_LANGUAGE_LABELS[language.id]}. File: ${language.filename(name)}.`,
@@ -450,6 +637,11 @@ export function exportAnchors(context: ExportContext): string[] {
         else if (["fill", "assertText", "waitForText", "assertUrl", "select"].includes(action.do) && !action.secretEnv) add(action.option ?? action.value);
         add(action.locators?.find((locator) => locator.testid)?.testid);
       }
+    } else if (step.type === "mobile") {
+      for (const action of step.actions) {
+        if ((action.do === "type" || action.do === "assertText") && !action.secretEnv) add(action.value);
+        add(action.locators?.find((locator) => locator.using === "accessibility id" || locator.using === "id")?.value);
+      }
     } else if (step.type === "http") {
       const bound = Object.keys(step.uses ?? {}).map((key) => /^path "(.*)"$/.exec(key)?.[1]).filter((item): item is string => Boolean(item));
       addUrl(step.url, bound);
@@ -461,13 +653,16 @@ export function exportAnchors(context: ExportContext): string[] {
 }
 
 const BROWSER_ACTIONS = new Set(["navigate", "click", "fill", "select", "check", "uncheck", "press", "hover", "upload"]);
+/** Mobile actions counted against the code (clearing is left out: typing usually clears first). */
+const MOBILE_ACTIONS = new Set(["tap", "type", "longPress", "swipe", "back"]);
 
-/** Browser actions the precondition performs: each UI step's start URL and its interactive actions. */
+/** UI actions the precondition performs: each UI step's start URL and its interactive actions, and each mobile step's interactive actions. */
 export function exportBrowserActions(context: ExportContext): number {
-  return context.steps.reduce(
-    (count, step) => count + (step.type === "ui" ? 1 + step.actions.filter((action) => BROWSER_ACTIONS.has(action.do)).length : 0),
-    0,
-  );
+  return context.steps.reduce((count, step) => {
+    if (step.type === "ui") return count + 1 + step.actions.filter((action) => BROWSER_ACTIONS.has(action.do)).length;
+    if (step.type === "mobile") return count + step.actions.filter((action) => MOBILE_ACTIONS.has(action.do)).length;
+    return count;
+  }, 0);
 }
 
 const SECRET_PATTERNS: Array<{ pattern: RegExp; kind: string }> = [
@@ -505,6 +700,8 @@ export function validateExportCode(input: {
   hasUiSteps?: boolean;
   /** Recorded browser actions (opening each UI step's start URL included); the code should perform as many. */
   browserActions?: number;
+  /** "step": one step exported as a reusable function (no test case required). */
+  mode?: "full" | "step";
 }): ExportValidation {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -526,7 +723,9 @@ export function validateExportCode(input: {
   for (const item of [...framework.foreign, ...(language.foreign ?? [])]) {
     if (item.pattern.test(comments)) errors.push(`The code uses ${item.api} APIs instead of ${framework.label}`);
   }
-  const foreignLanguage = LANGUAGE_CHECKS[language.id].find((check) => check.pattern.test(comments));
+  // A single step is a keyword file: it has no test case section.
+  const languageChecks = LANGUAGE_CHECKS[language.id].filter((check) => !(input.mode === "step" && check.why === NO_TEST_CASES));
+  const foreignLanguage = languageChecks.find((check) => check.pattern.test(comments));
   if (foreignLanguage) errors.push(`The code is not ${EXPORT_LANGUAGE_LABELS[language.id]}: ${foreignLanguage.why}`);
 
   const known = (input.secrets ?? []).filter((value) => value.length >= 4);
@@ -565,6 +764,8 @@ export function validateExportCode(input: {
   return { ok: errors.length === 0, code, errors, warnings: [...new Set(warnings)] };
 }
 
+const NO_TEST_CASES = "no *** Test Cases *** section";
+
 /** Code that cannot be the chosen language. */
 const LANGUAGE_CHECKS: Record<ExportLanguageId, Array<{ pattern: RegExp; why: string }>> = {
   typescript: [
@@ -590,7 +791,7 @@ const LANGUAGE_CHECKS: Record<ExportLanguageId, Array<{ pattern: RegExp; why: st
     { pattern: /^\s*from\s+[\w.]+\s+import\s+/m, why: "Python import" },
   ],
   robot: [
-    { pattern: /^(?![\s\S]*\*\*\*\s*Test Cases?\s*\*\*\*)/i, why: "no *** Test Cases *** section" },
+    { pattern: /^(?![\s\S]*\*\*\*\s*Test Cases?\s*\*\*\*)/i, why: NO_TEST_CASES },
     { pattern: /^\s*(?:def|class)\s+\w+.*:\s*$|^\s*(?:from\s+[\w.]+\s+)?import\s+\w/m, why: "Python code" },
     { pattern: /^\s*(?:const|let|var)\s+\w|=>\s*[{(]/m, why: "JavaScript syntax" },
     { pattern: /\bpublic\s+(?:class|void|static)\b/, why: "Java syntax" },

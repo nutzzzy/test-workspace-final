@@ -75,8 +75,11 @@ describe("PreconditionExportService.options", () => {
   it("lists frameworks with file names and the workspace's AI connections, the automation default first", async () => {
     const { service } = setup();
     const options = await service.options("sc1");
-    expect(options.frameworks.map((item) => item.id)).toEqual(["playwright", "selenium", "cypress"]);
+    // Appium is listed but cannot export a browser precondition.
+    expect(options.frameworks.map((item) => [item.id, item.available])).toEqual([["playwright", true], ["selenium", true], ["cypress", true], ["appium", false]]);
+    expect(options.step).toBeNull();
     expect(options.frameworks[0]!.languages[0]).toEqual({ id: "typescript", label: "TypeScript", filename: "login-flow.spec.ts" });
+    expect(options.frameworks[3]!.unavailableReason).toBe("noMobileSteps");
     expect(options.providers.map((item) => item.id)).toEqual(["claude", "openai", "gemini"]);
     expect(options.providers[2]).toEqual({ id: "gemini", name: "Gemini", model: "gemini-pro", usable: false, blockedReason: "external_not_allowed" });
     expect(options.defaultProviderId).toBe("claude");
@@ -195,5 +198,134 @@ describe("PreconditionExportService.generate", () => {
     expect(result.message).toMatch(/^The generated code was rejected: /);
     const cypress = setup({ call: jest.fn().mockResolvedValue({ data: { code: CODE.playwright }, origin: { connectionId: "claude", name: "Claude", model: "m" } }) });
     expect((await failure(cypress.service.generate("sc1", { framework: "cypress", language: "typescript" }))).message).toMatch(/Playwright APIs/);
+  });
+});
+
+// ── Appium and single-step export ───────────────────────────────────────
+
+const mobileStep = {
+  id: "m1",
+  name: "Open cart on Android",
+  type: "MOBILE_FLOW",
+  orderIndex: 1,
+  enabled: true,
+  config: {
+    platform: "android",
+    serverUrl: "http://user:key@127.0.0.1:4723",
+    capabilities: { "appium:appPackage": "com.shop.app", "appium:accessKey": "s3cr3t-key" },
+    actions: [
+      {
+        id: "t1",
+        kind: "tap",
+        target: {
+          candidates: [
+            { using: "xpath", value: "(//android.widget.Button)[3]", score: 0.14, unique: true },
+            { using: "accessibility id", value: "Cart", score: 0.95, unique: true },
+          ],
+          fingerprint: { tag: "android.widget.Button", name: "Cart" },
+        },
+      },
+      { id: "t2", kind: "assertText", value: "Your cart", target: { candidates: [{ using: "id", value: "com.shop.app:id/title", score: 0.9, unique: true }], fingerprint: { tag: "android.widget.TextView" } } },
+    ],
+  },
+};
+
+const APPIUM_PY = `import os
+from appium import webdriver
+from appium.options.common import AppiumOptions
+from appium.webdriver.common.appiumby import AppiumBy
+
+
+def test_open_cart(driver):
+    driver.find_element(AppiumBy.ACCESSIBILITY_ID, "Cart").click()
+    assert "Your cart" in driver.find_element(AppiumBy.ID, "com.shop.app:id/title").text
+`;
+
+const PLAYWRIGHT_STEP = `import { Page, expect } from '@playwright/test';\n// The caller provides: page (signed out, any page).\nexport async function signIn(page: Page) {\n  await page.goto('https://app.test/login');\n  await page.getByLabel('Email').fill('sara@example.com');\n  await page.getByTestId('login-submit').click();\n  await expect(page.getByText('Welcome back')).toBeVisible();\n}\n`;
+
+describe("PreconditionExportService with mobile steps", () => {
+  const mobileOnly = { ...scenario, name: "Cart", steps: [{ ...mobileStep, orderIndex: 0 }] };
+
+  it("offers only Appium for a mobile precondition", async () => {
+    const { service, prisma } = setup();
+    prisma.scenario.findUnique.mockResolvedValue(mobileOnly);
+    const options = await service.options("sc1");
+    expect(options.frameworks.filter((item) => item.available).map((item) => item.id)).toEqual(["appium"]);
+    expect(options.frameworks.find((item) => item.id === "playwright")!.unavailableReason).toBe("mobileOnly");
+  });
+
+  it("exports Appium code: locators ranked, credentials and secret capabilities kept out of the prompt", async () => {
+    const call = jest.fn().mockResolvedValue({ data: { code: APPIUM_PY, warnings: [] }, origin: { connectionId: "claude", name: "Claude", model: "m" } });
+    const { service, prisma } = setup({ call });
+    prisma.scenario.findUnique.mockResolvedValue(mobileOnly);
+    const result = await service.generate("sc1", { framework: "appium", language: "python" });
+    const { system, prompt } = call.mock.calls[0][1];
+    expect(system).toMatch(/Appium tests in Python/);
+    expect(prompt).toContain('"type":"mobile"');
+    expect(prompt).toContain('"server":"http://127.0.0.1:4723"');
+    expect(prompt).not.toContain("user:key");
+    expect(prompt).not.toContain("s3cr3t-key");
+    // The stable accessibility id comes before the positional XPath, though the XPath was recorded first.
+    expect(prompt.indexOf('"value":"Cart"')).toBeLessThan(prompt.indexOf("(//android.widget.Button)[3]"));
+    expect(result).toMatchObject({ framework: "appium", language: "python", filename: "cart_test.py", warnings: [] });
+  });
+
+  it("refuses a browser framework for a mobile-only precondition, before calling the AI", async () => {
+    const { service, prisma, call } = setup();
+    prisma.scenario.findUnique.mockResolvedValue(mobileOnly);
+    expect(await failure(service.generate("sc1", { framework: "playwright", language: "typescript" }))).toEqual({ status: 400, message: EXPORT_ERRORS.frameworkCannotExport });
+    expect(call).not.toHaveBeenCalled();
+  });
+
+  it("leaves the mobile step out of browser code for a mixed precondition, and says so", async () => {
+    const { service, prisma, call } = setup();
+    prisma.scenario.findUnique.mockResolvedValue({ ...scenario, steps: [...scenario.steps, mobileStep] });
+    const result = await service.generate("sc1", { framework: "playwright", language: "typescript" });
+    expect(call.mock.calls[0][1].prompt).not.toContain('"type":"mobile"');
+    expect(result.warnings).toContain('Step "Open cart on Android" was left out: Playwright cannot drive a mobile app.');
+  });
+});
+
+describe("PreconditionExportService single-step export", () => {
+  it("lists frameworks for that step, named after it", async () => {
+    const { service, prisma } = setup();
+    prisma.scenario.findUnique.mockResolvedValue({ ...scenario, steps: [...scenario.steps, mobileStep] });
+    const web = await service.options("sc1", "s1");
+    expect(web.step).toEqual({ id: "s1", name: "Sign in", type: "UI_FLOW" });
+    expect(web.frameworks.find((item) => item.id === "appium")!.available).toBe(false);
+    expect(web.frameworks[0]!.languages[0]!.filename).toBe("sign-in.spec.ts");
+    const mobile = await service.options("sc1", "m1");
+    expect(mobile.frameworks.filter((item) => item.available).map((item) => item.id)).toEqual(["appium"]);
+    await expect(service.options("sc1", "missing")).rejects.toThrow(EXPORT_ERRORS.stepNotFound);
+  });
+
+  it("exports one web step as a reusable function, with the step rules and its scope", async () => {
+    const call = jest.fn().mockResolvedValue({ data: { code: PLAYWRIGHT_STEP, warnings: [] }, origin: { connectionId: "claude", name: "Claude", model: "m" } });
+    const { service, prisma } = setup({ call });
+    prisma.scenario.findUnique.mockResolvedValue({ ...scenario, steps: [...scenario.steps, mobileStep] });
+    const result = await service.generate("sc1", { framework: "playwright", language: "typescript", stepId: "s1" });
+    const { system, prompt } = call.mock.calls[0][1];
+    expect(system).toMatch(/Export only the one step named in scope/);
+    expect(prompt).toContain('"scope":{"kind":"step","step":"Sign in","precondition":"Login flow","position":1,"total":2');
+    expect(prompt).not.toContain("Open cart on Android");
+    expect(result).toMatchObject({ filename: "sign-in.spec.ts", warnings: [] });
+  });
+
+  it("exports one mobile step with Appium and reports an unknown step", async () => {
+    const call = jest.fn().mockResolvedValue({ data: { code: APPIUM_PY, warnings: [] }, origin: { connectionId: "claude", name: "Claude", model: "m" } });
+    const { service, prisma } = setup({ call });
+    prisma.scenario.findUnique.mockResolvedValue({ ...scenario, steps: [...scenario.steps, mobileStep] });
+    const result = await service.generate("sc1", { framework: "appium", language: "python", stepId: "m1" });
+    expect(call.mock.calls[0][1].prompt).toContain('"scope":{"kind":"step","step":"Open cart on Android"');
+    expect(result.filename).toBe("open_cart_on_android_test.py");
+    expect(await failure(service.generate("sc1", { framework: "appium", language: "python", stepId: "nope" }))).toEqual({ status: 404, message: EXPORT_ERRORS.stepNotFound });
+  });
+
+  it("a whole-precondition export is unchanged by step export (no scope, no step rules)", async () => {
+    const { service, call } = setup();
+    await service.generate("sc1", { framework: "playwright", language: "typescript" });
+    const { system, prompt } = call.mock.calls[0][1];
+    expect(system).not.toMatch(/Export only the one step/);
+    expect(prompt).not.toContain('"scope"');
   });
 });

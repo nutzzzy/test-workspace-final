@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  APPIUM,
   CYPRESS,
   EXPORT_FRAMEWORKS,
   PLAYWRIGHT,
   SELENIUM,
   buildExportPrompt,
+  contextForFramework,
   exportAnchors,
   exportBrowserActions,
   exportFrameworkOptions,
   exportName,
+  exportSurfaces,
   findExportFramework,
+  frameworkAvailability,
   findExportLanguage,
   validateExportCode,
   type ExportContext,
@@ -123,8 +127,9 @@ Login flow
 const anchors = exportAnchors(context);
 
 describe("export registry", () => {
-  it("lists Playwright, Selenium and Cypress with only implemented languages", () => {
-    assert.deepEqual(EXPORT_FRAMEWORKS.map((item) => item.id), ["playwright", "selenium", "cypress"]);
+  it("lists Playwright, Selenium, Cypress and Appium with only implemented languages", () => {
+    assert.deepEqual(EXPORT_FRAMEWORKS.map((item) => item.id), ["playwright", "selenium", "cypress", "appium"]);
+    assert.deepEqual(APPIUM.languages.map((item) => item.id), ["java", "python", "javascript", "typescript", "robot"]);
     assert.deepEqual(PLAYWRIGHT.languages.map((item) => item.id), ["typescript", "javascript", "python", "robot"]);
     assert.deepEqual(SELENIUM.languages.map((item) => item.id), ["java", "python", "javascript", "typescript", "robot"]);
     assert.deepEqual(CYPRESS.languages.map((item) => item.id), ["typescript", "javascript"]);
@@ -356,5 +361,180 @@ describe("validateExportCode", () => {
       steps: [{ type: "http", name: "Cancel", method: "POST", url: "https://api.test/bpms/28647645/cancel", uses: { 'path "28647645"': 'step "Add" response.body.result.id' } }],
     };
     assert.deepEqual(exportAnchors(withMappedId), ["/bpms/"]);
+  });
+});
+
+// ── Appium, framework availability and single-step export ───────────────
+
+const mobileContext: ExportContext = {
+  preconditionId: "sc2",
+  name: "App login",
+  steps: [
+    {
+      type: "mobile",
+      name: "Sign in on Android",
+      platform: "android",
+      server: "http://127.0.0.1:4723",
+      capabilities: { platformName: "Android", "appium:automationName": "UiAutomator2", "appium:appPackage": "com.shop.app" },
+      actions: [
+        { do: "type", value: "sara@example.com", locators: [{ using: "id", value: "com.shop.app:id/email" }] },
+        { do: "type", secretEnv: "PASSWORD", locators: [{ using: "id", value: "com.shop.app:id/password" }] },
+        { do: "tap", locators: [{ using: "accessibility id", value: "Sign in" }, { using: "xpath", value: '//android.widget.Button[@text="Sign in"]' }] },
+        { do: "assertText", value: "Welcome", locators: [{ using: "id", value: "com.shop.app:id/title" }] },
+      ],
+    },
+  ],
+  variables: [],
+  metadata: { stopOnFailure: true },
+};
+
+const APPIUM_JAVA = `import io.appium.java_client.AppiumBy;
+import io.appium.java_client.android.AndroidDriver;
+import io.appium.java_client.android.options.UiAutomator2Options;
+import org.junit.jupiter.api.*;
+import java.net.URL;
+
+public class AppLoginTest {
+  private AndroidDriver driver;
+
+  @BeforeEach
+  void setUp() throws Exception {
+    UiAutomator2Options options = new UiAutomator2Options().setAppPackage("com.shop.app");
+    driver = new AndroidDriver(new URL("http://127.0.0.1:4723"), options);
+  }
+
+  @Test
+  void appLogin() {
+    // Sign in on Android
+    driver.findElement(AppiumBy.id("com.shop.app:id/email")).sendKeys("sara@example.com");
+    driver.findElement(AppiumBy.id("com.shop.app:id/password")).sendKeys(System.getenv("PASSWORD"));
+    driver.findElement(AppiumBy.accessibilityId("Sign in")).click();
+    Assertions.assertTrue(driver.findElement(AppiumBy.id("com.shop.app:id/title")).getText().contains("Welcome"));
+  }
+
+  @AfterEach
+  void tearDown() {
+    driver.quit();
+  }
+}
+`;
+
+const APPIUM_ROBOT_KEYWORD = `*** Settings ***
+Library    AppiumLibrary
+
+*** Keywords ***
+Sign In On Android
+    # The caller opens the application (Open Application) and provides %{PASSWORD}.
+    Input Text    id=com.shop.app:id/email    sara@example.com
+    Input Password    id=com.shop.app:id/password    %{PASSWORD}
+    Click Element    accessibility_id=Sign in
+    Element Should Contain Text    id=com.shop.app:id/title    Welcome
+`;
+
+describe("framework availability", () => {
+  const web = exportSurfaces(context.steps);
+  const mobile = exportSurfaces(mobileContext.steps);
+  const none = exportSurfaces([{ type: "http" }]);
+  const mixed = exportSurfaces([...context.steps, ...mobileContext.steps]);
+
+  it("offers browser frameworks for web and HTTP-only preconditions, Appium only for mobile ones", () => {
+    assert.deepEqual(frameworkAvailability(PLAYWRIGHT, web), { available: true });
+    assert.deepEqual(frameworkAvailability(APPIUM, web), { available: false, reason: "noMobileSteps" });
+    assert.deepEqual(frameworkAvailability(SELENIUM, none), { available: true });
+    assert.deepEqual(frameworkAvailability(APPIUM, none), { available: false, reason: "noMobileSteps" });
+    assert.deepEqual(frameworkAvailability(APPIUM, mobile), { available: true });
+    assert.deepEqual(frameworkAvailability(CYPRESS, mobile), { available: false, reason: "mobileOnly" });
+    assert.equal(frameworkAvailability(PLAYWRIGHT, mixed).available, true);
+    assert.equal(frameworkAvailability(APPIUM, mixed).available, true);
+  });
+
+  it("lists availability only when asked, so existing callers see the same options", () => {
+    const plain = exportFrameworkOptions("Login flow").find((item) => item.id === "playwright")!;
+    assert.deepEqual(Object.keys(plain).sort(), ["id", "label", "languages"]);
+    const mobileOptions = exportFrameworkOptions("App login", mobile);
+    assert.deepEqual(
+      mobileOptions.map((item) => [item.id, item.available, item.unavailableReason]),
+      [["playwright", false, "mobileOnly"], ["selenium", false, "mobileOnly"], ["cypress", false, "mobileOnly"], ["appium", true, undefined]],
+    );
+    assert.equal(mobileOptions.find((item) => item.id === "appium")!.languages.find((item) => item.id === "java")!.filename, "AppLoginTest.java");
+  });
+
+  it("leaves out the UI steps a framework cannot drive, and says so", () => {
+    const both: ExportContext = { ...context, steps: [...context.steps, ...mobileContext.steps] };
+    const forPlaywright = contextForFramework(both, PLAYWRIGHT);
+    assert.deepEqual(forPlaywright.steps.map((step) => step.type), ["ui"]);
+    assert.deepEqual(forPlaywright.metadata.leftOut, [{ step: "Sign in on Android", reason: "Playwright cannot drive a mobile app" }]);
+    const forAppium = contextForFramework(both, APPIUM);
+    assert.deepEqual(forAppium.steps.map((step) => step.type), ["mobile"]);
+    assert.equal(contextForFramework(context, PLAYWRIGHT), context, "nothing left out: the same context");
+  });
+});
+
+describe("Appium export", () => {
+  it("sends Appium rules, not browser rules", () => {
+    const { system, prompt } = buildExportPrompt(mobileContext, APPIUM, lang(APPIUM, "java"));
+    assert.match(system, /Appium tests in Java/);
+    assert.match(system, /io\.appium\.java_client/);
+    assert.match(system, /accessibility id, id \(resource id\), -android uiautomator/);
+    assert.doesNotMatch(system, /Playwright Test|getByTestId|cy\.visit/);
+    assert.match(prompt, /File: AppLoginTest\.java/);
+    const robot = buildExportPrompt(mobileContext, APPIUM, lang(APPIUM, "robot")).system;
+    assert.match(robot, /Library {4}AppiumLibrary/);
+    assert.doesNotMatch(robot, /SeleniumLibrary\.|Library {4}Browser\b(?! library)/);
+  });
+
+  it("accepts Appium Java code of the precondition and counts its mobile actions", () => {
+    const result = validateExportCode({
+      code: APPIUM_JAVA,
+      framework: APPIUM,
+      language: lang(APPIUM, "java"),
+      anchors: exportAnchors(mobileContext),
+      browserActions: exportBrowserActions(mobileContext),
+    });
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.ok, true);
+    assert.equal(exportBrowserActions(mobileContext), 3);
+    assert.ok(!result.warnings.some((warning) => /browser actions/.test(warning)), result.warnings.join("; "));
+  });
+
+  it("anchors mobile steps by typed and expected values and stable ids, not secrets", () => {
+    const found = exportAnchors(mobileContext);
+    assert.ok(found.includes("sara@example.com"));
+    assert.ok(found.includes("Welcome"));
+    assert.ok(found.includes("com.shop.app:id/email"));
+    assert.ok(found.includes("Sign in"));
+    assert.ok(!found.some((anchor) => anchor.includes("PASSWORD")));
+  });
+
+  it("rejects browser code for Appium and Appium code for a browser framework", () => {
+    const playwrightForAppium = validateExportCode({ code: PLAYWRIGHT_TS, framework: APPIUM, language: lang(APPIUM, "typescript") });
+    assert.equal(playwrightForAppium.ok, false);
+    assert.ok(playwrightForAppium.errors.some((error) => /does not use Appium/.test(error)));
+    assert.ok(playwrightForAppium.errors.some((error) => /uses Playwright APIs/.test(error)));
+    assert.equal(validateExportCode({ code: APPIUM_JAVA, framework: PLAYWRIGHT, language: lang(PLAYWRIGHT, "typescript") }).ok, false);
+  });
+});
+
+describe("single-step export", () => {
+  const stepContext: ExportContext = {
+    ...mobileContext,
+    scope: { kind: "step", step: "Sign in on Android", precondition: "App login", position: 2, total: 3, inputs: ["PASSWORD"], continuesSession: true },
+  };
+
+  it("adds the step rules only when one step is exported", () => {
+    const full = buildExportPrompt(context, PLAYWRIGHT, lang(PLAYWRIGHT, "typescript")).system;
+    assert.doesNotMatch(full, /Export only the one step/);
+    const step = buildExportPrompt(stepContext, APPIUM, lang(APPIUM, "robot"));
+    assert.match(step.system, /Export only the one step named in scope/);
+    assert.match(step.system, /do not create, open, close or quit/);
+    assert.ok(step.prompt.includes('"scope":{"kind":"step"'));
+  });
+
+  it("accepts a Robot keyword file for one step, but not as a whole precondition", () => {
+    const language = lang(APPIUM, "robot");
+    assert.equal(validateExportCode({ code: APPIUM_ROBOT_KEYWORD, framework: APPIUM, language, mode: "step" }).ok, true);
+    const full = validateExportCode({ code: APPIUM_ROBOT_KEYWORD, framework: APPIUM, language });
+    assert.equal(full.ok, false);
+    assert.ok(full.errors.some((error) => /Test Cases/.test(error)));
   });
 });

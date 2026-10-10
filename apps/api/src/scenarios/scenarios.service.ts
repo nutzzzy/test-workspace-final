@@ -13,6 +13,8 @@ import { encryptSecret, resolveEncryptionKey } from "../common/crypto.util";
 import { UiRecorderService } from "../scenario-engine/ui/ui-recorder.service";
 import { UiSessionStore } from "../scenario-engine/ui/saved-sessions";
 import { publicUiConfig, readUiConfig, sealUiConfig } from "../scenario-engine/ui/ui-types";
+import { MOBILE_STEP_TYPE, publicMobileConfig, sealMobileConfig } from "../scenario-engine/mobile/mobile-types";
+import { MobileRecorderService } from "../scenario-engine/mobile/mobile-recorder.service";
 import { describeSeed, seedFromContext } from "../scenario-engine/ui/browser-session";
 import { SESSION_KEY, uiSessionState } from "../scenario-engine/executors/ui-flow.executor";
 import type { PrepareRecording, RecordRange } from "../scenario-engine/ui/ui-recorder.service";
@@ -65,9 +67,11 @@ export type ImportItem =
     }
   | { index: number; ok: false; code: string; preview: string };
 
-/** A step as the client sees it: secret values typed in UI steps are never sent back. */
+/** A step as the client sees it: secret values typed in UI and mobile steps are never sent back. */
 export function publicStep<T extends { type: string; config: unknown }>(step: T): T {
-  return step.type === "UI_FLOW" ? { ...step, config: publicUiConfig(asRecord(step.config)) as T["config"] } : step;
+  if (step.type === "UI_FLOW") return { ...step, config: publicUiConfig(asRecord(step.config)) as T["config"] };
+  if (step.type === MOBILE_STEP_TYPE) return { ...step, config: publicMobileConfig(asRecord(step.config)) as T["config"] };
+  return step;
 }
 
 export function publicScenario<T extends { steps: Array<{ type: string; config: unknown }> }>(scenario: T): T {
@@ -83,6 +87,7 @@ export class ScenariosService {
     private readonly recorder: UiRecorderService,
     private readonly config: ConfigService,
     private readonly savedSessions: UiSessionStore,
+    private readonly mobileRecorder: MobileRecorderService,
   ) {}
 
   private encrypt = (plain: string) => encryptSecret(plain, resolveEncryptionKey(this.config.get<string>("SECRETS_ENCRYPTION_KEY")));
@@ -94,6 +99,60 @@ export class ScenariosService {
     } catch (error) {
       throw new BadRequestException(error instanceof Error ? error.message : "Invalid UI step");
     }
+  }
+
+  /** A mobile step's config with typed secrets encrypted (the current ones kept when not retyped). */
+  private sealMobile(config: Record<string, unknown>, current: Record<string, unknown> | null) {
+    try {
+      return sealMobileConfig(config, current, this.encrypt);
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : "Invalid mobile step");
+    }
+  }
+
+  // ── Mobile (Appium) recording ─────────────────────────────────────────
+
+  /** Connect to Appium for a recording: into a new mobile step, or into the mobile step it is started from. */
+  async startMobileRecording(scenarioId: string, body: { stepId?: unknown; platform?: unknown; serverUrl?: unknown; capabilities?: unknown }) {
+    const scenario = await this.prisma.scenario.findUnique({ where: { id: scenarioId }, include: { steps: true } });
+    if (!scenario) throw new NotFoundException("Scenario not found");
+    const stepId = typeof body.stepId === "string" && body.stepId ? body.stepId : null;
+    if (stepId && !scenario.steps.some((item) => item.id === stepId && item.type === MOBILE_STEP_TYPE)) throw new NotFoundException("Step not found");
+    return this.mobileRecorder.start({ scenarioId, stepId, platform: body.platform, serverUrl: body.serverUrl, capabilities: body.capabilities });
+  }
+
+  /**
+   * Save a finished mobile recording: a new mobile step at the end, or —
+   * when it was started from a mobile step — appended to its actions or
+   * replacing them (the device settings recorded with are kept on the step).
+   */
+  async saveMobileRecording(id: string, body: { name?: unknown; mode?: unknown }) {
+    const recording = this.mobileRecorder.take(id);
+    if (recording.actions.length === 0) throw new BadRequestException("Nothing was recorded");
+    const device = { platform: recording.platform, serverUrl: recording.serverUrl, capabilities: recording.capabilities };
+    if (recording.stepId) {
+      const current = await this.prisma.scenarioStep.findUnique({ where: { id: recording.stepId } });
+      if (current) {
+        const config = asRecord(current.config);
+        const existing = Array.isArray(config.actions) ? (config.actions as unknown[]) : [];
+        const replace = body.mode === "replace";
+        const next = { ...config, ...device, actions: replace ? recording.actions : [...existing, ...recording.actions] };
+        return this.prisma.scenarioStep.update({ where: { id: current.id }, data: { config: this.sealMobile(next, config) as Prisma.InputJsonValue } });
+      }
+    }
+    const app = String(recording.capabilities["appium:appPackage"] ?? recording.capabilities.appPackage ?? recording.capabilities["appium:bundleId"] ?? recording.capabilities.bundleId ?? "");
+    const fallback = `Mobile · ${recording.platform === "ios" ? "iOS" : "Android"}${app ? ` · ${app}` : ""}`;
+    const name = typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, 120) : fallback.slice(0, 120);
+    return this.prisma.scenarioStep.create({
+      data: {
+        scenarioId: recording.scenarioId,
+        name,
+        type: MOBILE_STEP_TYPE,
+        orderIndex: await this.nextOrderIndex(recording.scenarioId),
+        enabled: true,
+        config: this.sealMobile({ ...device, actions: recording.actions }, null) as Prisma.InputJsonValue,
+      },
+    });
   }
 
   // ── UI recording ──────────────────────────────────────────────────────
@@ -360,6 +419,7 @@ export class ScenariosService {
     }
     if (input.type === "HTTP_REQUEST") assertMappings(input.config);
     if (input.type === "UI_FLOW") input = { ...input, config: this.sealUi({ startUrl: "", actions: [], ...(input.config ?? {}) }, null) };
+    if (input.type === MOBILE_STEP_TYPE) input = { ...input, config: this.sealMobile({ actions: [], capabilities: {}, ...(input.config ?? {}) }, null) };
     return this.prisma.scenarioStep.create({
       data: {
         scenarioId,
@@ -388,6 +448,7 @@ export class ScenariosService {
       }
       if (current?.type === "HTTP_REQUEST") assertMappings(data.config);
       if (current?.type === "UI_FLOW") data = { ...data, config: this.sealUi(data.config, asRecord(current.config)) };
+      if (current?.type === MOBILE_STEP_TYPE) data = { ...data, config: this.sealMobile(data.config!, asRecord(current.config)) };
     }
     return this.prisma.scenarioStep.update({
       where: { id: stepId },

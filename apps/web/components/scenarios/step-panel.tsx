@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { CheckSquare, Forward, Play, X } from "lucide-react";
+import { CheckSquare, FileCode2, Forward, Play, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AttemptHistory } from "@/components/scenarios/attempt-history";
 import {
@@ -25,6 +25,7 @@ import type { ListPickHelp } from "@/components/scenarios/list-pick-editor";
 import type { ResponseSource } from "@/components/scenarios/builder-types";
 import { ResponseErrorCard } from "@/components/scenarios/response-error";
 import { UiActionsTab, UiLiveProgressView, UiResultTab, type EarlierValue, type UiOutput } from "@/components/scenarios/ui-step";
+import { MobileActionsTab } from "@/components/scenarios/mobile-step";
 import { RequestEditor, RequestView } from "@/components/scenarios/request-tab";
 import { ResponseExplorer } from "@/components/scenarios/response-explorer";
 import { AssertionsTab, StepSettings } from "@/components/scenarios/step-settings";
@@ -54,6 +55,10 @@ export type StepActions = {
   saveBinding: (stepId: string, binding: StepBinding) => Promise<void>;
   /** Record more actions into a UI step (or re-record it, or only part of it from one action). */
   recordUi: (step: Step, fromActionId?: string) => void;
+  /** Record more actions into a mobile step through Appium. */
+  recordMobile: (step: Step) => void;
+  /** Export only this step as automation code. */
+  exportStep: (step: Step) => void;
 };
 
 /** Focused details of one step: request, response, mappings, assertions, attempts, advanced settings. */
@@ -83,6 +88,9 @@ export function StepPanel({
   const { t, n, err, label } = useI18n();
   const http = step.type === "HTTP_REQUEST";
   const ui = step.type === "UI_FLOW";
+  const mobile = step.type === "MOBILE_FLOW";
+  /** Steps recorded as actions (browser or app): actions, result, settings. */
+  const recorded = ui || mobile;
   const index = steps.findIndex((item) => item.id === step.id);
   const stepRun = stepRunOf(step, run);
   const output = outputOf(stepRun);
@@ -100,7 +108,7 @@ export function StepPanel({
   }
   const stepNumber = (id: string | undefined) => steps.findIndex((item) => item.id === id) + 1;
 
-  const defaultTab: Tab = ui ? (stepRun ? "result" : "actions") : !http ? "settings" : output?.blocked?.length || broken ? "mapping" : "request";
+  const defaultTab: Tab = recorded ? (stepRun ? "result" : "actions") : !http ? "settings" : output?.blocked?.length || broken ? "mapping" : "request";
   const [tab, setTab] = useState<Tab>(defaultTab);
   const [editing, setEditing] = useState(false);
   const tabs: Array<{ id: Tab; badge?: string; warn?: boolean }> = http
@@ -112,7 +120,7 @@ export function StepPanel({
         { id: "attempts", badge: attempts ? n(attempts) : undefined },
         { id: "settings" },
       ]
-    : ui
+    : recorded
       ? [{ id: "actions", badge: n(((step.config.actions as unknown[]) ?? []).length) }, { id: "result" }, { id: "settings" }]
       : [{ id: "response" }, { id: "settings" }];
 
@@ -144,7 +152,11 @@ export function StepPanel({
           </span>
           {typeof output?.status === "number" ? <span className="font-mono text-xs text-muted-foreground">HTTP {output.status}</span> : null}
           {stepRun?.durationMs ? <span className="text-xs text-muted-foreground">{t("builder.flow.ms", { value: n(stepRun.durationMs) })}</span> : null}
-          <Button size="sm" variant="outline" className="ms-auto" disabled={busy} onClick={() => actions.runUntil(step)}>
+          <Button size="sm" variant="outline" className="ms-auto" title={t("builder.export.stepHint")} onClick={() => actions.exportStep(step)}>
+            <FileCode2 className="h-3.5 w-3.5" />
+            {t("builder.export.stepButton")}
+          </Button>
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => actions.runUntil(step)}>
             <Play className="h-3.5 w-3.5" />
             {t("builder.panel.runUntil")}
           </Button>
@@ -156,7 +168,7 @@ export function StepPanel({
         ) : null}
       </header>
 
-      {ui && run?.live?.stepId === step.id && run.live.ui && ACTIVE_RUN.has(run.status) ? (
+      {recorded && run?.live?.stepId === step.id && run.live.ui && ACTIVE_RUN.has(run.status) ? (
         <div className="border-b border-border p-3">
           <UiLiveProgressView progress={run.live.ui} />
         </div>
@@ -343,7 +355,16 @@ export function StepPanel({
           />
         ) : null}
 
-        {tab === "result" && ui ? <UiResultTab output={stepRun ? (output as UiOutput | null) : null} error={stepRun?.error} /> : null}
+        {tab === "actions" && mobile ? (
+          <MobileActionsTab
+            key={`${step.id}:${JSON.stringify(step.config).length}`}
+            step={step}
+            onSave={(config) => actions.saveStep(step.id, { config })}
+            onRecordMore={() => actions.recordMobile(step)}
+          />
+        ) : null}
+
+        {tab === "result" && recorded ? <UiResultTab output={stepRun ? (output as UiOutput | null) : null} error={stepRun?.error} /> : null}
 
         {tab === "settings" ? (
           <StepSettings

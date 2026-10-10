@@ -235,3 +235,86 @@ describe("locators", () => {
     expect(ui.actions[0]!.locators).toEqual([{ css: "div > div > div > span" }]);
   });
 });
+
+describe("buildExportContext with mobile steps", () => {
+  const mobile = {
+    id: "m1",
+    name: "Pay in app",
+    type: "MOBILE_FLOW",
+    orderIndex: 5,
+    enabled: true,
+    config: {
+      platform: "ios",
+      serverUrl: "https://alice:hub-key@hub.example.com/wd/hub",
+      capabilities: { "appium:bundleId": "com.shop", "bstack:options": { userName: "alice", accessKey: "k-123456" } },
+      actions: [
+        {
+          id: "p1",
+          kind: "type",
+          secret: true,
+          valueEnc: "v1:enc",
+          target: { candidates: [{ using: "accessibility id", value: "pin", score: 0.95, unique: true }], fingerprint: { tag: "XCUIElementTypeSecureTextField", accessibilityId: "pin" } },
+        },
+        {
+          id: "p2",
+          kind: "tap",
+          target: {
+            candidates: [
+              { using: "-ios predicate string", value: 'label == "Pay"', score: 0.3, unique: false, matches: 2 },
+              { using: "accessibility id", value: "pay-button", score: 0.95, unique: true },
+              { using: "xpath", value: "(//XCUIElementTypeButton)[4]", score: 0.14, unique: true },
+            ],
+            fingerprint: { tag: "XCUIElementTypeButton", name: "Pay" },
+            learned: 2,
+          },
+        },
+        { id: "p3", kind: "swipe", direction: "down" },
+      ],
+    },
+  };
+  const withMobile: ExportSource = { ...source, steps: [...source.steps, mobile] };
+
+  it("exports the device, the capabilities without credentials, and the actions in order", () => {
+    const step = buildExportContext(withMobile).steps.find((item) => item.type === "mobile");
+    if (step?.type !== "mobile") throw new Error("expected a mobile step");
+    expect(step.platform).toBe("ios");
+    expect(step.server).toBe("https://hub.example.com/wd/hub");
+    expect(step.capabilities).toEqual({ "appium:bundleId": "com.shop", "bstack:options": { userName: "alice", accessKey: "***" } });
+    expect(step.actions.map((action) => action.do)).toEqual(["type", "tap", "swipe"]);
+    expect(step.actions[0]).toEqual({ do: "type", secretEnv: "PIN", locators: [{ using: "accessibility id", value: "pin" }] });
+    expect(step.actions[2]).toEqual({ do: "swipe", direction: "down" });
+  });
+
+  it("puts the locator that worked last first, then unique ones by rank, and drops one that matched several elements", () => {
+    const step = buildExportContext(withMobile).steps.find((item) => item.type === "mobile");
+    if (step?.type !== "mobile") throw new Error("expected a mobile step");
+    expect(step.actions[1]!.locators).toEqual([
+      { using: "xpath", value: "(//XCUIElementTypeButton)[4]" },
+      { using: "accessibility id", value: "pay-button" },
+    ]);
+  });
+});
+
+describe("buildExportContext for one step", () => {
+  it("exports only that step, named after it, with its place, inputs and session", () => {
+    const later = { ...loginStep, id: "s9", name: "Sign in again", orderIndex: 9 };
+    const context = buildExportContext({ ...source, steps: [...source.steps, later] }, new Map(), { stepId: "s9" });
+    expect(context.name).toBe("Sign in again");
+    expect(context.steps.map((step) => step.name)).toEqual(["Sign in again"]);
+    expect(context.scope).toEqual({ kind: "step", step: "Sign in again", precondition: "Edit user", position: 5, total: 5, inputs: ["PASSWORD"], continuesSession: true });
+    expect(context.metadata).toEqual({ environment: "QA", stopOnFailure: true });
+  });
+
+  it("lists the variables an HTTP step needs and exports a disabled step when it is chosen", () => {
+    const http = buildExportContext(source, new Map(), { stepId: "s2" });
+    expect(http.scope).toMatchObject({ step: "Get user", position: 2, inputs: ["base_url", "userId"] });
+    expect(http.scope?.continuesSession).toBeUndefined();
+    const disabled = buildExportContext(source, new Map(), { stepId: "s3" });
+    expect(disabled.steps).toEqual([{ type: "delay", name: "Disabled", ms: 500 }]);
+  });
+
+  it("does not change the whole-precondition context", () => {
+    expect(buildExportContext(source).scope).toBeUndefined();
+    expect(() => buildExportContext(source, new Map(), { stepId: "nope" })).toThrow("Step not found");
+  });
+});

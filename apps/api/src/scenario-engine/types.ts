@@ -33,7 +33,7 @@ export type StepExecutionResult = {
   responseError?: ResponseError;
   /** UI step: values for later steps (cookies, storage, URL); not stored as such. */
   uiProduced?: UiProduced;
-  /** UI step: locators that worked better than the remembered ones. */
+  /** UI or mobile step: locators that worked better than the remembered ones. */
   uiLearned?: UiLearning[];
   /** UI step: where the app keeps its token (learned when it was found there). */
   uiLearnedStorage?: StorageSeed;
@@ -62,9 +62,9 @@ export type HttpExchange = {
 /** One action of a UI step as the live view shows it while the step runs. */
 export type UiLiveAction = { id: string; kind: string; label: string; status: "pending" | "running" | "passed" | "failed" | "skipped" };
 
-/** Where a running UI step is: preparing the browser, or on action `current` of `total`. */
+/** Where a running UI or mobile step is: preparing the browser (or connecting to Appium), or on action `current` of `total`. */
 export type UiLiveProgress = {
-  phase: "starting" | "signingIn" | "opening" | "actions" | "finishing";
+  phase: "starting" | "signingIn" | "opening" | "connecting" | "actions" | "finishing";
   /** 1-based position of the running action (0 before the first). */
   current: number;
   total: number;

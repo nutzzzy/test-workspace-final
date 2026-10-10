@@ -1,12 +1,15 @@
 import { BadRequestException, HttpException, HttpStatus, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import {
   buildExportPrompt,
+  contextForFramework,
   exportAnchors,
   exportBrowserActions,
   exportFrameworkOptions,
   exportName,
+  exportSurfaces,
   findExportFramework,
   findExportLanguage,
+  frameworkAvailability,
   validateExportCode,
   type ExportFrameworkOption,
   type ExportResult,
@@ -21,6 +24,8 @@ export const EXPORT_ERRORS = {
   unsupportedFramework: "Unsupported framework",
   unsupportedLanguage: "Unsupported language for this framework",
   nothingToExport: "This precondition has no steps to export",
+  frameworkCannotExport: "This framework cannot drive the steps being exported",
+  stepNotFound: "Step not found",
   noProvider: "No AI provider is available in this workspace",
   providerUnavailable: "The selected AI provider is not available",
   timeout: "The AI provider did not answer in time",
@@ -39,12 +44,15 @@ const AnswerSchema = z.object({
 
 export type ExportOptions = {
   frameworks: ExportFrameworkOption[];
+  /** Set when one step is exported. */
+  step: { id: string; name: string; type: string } | null;
   providers: Array<Pick<ConnectionView, "id" | "name" | "model" | "usable" | "blockedReason">>;
   /** The connection an export uses when none is chosen (the automation stage's first). */
   defaultProviderId: string | null;
 };
 
-export type ExportRequest = { framework?: unknown; language?: unknown; providerId?: unknown };
+/** `stepId`: export that one step instead of the whole precondition. */
+export type ExportRequest = { framework?: unknown; language?: unknown; providerId?: unknown; stepId?: unknown };
 
 /**
  * Precondition → automation code. One AI request per export, through the
@@ -59,12 +67,20 @@ export class PreconditionExportService {
     private readonly ai: AIService,
   ) {}
 
-  async options(scenarioId: string): Promise<ExportOptions> {
-    const scenario = await this.prisma.scenario.findUnique({ where: { id: scenarioId }, select: { name: true } });
+  /** Frameworks (with whether each can drive what is exported), languages, file names and AI connections. */
+  async options(scenarioId: string, stepId?: string): Promise<ExportOptions> {
+    const scenario = await this.prisma.scenario.findUnique({
+      where: { id: scenarioId },
+      select: { id: true, name: true, description: true, stopOnFailure: true, steps: { orderBy: { orderIndex: "asc" } } },
+    });
     if (!scenario) throw new NotFoundException("Scenario not found");
+    const step = stepId ? scenario.steps.find((item) => item.id === stepId) : undefined;
+    if (stepId && !step) throw new NotFoundException(EXPORT_ERRORS.stepNotFound);
+    const context = buildExportContext(scenario, new Map(), { stepId });
     const [connections, chain] = await Promise.all([this.ai.listConnections(), this.ai.chainFor("automation")]);
     return {
-      frameworks: exportFrameworkOptions(scenario.name),
+      frameworks: exportFrameworkOptions(context.name, exportSurfaces(context.steps)),
+      step: step ? { id: step.id, name: step.name, type: step.type } : null,
       providers: connections.map(({ id, name, model, usable, blockedReason }) => ({ id, name, model, usable, blockedReason })),
       defaultProviderId: chain[0]?.id ?? null,
     };
@@ -81,15 +97,20 @@ export class PreconditionExportService {
       include: { steps: { orderBy: { orderIndex: "asc" } }, environment: { select: { name: true } } },
     });
     if (!scenario) throw new NotFoundException("Scenario not found");
+    const stepId = typeof request.stepId === "string" && request.stepId ? request.stepId : undefined;
+    if (stepId && !scenario.steps.some((step) => step.id === stepId)) throw new NotFoundException(EXPORT_ERRORS.stepNotFound);
     const connectorIds = scenario.steps
-      .filter((step) => step.type === "DATABASE_ACTION")
+      .filter((step) => step.type === "DATABASE_ACTION" && (!stepId || step.id === stepId))
       .map((step) => String((step.config as Record<string, unknown> | null)?.connectorId ?? ""))
       .filter(Boolean);
     const connectors = connectorIds.length
       ? await this.prisma.databaseConnector.findMany({ where: { id: { in: connectorIds } }, select: { id: true, type: true } })
       : [];
-    const context = buildExportContext(scenario, new Map(connectors.map((item) => [item.id, item.type])));
-    if (context.steps.length === 0) throw new BadRequestException(EXPORT_ERRORS.nothingToExport);
+    const full = buildExportContext(scenario, new Map(connectors.map((item) => [item.id, item.type])), { stepId });
+    if (full.steps.length === 0) throw new BadRequestException(EXPORT_ERRORS.nothingToExport);
+    if (!frameworkAvailability(framework, exportSurfaces(full.steps)).available) throw new BadRequestException(EXPORT_ERRORS.frameworkCannotExport);
+    // UI steps the framework cannot drive (a mobile step for Playwright, a browser step for Appium) are left out, with a warning.
+    const context = contextForFramework(full, framework);
 
     const providerId = typeof request.providerId === "string" && request.providerId ? request.providerId : undefined;
     const connections = await this.ai.listConnections();
@@ -122,19 +143,21 @@ export class PreconditionExportService {
       framework,
       language,
       anchors: exportAnchors(context),
-      hasUiSteps: context.steps.some((step) => step.type === "ui"),
+      hasUiSteps: context.steps.some((step) => step.type === "ui" || step.type === "mobile"),
       browserActions: exportBrowserActions(context),
+      mode: context.scope ? "step" : "full",
     });
     if (!checked.ok) {
       throw new HttpException(`The generated code was rejected: ${checked.errors.join("; ")}`, HttpStatus.UNPROCESSABLE_ENTITY);
     }
     const aiWarnings = (answer.data.warnings ?? []).map((item) => item.trim()).filter(Boolean).slice(0, 20);
+    const leftOut = (context.metadata.leftOut ?? []).map((item) => `Step "${item.step}" was left out: ${item.reason}.`);
     return {
       framework: framework.id,
       language: language.id,
       code: checked.code,
-      filename: language.filename(exportName(scenario.name)),
-      warnings: [...new Set([...aiWarnings, ...checked.warnings])],
+      filename: language.filename(exportName(context.name)),
+      warnings: [...new Set([...leftOut, ...aiWarnings, ...checked.warnings])],
       provider: { id: answer.origin.connectionId, name: answer.origin.name, model: answer.origin.model },
     };
   }

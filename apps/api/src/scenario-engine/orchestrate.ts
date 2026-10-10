@@ -3,6 +3,7 @@ import { AssertionExecutor } from "./executors/assertion.executor";
 import { ExtractVariableExecutor } from "./executors/extract-variable.executor";
 import { expectedStatuses as expectedStatusOf, HttpRequestExecutor } from "./executors/http-request.executor";
 import { UiFlowExecutor, type UiLearning } from "./executors/ui-flow.executor";
+import { MobileFlowExecutor } from "./executors/mobile-flow.executor";
 import type { StorageSeed } from "./ui/browser-session";
 import { applyBindings, readBindings, upsertBinding, verifyBindings, type StepBinding } from "./flow/bindings";
 import {
@@ -132,8 +133,8 @@ export async function orchestrateSteps(
       } else {
         const live = { orderIndex: step.orderIndex, stepId: step.id, stepName: step.name };
         options.onProgress?.({ ...live, state: "RUNNING" });
-        // A UI step tells which action it is on, as it goes.
-        if (executor instanceof UiFlowExecutor) context.reportUi = (ui) => options.onProgress?.({ ...live, state: "RUNNING", ui });
+        // A UI or mobile step tells which action it is on, as it goes.
+        if (executor instanceof UiFlowExecutor || executor instanceof MobileFlowExecutor) context.reportUi = (ui) => options.onProgress?.({ ...live, state: "RUNNING", ui });
         try {
           result = await executor.execute(step.config ?? {}, context);
         } finally {
@@ -141,6 +142,7 @@ export async function orchestrateSteps(
         }
         if (executor instanceof ExtractVariableExecutor && result.status === "PASSED") markExtraction(result, context);
         if (executor instanceof UiFlowExecutor) result = await afterUiStep(step, result, context, options);
+        if (executor instanceof MobileFlowExecutor) result = await afterMobileStep(step, result, options);
       }
     } catch (error) {
       result = {
@@ -182,6 +184,13 @@ export async function orchestrateSteps(
   if (!options.keepResources) await context.dispose();
 
   return { status: finalStatus, error: runError, stepResults };
+}
+
+/** After a mobile step: locators that found an element when the remembered one did not are tried first next time. */
+async function afterMobileStep(step: OrchestrationStep, result: StepExecutionResult, options: OrchestrationOptions): Promise<StepExecutionResult> {
+  const { uiLearned, ...rest } = result;
+  if (uiLearned?.length && step.id && options.onLearnUi) await options.onLearnUi(step.id, uiLearned).catch(() => undefined);
+  return rest;
 }
 
 /**

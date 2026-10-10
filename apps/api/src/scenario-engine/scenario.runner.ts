@@ -20,6 +20,7 @@ import { ExtractVariableExecutor } from "./executors/extract-variable.executor";
 import { HttpRequestExecutor } from "./executors/http-request.executor";
 import { SetVariableExecutor } from "./executors/set-variable.executor";
 import { UiFlowExecutor, type UiLearning } from "./executors/ui-flow.executor";
+import { MobileFlowExecutor } from "./executors/mobile-flow.executor";
 import { decryptSecret, resolveEncryptionKey } from "../common/crypto.util";
 import type { UiAction } from "./ui/ui-types";
 import { UiSessionStore } from "./ui/saved-sessions";
@@ -81,6 +82,7 @@ export class ScenarioRunner implements OnModuleInit {
         loadSession: (id) => this.savedSessions?.state(id) ?? Promise.resolve(null),
         ai: (question) => this.resolveUiTarget(question),
       }),
+      new MobileFlowExecutor((payload) => decryptSecret(payload, resolveEncryptionKey(process.env.SECRETS_ENCRYPTION_KEY))),
     ]) {
       this.registry.register(executor);
     }
@@ -239,7 +241,8 @@ export class ScenarioRunner implements OnModuleInit {
     const envVars = found.environmentId ? await this.environments.getResolvedVariables(found.environmentId) : {};
     const secretKeys = found.environmentId ? await this.environments.getSecretKeys(found.environmentId) : [];
     const context = new ExecutionContext(envVars, { secretKeys });
-    const steps = found.steps.filter((step) => step.orderIndex < beforeOrderIndex);
+    // Mobile steps drive a device, not the browser being signed in: they are not replayed for a recording.
+    const steps = found.steps.filter((step) => step.orderIndex < beforeOrderIndex && step.type !== "MOBILE_FLOW");
     const ran: Array<{ name: string; status: string; error?: string }> = [];
     const result = await orchestrateSteps(
       steps.map((step) => ({

@@ -146,6 +146,22 @@ const EXACT: Record<string, string> = {
   "The AI provider returned an empty answer": "errors.exportEmpty",
   "The AI provider returned an invalid answer": "errors.exportInvalid",
   "The AI provider's answer was cut off before the code was complete": "errors.exportCutOff",
+  "This framework cannot drive the steps being exported": "errors.exportFrameworkUnavailable",
+  "Mobile recording not found": "errors.mobileRecordingNotFound",
+  "Choose the platform (Android or iOS)": "errors.mobilePlatform",
+  "Enter the Appium server URL (http:// or https://)": "errors.mobileServerUrl",
+  "Capabilities must be a JSON object": "errors.mobileCapabilities",
+  "Another mobile recording is still open; stop it first": "errors.mobileAnotherOpen",
+  "Wait for the current operation to finish": "errors.mobileBusy",
+  "The recording is not connected to a device": "errors.mobileNotConnected",
+  "Choose an element on the current screen": "errors.mobileChooseElement",
+  "No locator finds this element; choose another one": "errors.mobileNoLocator",
+  "Enter the text to type": "errors.mobileTypeText",
+  "Enter the text the element must show": "errors.mobileExpectedText",
+  "iOS has no back button; tap the app's own back control": "errors.mobileNoBack",
+  "The screen has not been read yet": "errors.mobileNoScreen",
+  "Unknown mobile action": "errors.mobileUnknownAction",
+  "The Appium session has ended (the app or device was closed)": "errors.mobileSessionGone",
 };
 
 const CURL_CODES = new Set(["missing_url", "unclosed_quote", "missing_value", "file_body", "bad_url"]);
@@ -254,6 +270,9 @@ export function localizeUserMessage(raw: string, t: Translate): string {
     [/^Invalid (?:test case field|test run|suite):\s*(.+)$/, "errors.invalidField", "value"],
     [/^The generated code was rejected:\s*(.+)$/, "errors.exportRejected", "value"],
     [/^Code generation failed:\s*(.+)$/, "errors.exportFailed", "value"],
+    [/^Could not reach the Appium server at (\S+?)\. Start it/, "errors.mobileUnreachable", "value"],
+    [/^Appium could not start the session:\s*(.+)$/, "errors.mobileSessionFailed", "value"],
+    [/^(?:Text|Visibility) check failed:\s*(.+)$/, "errors.mobileCheckFailed", "value"],
   ];
   for (const [pattern, path, varName] of prefixed) {
     const match = text.match(pattern);

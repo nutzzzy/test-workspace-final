@@ -1,7 +1,9 @@
-import type { ExportContext, ExportLocator, ExportStep, ExportUiAction } from "@qa-workbench/shared";
+import type { ExportContext, ExportLocator, ExportMobileAction, ExportStep, ExportUiAction } from "@qa-workbench/shared";
 import { isSecretKey, maskDeep } from "../../common/mask.util";
 import type { LocatorCandidate, RowIdentity, UiAction, UiTarget } from "../../scenario-engine/ui/ui-types";
 import { SECRET_PLACEHOLDER, describeAction, readUiConfig } from "../../scenario-engine/ui/ui-types";
+import { rankMobileLocators } from "../../scenario-engine/mobile/mobile-locators";
+import { MOBILE_STEP_TYPE, describeMobileAction, readMobileConfig, type MobileAction } from "../../scenario-engine/mobile/mobile-types";
 
 /**
  * The compact, self-contained description of a precondition that an export
@@ -24,8 +26,15 @@ export type ExportSource = {
 const MAX_LOCATORS = 3;
 const MAX_BODY_CHARS = 2_000;
 
-export function buildExportContext(source: ExportSource, connectorTypes: Map<string, string> = new Map()): ExportContext {
+/**
+ * `stepId`: export that one step on its own (enabled or not). The context
+ * then carries a `scope` — the step's place, the values it needs as inputs,
+ * whether it continues an earlier step's browser or app session — and is
+ * named after the step.
+ */
+export function buildExportContext(source: ExportSource, connectorTypes: Map<string, string> = new Map(), options: { stepId?: string } = {}): ExportContext {
   const ordered = [...source.steps].sort((a, b) => a.orderIndex - b.orderIndex);
+  if (options.stepId) return buildStepContext(source, ordered, connectorTypes, options.stepId);
   const enabled = ordered.filter((step) => step.enabled);
   const secretNames = new Set<string>();
   const steps = enabled.map((step) => exportStep(step, ordered, connectorTypes, secretNames)).filter((step): step is ExportStep => Boolean(step));
@@ -46,6 +55,46 @@ export function buildExportContext(source: ExportSource, connectorTypes: Map<str
   return context;
 }
 
+function buildStepContext(source: ExportSource, ordered: StepRow[], connectorTypes: Map<string, string>, stepId: string): ExportContext {
+  const position = ordered.findIndex((item) => item.id === stepId);
+  const step = ordered[position];
+  if (!step) throw new Error("Step not found");
+  const exported = exportStep(step, ordered, connectorTypes, new Set());
+  const steps = exported ? [exported] : [];
+  // A UI or mobile step continues the session of an earlier enabled step of its kind unless it starts a new one.
+  const sessionKind = step.type === "UI_FLOW" || step.type === MOBILE_STEP_TYPE ? step.type : null;
+  const continuesSession =
+    Boolean(sessionKind) && asRecord(step.config).newSession !== true && ordered.slice(0, position).some((item) => item.enabled && item.type === sessionKind);
+  const context: ExportContext = {
+    preconditionId: source.id,
+    name: step.name,
+    url: firstUrl(steps),
+    steps,
+    variables: [],
+    metadata: {
+      ...(source.environment?.name ? { environment: source.environment.name } : {}),
+      stopOnFailure: source.stopOnFailure,
+    },
+  };
+  context.variables = externalVariables(context);
+  context.scope = {
+    kind: "step",
+    step: step.name,
+    precondition: source.name,
+    position: position + 1,
+    total: ordered.length,
+    inputs: [...context.variables, ...steps.flatMap(secretInputs)],
+    ...(continuesSession ? { continuesSession: true } : {}),
+  };
+  return context;
+}
+
+/** Secret values a step reads from the environment: inputs of a single-step export too. */
+function secretInputs(step: ExportStep): string[] {
+  if (step.type === "ui" || step.type === "mobile") return step.actions.flatMap((action) => (action.secretEnv ? [action.secretEnv] : []));
+  return [];
+}
+
 function exportStep(step: StepRow, all: StepRow[], connectorTypes: Map<string, string>, secretNames: Set<string>): ExportStep | null {
   const config = asRecord(step.config);
   const name = step.name;
@@ -59,6 +108,19 @@ function exportStep(step: StepRow, all: StepRow[], connectorTypes: Map<string, s
         startUrl: parsed.value.startUrl,
         ...(parsed.value.newSession ? { newSession: true } : {}),
         actions: parsed.value.actions.map((action) => exportAction(action, secretNames)),
+      };
+    }
+    case MOBILE_STEP_TYPE: {
+      const parsed = readMobileConfig(config);
+      if (!parsed.ok) return null;
+      return {
+        type: "mobile",
+        name,
+        platform: parsed.value.platform,
+        server: withoutCredentials(parsed.value.serverUrl),
+        capabilities: maskCapabilities(parsed.value.capabilities),
+        ...(parsed.value.newSession ? { newSession: true } : {}),
+        actions: parsed.value.actions.map((action) => exportMobileAction(action, secretNames)),
       };
     }
     case "HTTP_REQUEST": {
@@ -150,6 +212,61 @@ function exportAction(action: UiAction, secretNames: Set<string>): ExportUiActio
   if (action.optional) out.optional = true;
   if (action.files?.length) out.files = action.files.map((file) => file.name);
   return out;
+}
+
+function exportMobileAction(action: MobileAction, secretNames: Set<string>): ExportMobileAction {
+  const out: ExportMobileAction = { do: action.kind };
+  if (action.label && action.label !== describeMobileAction({ ...action, ...(action.secret ? { value: SECRET_PLACEHOLDER } : {}) })) out.label = action.label;
+  if (action.secret) {
+    const fp = action.target?.fingerprint;
+    out.secretEnv = uniqueEnvName([fp?.resourceId?.replace(/^.*:id\//, ""), fp?.accessibilityId, fp?.name, "password"], secretNames);
+  } else if (action.value !== undefined && action.value !== "") {
+    out.value = action.value;
+  }
+  if (action.target) {
+    // The locator that worked last time first, then the ranking; one that matched several elements only when nothing else is left.
+    const candidates = action.target.candidates;
+    const learned = action.target.learned !== undefined ? candidates[action.target.learned] : undefined;
+    const ranked = [...(learned ? [learned] : []), ...rankMobileLocators(candidates).filter((item) => item !== learned)];
+    const unique = ranked.filter((item) => item.unique !== false);
+    out.locators = (unique.length ? unique : ranked).slice(0, MAX_LOCATORS).map((item) => ({ using: item.using, value: item.value }));
+  }
+  if (action.kind === "swipe") out.direction = action.direction ?? "up";
+  if (action.optional) out.optional = true;
+  return out;
+}
+
+/** Device-cloud credentials in capabilities (BrowserStack, Sauce Labs, LambdaTest: accessKey). */
+const CAPABILITY_SECRET = /^(?:accesskey|.*apikey|.*authkey)$/;
+
+/**
+ * Capabilities with secret values masked, nested vendor options
+ * (`bstack:options`) included; `appium:accessKey` is judged by its name
+ * without the vendor prefix.
+ */
+function maskCapabilities(capabilities: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(capabilities).map(([key, value]) => {
+      const bare = key.split(":").pop() ?? key;
+      const secret = isSecretKey(bare) || CAPABILITY_SECRET.test(bare.replace(/[-_\s]/g, "").toLowerCase());
+      if (secret && (typeof value === "string" || typeof value === "number")) return [key, "***"];
+      if (value && typeof value === "object" && !Array.isArray(value)) return [key, maskCapabilities(value as Record<string, unknown>)];
+      return [key, maskDeep(value)];
+    }),
+  );
+}
+
+/** The server URL without user name or password (Appium cloud URLs carry keys there). */
+function withoutCredentials(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (!parsed.username && !parsed.password) return url;
+    parsed.username = "";
+    parsed.password = "";
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return url;
+  }
 }
 
 function exportTarget(target: UiTarget): Pick<ExportUiAction, "locators" | "row" | "within"> {
@@ -277,6 +394,11 @@ function secretEnvName(action: UiAction, used: Set<string>): string {
     fp?.ariaLabel,
     fp?.type === "password" ? "password" : undefined,
   ];
+  return uniqueEnvName(hints, used);
+}
+
+/** The first hint usable as an environment-variable name, made unique among those already used. */
+function uniqueEnvName(hints: Array<string | undefined>, used: Set<string>): string {
   const base =
     hints
       .map((hint) => (hint ?? "").toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 30))

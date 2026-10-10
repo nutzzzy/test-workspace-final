@@ -24,9 +24,9 @@ export type StepRun = {
   output?: unknown;
 };
 
-/** Mirrors the API's UiLiveProgress (scenario-engine/types.ts). */
+/** Mirrors the API's UiLiveProgress (scenario-engine/types.ts); mobile steps report it too ("connecting"). */
 export type UiLiveProgress = {
-  phase: "starting" | "signingIn" | "opening" | "actions" | "finishing";
+  phase: "starting" | "signingIn" | "opening" | "connecting" | "actions" | "finishing";
   current: number;
   total: number;
   actions: Array<{ id: string; kind: string; label: string; status: "pending" | "running" | "passed" | "failed" | "skipped" }>;

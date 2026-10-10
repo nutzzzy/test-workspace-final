@@ -65,7 +65,8 @@ export type UiAction = {
 
 export type UiActionResult = {
   id: string;
-  kind: UiAction["kind"];
+  /** A UI action kind, or a mobile one (tap, type, swipe …) for mobile steps. */
+  kind: string;
   label: string;
   status: "PASSED" | "FAILED" | "SKIPPED";
   durationMs: number;
@@ -78,7 +79,8 @@ export type UiActionResult = {
 };
 
 export type UiOutput = StepOutput & {
-  kind?: "ui";
+  /** "mobile": a mobile step's result (same shape; no URL, title or page values). */
+  kind?: "ui" | "mobile";
   url?: string;
   title?: string;
   actions?: UiActionResult[];
@@ -923,10 +925,10 @@ function IconButton({ label, disabled, danger, onClick, children }: { label: str
   );
 }
 
-/** The Result tab of a UI step: every action, how its element was found, the final page. */
+/** The Result tab of a UI or mobile step: every action, how its element was found, the final page or screen. */
 export function UiResultTab({ output, error }: { output: UiOutput | null; error?: string | null }) {
   const { t, n, err } = useI18n();
-  if (!output || output.kind !== "ui") {
+  if (!output || (output.kind !== "ui" && output.kind !== "mobile")) {
     return <p className="rounded-md border border-dashed border-border px-3 py-6 text-center text-xs text-muted-foreground">{t("builder.panel.runToSee")}</p>;
   }
   const actions = output.actions ?? [];

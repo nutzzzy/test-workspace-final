@@ -24,11 +24,13 @@ import {
 const SELECT = "h-8 w-full rounded-md border border-border bg-background px-2 text-xs text-foreground disabled:opacity-60";
 
 /**
- * Export a precondition as automation code: choose framework, language and
- * one of the workspace's AI connections, generate, then copy or download.
- * The precondition itself is only read.
+ * Export a precondition — all its steps, or one `step` on its own — as
+ * automation code: choose framework, language and one of the workspace's AI
+ * connections, generate, then copy or download. The precondition itself is
+ * only read. Frameworks that cannot drive the steps (a browser framework for
+ * a mobile step, or the reverse) are listed but cannot be chosen.
  */
-export function ExportDialog({ scenarioId, onClose }: { scenarioId: string; onClose: () => void }) {
+export function ExportDialog({ scenarioId, step = null, onClose }: { scenarioId: string; step?: { id: string; name: string } | null; onClose: () => void }) {
   const { t, err } = useI18n();
   const toast = useToast();
   const [options, setOptions] = useState<ExportOptions | null>(null);
@@ -41,9 +43,11 @@ export function ExportDialog({ scenarioId, onClose }: { scenarioId: string; onCl
   /** Only the latest request may update the dialog (a regenerate or a closed dialog makes older ones stale). */
   const requestRef = useRef(0);
 
+  const query = step ? `?stepId=${encodeURIComponent(step.id)}` : "";
+
   useEffect(() => {
     let alive = true;
-    api<ExportOptions>(`/scenarios/${scenarioId}/export`)
+    api<ExportOptions>(`/scenarios/${scenarioId}/export${query}`)
       .then((loaded) => {
         if (!alive) return;
         setOptions(loaded);
@@ -56,7 +60,7 @@ export function ExportDialog({ scenarioId, onClose }: { scenarioId: string; onCl
       alive = false;
       requestRef.current += 1;
     };
-  }, [scenarioId]);
+  }, [scenarioId, query]);
 
   const generate = async () => {
     if (!options || !selection) return;
@@ -67,7 +71,12 @@ export function ExportDialog({ scenarioId, onClose }: { scenarioId: string; onCl
     try {
       const generated = await api<ExportResult>(`/scenarios/${scenarioId}/export`, {
         method: "POST",
-        body: JSON.stringify({ framework: wanted.framework, language: wanted.language, ...(wanted.providerId ? { providerId: wanted.providerId } : {}) }),
+        body: JSON.stringify({
+          framework: wanted.framework,
+          language: wanted.language,
+          ...(wanted.providerId ? { providerId: wanted.providerId } : {}),
+          ...(step ? { stepId: step.id } : {}),
+        }),
       });
       if (id !== requestRef.current) return;
       setResult(generated);
@@ -95,8 +104,8 @@ export function ExportDialog({ scenarioId, onClose }: { scenarioId: string; onCl
   return (
     <Dialog
       open
-      title={t("builder.export.title")}
-      description={t("builder.export.description")}
+      title={step ? t("builder.export.titleStep", { name: step.name }) : t("builder.export.title")}
+      description={step ? t("builder.export.descriptionStep") : t("builder.export.description")}
       closeLabel={t("common.cancel")}
       onClose={onClose}
       className="max-w-4xl"
@@ -150,8 +159,13 @@ export function ExportDialog({ scenarioId, onClose }: { scenarioId: string; onCl
                 onChange={(event) => setSelection(withFramework(options, selection, event.target.value))}
               >
                 {options.frameworks.map((framework) => (
-                  <option key={framework.id} value={framework.id}>
-                    {framework.label}
+                  <option key={framework.id} value={framework.id} disabled={framework.available === false}>
+                    {framework.available === false
+                      ? t("builder.export.unavailable", {
+                          name: framework.label,
+                          reason: t(`builder.export.unavailableReason.${framework.unavailableReason ?? "mobileOnly"}`),
+                        })
+                      : framework.label}
                   </option>
                 ))}
               </select>

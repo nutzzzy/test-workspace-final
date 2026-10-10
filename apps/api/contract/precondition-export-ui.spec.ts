@@ -10,6 +10,7 @@ import {
   canGenerate,
   defaultProvider,
   filenameOf,
+  frameworkAvailable,
   initialSelection,
   languagesOf,
   resultMatches,
@@ -94,5 +95,72 @@ describe("export error messages", () => {
         if (locale === "fa") expect(text).toMatch(/[؀-ۿ]/);
       }
     }
+  });
+});
+
+describe("export dialog choices for mobile steps and single steps", () => {
+  const mobile: ExportOptions = {
+    frameworks: exportFrameworkOptions("Open cart", new Set(["mobile"])),
+    step: { id: "m1", name: "Open cart", type: "MOBILE_FLOW" },
+    providers: options.providers,
+    defaultProviderId: "claude",
+  };
+
+  it("starts with the first framework that can drive the steps", () => {
+    expect(initialSelection(mobile)).toEqual({ framework: "appium", language: "java", providerId: "" });
+    expect(filenameOf(mobile, initialSelection(mobile))).toBe("OpenCartTest.java");
+    expect(frameworkAvailable(mobile, "playwright")).toBe(false);
+    expect(frameworkAvailable(options, "playwright")).toBe(true);
+  });
+
+  it("cannot switch to or generate with a framework that cannot drive the steps", () => {
+    const selection = initialSelection(mobile);
+    expect(withFramework(mobile, selection, "playwright")).toBe(selection);
+    expect(canGenerate(mobile, { framework: "playwright", language: "typescript", providerId: "" })).toBe(false);
+    expect(canGenerate(mobile, selection)).toBe(true);
+  });
+
+  it("explains every unavailable framework and every mobile message in both locales", () => {
+    for (const dict of [en, fa]) {
+      const flat = JSON.stringify(dict);
+      for (const reason of ["mobileOnly", "noMobileSteps"]) expect(flat).toContain(`"${reason}":`);
+    }
+    for (const [locale, dict] of [["en", en], ["fa", fa]] as const) {
+      const lookup = (path: string, vars?: Record<string, string | number>) => {
+        const text = path.split(".").reduce<unknown>((node, key) => (node as Record<string, unknown> | undefined)?.[key], dict);
+        if (typeof text !== "string") return `MISSING:${path}`;
+        return text.replace(/\{(\w+)\}/g, (_, key: string) => String(vars?.[key] ?? ""));
+      };
+      for (const raw of [
+        EXPORT_ERRORS.frameworkCannotExport,
+        "Mobile recording not found",
+        "Choose the platform (Android or iOS)",
+        "Enter the Appium server URL (http:// or https://)",
+        "Capabilities must be a JSON object",
+        "Another mobile recording is still open; stop it first",
+        "Wait for the current operation to finish",
+        "The recording is not connected to a device",
+        "Choose an element on the current screen",
+        "No locator finds this element; choose another one",
+        "Enter the text to type",
+        "Enter the text the element must show",
+        "iOS has no back button; tap the app's own back control",
+        "The screen has not been read yet",
+        "Unknown mobile action",
+        "The Appium session has ended (the app or device was closed)",
+        "Could not reach the Appium server at http://127.0.0.1:4723. Start it (appium) and check the URL.",
+        "Appium could not start the session: Could not find a connected Android device",
+        'Text check failed: the element shows "Hi", not "Bye"',
+        "Element not found: «Sign in»",
+        'Ambiguous element: «Help» — xpath "//x" matches 2 elements',
+      ]) {
+        const text = localizeUserMessage(raw, lookup);
+        expect(text).not.toContain("MISSING:");
+        if (locale === "fa") expect(text).toMatch(/[؀-ۿ]/);
+      }
+    }
+    expect(localizeUserMessage("Could not reach the Appium server at http://127.0.0.1:4723. Start it (appium) and check the URL.", (path, vars) => `${path}|${vars?.value}`)).toBe(
+      "errors.mobileUnreachable|http://127.0.0.1:4723",
+    );
   });
 });
