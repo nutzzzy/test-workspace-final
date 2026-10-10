@@ -1,4 +1,4 @@
-import { request as httpRequest } from "http";
+import { request as httpRequest, type RequestOptions } from "http";
 import { request as httpsRequest } from "https";
 
 /**
@@ -22,7 +22,10 @@ export function longRequest(
         method: init.method ?? "GET",
         headers: { ...(init.headers ?? {}), ...(init.body !== undefined ? { "Content-Length": String(Buffer.byteLength(init.body)) } : {}) },
         signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(init.timeoutMs)]) : AbortSignal.timeout(init.timeoutMs),
-      },
+        // Node tries each address of the host for only 250 ms by default; over a slow link every attempt
+        // times out (ETIMEDOUT) although the service is up. Give each address a fair chance.
+        autoSelectFamilyAttemptTimeout: 2_000,
+      } as RequestOptions & { autoSelectFamilyAttemptTimeout?: number },
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => {
